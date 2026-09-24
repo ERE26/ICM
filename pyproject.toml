@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "icm"
 version = "0.1.0"
-description = "Analisis de carteras y modelos de riesgo de mercado"
+description = "Analisis de carteras, modelos de riesgo y trading de energia"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,12 +15,18 @@ dependencies = [
     "pyarrow>=14.0",
     "arch>=6.2",
     "yfinance>=0.2.40",
+    "scikit-learn>=1.4",
 ]
 
 [project.optional-dependencies]
 graficos = ["matplotlib>=3.7"]
 notebooks = ["matplotlib>=3.7", "jupyter", "ipykernel"]
 ficheros = ["openpyxl>=3.1"]
+# PyTorch ocupa varios gigas porque el paquete de PyPI arrastra las
+# bibliotecas de CUDA. Solo hace falta para icm.ml.redes; todo lo demas
+# funciona sin el. Para la version ligera de CPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+redes = ["torch>=2.0"]
 dev = ["pytest>=7.4", "matplotlib>=3.7", "openpyxl>=3.1"]
 
 [tool.setuptools.packages.find]
