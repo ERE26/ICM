@@ -480,7 +480,15 @@ def simular_energia(
     dia_del_anio = fechas.dayofyear.to_numpy(dtype=float)
     generador = np.random.default_rng(semilla)
 
-    temperatura = _temperatura(dia_del_anio, generador, 14.0, 9.0, 0.85, 2.5)
+    # Mismo clima templado que el que trae por defecto simular_temperatura.
+    temperatura = _temperatura(
+        dia_del_anio,
+        generador,
+        media_anual=14.0,
+        amplitud=9.0,
+        persistencia=0.85,
+        ruido=2.5,
+    )
     grados = grados_dia(pd.Series(temperatura, index=fechas))
     exogenas = pd.DataFrame(
         {
@@ -531,6 +539,9 @@ def simular_energia(
     magnitudes = generador.gamma(np.maximum(cuenta, 1), tamanio_salto)
     saltos = np.where(cuenta > 0, magnitudes, 0.0) - lambda_salto * tamanio_salto
 
+    # Ornstein-Uhlenbeck discreto: cada activo arranca en su nivel medio y lo
+    # que se aleja de el vuelve a razon de "reversion" por dia. Con reversion
+    # nula (las acciones) queda un paseo aleatorio con deriva, que es lo suyo.
     desviacion = np.empty((n_periodos, len(claves)))
     desviacion[0] = 0.0
     persistencia = 1.0 - reversion
@@ -541,6 +552,10 @@ def simular_energia(
     log_precio = np.log(campo("nivel")) + estacional + efecto_exogeno + desviacion
     precios = pd.DataFrame(np.exp(log_precio), index=fechas, columns=claves)
 
+    # Las sensibilidades van por unidad de la exogena (grado dia, punto de
+    # factor de carga, punto porcentual de llenado); la volatilidad objetivo es
+    # anualizada y solo cubre la parte estocastica, asi que la realizada sale
+    # algo mayor: las exogenas y los saltos aniaden varianza por encima.
     parametros = {
         "activos": list(claves),
         "inicio": str(fechas[0].date()),
