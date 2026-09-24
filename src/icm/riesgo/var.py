@@ -10,6 +10,8 @@ que tanto confunde al comparar modelos.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -118,6 +120,47 @@ def _cuantil_cornish_fisher(probabilidad, asimetria: float, curtosis: float):
     )
 
 
+def dominio_valido_cornish_fisher(asimetria: float, curtosis: float) -> bool:
+    """Indica si la expansion de Cornish-Fisher sigue siendo una funcion de cuantiles.
+
+    La expansion es asintotica: solo vale para asimetria y curtosis moderadas.
+    Pasado cierto punto el polinomio deja de ser creciente, y una funcion de
+    cuantiles que no crece no es una funcion de cuantiles: el "VaR" resultante
+    puede ser menor al 99 % que al 95 %, o dispararse a decenas de sigmas.
+
+    La derivada del polinomio respecto a ``z`` es una cuadratica; el criterio
+    (Maillard, 2012) es que no tenga raices reales y se abra hacia arriba.
+
+    >>> dominio_valido_cornish_fisher(0.0, 0.0)     # la normal
+    True
+    >>> dominio_valido_cornish_fisher(-1.2, 29.0)   # colas muy gruesas
+    False
+    """
+    s, k = float(asimetria), float(curtosis)
+    a = k / 8.0 - s**2 / 6.0
+    b = s / 3.0
+    c = 1.0 - k / 8.0 + 5.0 * s**2 / 36.0
+
+    if abs(a) < 1e-12:
+        return abs(b) < 1e-12 and c >= 0.0
+    if a < 0.0:
+        return False
+    return (b**2 - 4.0 * a * c) <= 0.0
+
+
+def _avisar_si_fuera_de_dominio(asimetria: float, curtosis: float) -> None:
+    if dominio_valido_cornish_fisher(asimetria, curtosis):
+        return
+    warnings.warn(
+        f"Cornish-Fisher fuera de su dominio de validez (asimetria {asimetria:.2f}, "
+        f"exceso de curtosis {curtosis:.2f}): la expansion deja de ser monotona y el "
+        "valor devuelto no es un cuantil fiable. Use el metodo historico o la t de "
+        "Student con colas tan gruesas.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def var_cornish_fisher(rendimientos, nivel: float = 0.99) -> float:
     """VaR normal corregido por asimetria y curtosis.
 
@@ -125,10 +168,15 @@ def var_cornish_fisher(rendimientos, nivel: float = 0.99) -> float:
     momentos de tercer y cuarto orden. Es un termino medio barato entre el
     parametrico normal y el historico: mantiene la formula cerrada pero deja de
     suponer simetria y colas normales.
+
+    Ojo: es una expansion asintotica. Con colas muy gruesas se sale de su
+    dominio de validez y el resultado deja de ser un cuantil; en ese caso se
+    emite un ``UserWarning``. Vease :func:`dominio_valido_cornish_fisher`.
     """
     serie = como_serie(rendimientos, "rendimientos")
     nivel = validar_nivel(nivel)
     media, desviacion, s, k = _momentos(serie)
+    _avisar_si_fuera_de_dominio(s, k)
     return float(-(media + desviacion * _cuantil_cornish_fisher(1.0 - nivel, s, k)))
 
 
@@ -143,6 +191,7 @@ def es_cornish_fisher(rendimientos, nivel: float = 0.99, n_tramos: int = 1000) -
     nivel = validar_nivel(nivel)
     alfa = 1.0 - nivel
     media, desviacion, s, k = _momentos(serie)
+    _avisar_si_fuera_de_dominio(s, k)
     # Se evita el extremo alfa=0, donde el cuantil diverge.
     probabilidades = np.linspace(alfa / n_tramos, alfa, n_tramos)
     cuantiles = _cuantil_cornish_fisher(probabilidades, s, k)

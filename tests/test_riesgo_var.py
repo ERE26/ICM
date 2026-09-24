@@ -9,6 +9,7 @@ from scipy import stats
 
 from icm.comun import ErrorDatos
 from icm.riesgo import (
+    dominio_valido_cornish_fisher,
     curva_valor,
     duracion_maxima_caida,
     es_cornish_fisher,
@@ -112,6 +113,61 @@ def test_el_es_historico_promedia_la_cola():
     serie = pd.Series([-0.10, -0.08, -0.06, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07])
     # Al 80 %, la cola son las dos peores observaciones.
     assert es_historico(serie, 0.80) == pytest.approx(0.09, abs=1e-9)
+
+
+def test_cornish_fisher_admite_momentos_moderados():
+    assert dominio_valido_cornish_fisher(0.0, 0.0)
+    assert dominio_valido_cornish_fisher(-0.3, 1.5)
+
+
+def test_cornish_fisher_rechaza_colas_muy_gruesas():
+    # Con estos momentos el polinomio deja de ser creciente y el resultado
+    # ya no es un cuantil.
+    assert not dominio_valido_cornish_fisher(-1.19, 29.0)
+    assert not dominio_valido_cornish_fisher(0.0, 12.0)
+
+
+def test_fuera_del_dominio_la_transformacion_deja_de_ser_monotona():
+    # Comprobacion directa del criterio: si dice que no es valido, tiene que
+    # existir un tramo en el que el cuantil ajustado decrezca.
+    from icm.riesgo.var import _cuantil_cornish_fisher
+
+    s, k = -1.19, 29.0
+    assert not dominio_valido_cornish_fisher(s, k)
+    z = np.linspace(-4.0, 0.0, 200)
+    ajustado = _cuantil_cornish_fisher(stats.norm.cdf(z), s, k)
+    assert np.any(np.diff(ajustado) < 0)
+
+
+def test_dentro_del_dominio_la_transformacion_es_monotona():
+    s, k = -0.3, 1.5
+    from icm.riesgo.var import _cuantil_cornish_fisher
+
+    z = np.linspace(-5.0, 5.0, 500)
+    ajustado = _cuantil_cornish_fisher(stats.norm.cdf(z), s, k)
+    assert np.all(np.diff(ajustado) > 0)
+
+
+def test_se_avisa_al_salirse_del_dominio():
+    # Mezcla de una normal estrecha con unos pocos saltos enormes: curtosis
+    # muy por encima de lo que la expansion admite.
+    generador = np.random.default_rng(3)
+    valores = generador.standard_normal(5000) * 0.004
+    valores[::500] = -0.25
+    serie = pd.Series(valores)
+
+    with pytest.warns(UserWarning, match="dominio de validez"):
+        var_cornish_fisher(serie, 0.99)
+    with pytest.warns(UserWarning, match="dominio de validez"):
+        es_cornish_fisher(serie, 0.99)
+
+
+def test_no_se_avisa_con_datos_normales(normal_estandar):
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", UserWarning)
+        var_cornish_fisher(normal_estandar, 0.99)
 
 
 def test_distribucion_parametrica_desconocida(serie):

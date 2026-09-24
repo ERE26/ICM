@@ -40,6 +40,7 @@ from icm.riesgo.montecarlo import (
     var_montecarlo,
 )
 from icm.riesgo.var import (
+    dominio_valido_cornish_fisher,
     escalar_horizonte,
     es_cornish_fisher,
     es_historico,
@@ -83,6 +84,7 @@ __all__ = [
     "curva_valor",
     "dependencia_cola_empirica",
     "diagnostico_es",
+    "dominio_valido_cornish_fisher",
     "duracion_maxima_caida",
     "es_cornish_fisher",
     "es_garch",

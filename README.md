@@ -27,12 +27,14 @@ Requiere Python 3.10 o superior.
 ## Uso en treinta segundos
 
 ```python
-from icm.datos import cargar_precios, rendimientos, matriz_covarianzas
 from icm.cartera import maximo_sharpe, resumen_metricas
-from icm.datos import rendimientos_cartera
-from icm.riesgo import tabla_medidas, backtest_var
+from icm.datos import cargar_precios, matriz_covarianzas, rendimientos, rendimientos_cartera
+from icm.riesgo import backtest_var, tabla_medidas
 
 precios = cargar_precios(["AAPL", "MSFT", "JNJ", "XOM"], "2018-01-01", "2024-12-31")
+# ...o con tus propios datos:
+# from icm.datos import cargar_precios_fichero
+# precios = cargar_precios_fichero("datos/precios.csv")
 rend = rendimientos(precios, "log")
 
 pesos = maximo_sharpe(rend.mean() * 252, matriz_covarianzas(rend, anualizar=True))
@@ -54,6 +56,8 @@ análisis.
 | Pieza | Para qué |
 |---|---|
 | `ProveedorYahoo` | descarga cierres ajustados vía `yfinance`, con reintentos |
+| `ProveedorFichero` | lee **tus** datos de un CSV, un Excel o un Parquet |
+| `ProveedorMarco` | usa un `DataFrame` que ya tienes en memoria |
 | `ProveedorConCache` | guarda en Parquet lo descargado; Yahoo limita las peticiones |
 | `ProveedorSimulado` | genera series sintéticas para trabajar sin conexión |
 | `rendimientos` | precios → rendimientos, logarítmicos o simples |
@@ -68,6 +72,39 @@ from icm.datos import ProveedorSimulado, simular_precios
 
 precios = simular_precios(["A", "B", "C"], n_periodos=1500, semilla=7)
 ```
+
+#### Meter tus propios datos
+
+```python
+from icm.datos import cargar_precios_fichero, ProveedorMarco
+
+# Una columna de fechas y una columna por activo
+precios = cargar_precios_fichero("datos/precios.csv")
+
+# CSV exportado de una hoja de cálculo española: ; como separador,
+# coma decimal, punto de miles y fechas dd/mm/aaaa
+precios = cargar_precios_fichero("datos/ibex.csv", dia_primero=True)
+
+# Formato largo (fecha, ticker, valor), típico de una consulta SQL
+precios = cargar_precios_fichero("datos/largo.csv", formato="largo")
+
+# Si lo que tienes son rendimientos, no precios
+precios = cargar_precios_fichero("datos/rend.csv", contenido="rendimientos")
+
+# Un DataFrame que ya está en memoria
+precios = ProveedorMarco(mi_dataframe).descargar(["AAA", "BBB"])
+```
+
+Se leen `.csv`, `.xlsx`, `.xls` y `.parquet`. La carga resuelve sola lo que
+suele romper estos ficheros: localiza la columna de fechas, distingue el
+decimal del separador de miles, entiende las fechas escritas como `AAAAMMDD`,
+arrastra hacia delante el festivo de un mercado que no lo es de otro y se queda
+con el último valor si una fecha viene repetida. Lo que no puede adivinar lo
+dice con un error concreto en vez de devolver números silenciosamente malos.
+
+Una vez cargados, **todo lo demás funciona igual**: los proveedores comparten
+interfaz, así que tus datos pasan por la optimización, los modelos y los
+contrastes sin cambiar una línea.
 
 ### `icm.cartera` — qué hacer con ellos
 
@@ -177,6 +214,37 @@ cerrada, la cartera de mínima varianza con activos independientes frente a los
 pesos inversamente proporcionales a la varianza, los umbrales del semáforo de
 Basilea frente a los 0-4 / 5-9 / 10 excepciones del supervisor).
 
+### Pasar la batería sobre tus datos
+
+`tests/test_datos_propios.py` ejecuta el análisis completo sobre tu fichero en
+lugar de sobre datos simulados. Se salta solo si no encuentra datos, de modo que
+la suite sigue pasando en una máquina donde no están.
+
+```bash
+cp mis_precios.csv datos/precios.csv
+pytest tests/test_datos_propios.py -v -s      # -s para ver lo que informa
+
+# O apuntando a otro sitio
+ICM_DATOS=~/tfg/ibex.xlsx pytest tests/test_datos_propios.py -s
+ICM_DATOS_CONTENIDO=rendimientos ICM_DATOS_DIA_PRIMERO=1 pytest
+```
+
+No comprueba que tus datos «den bien», comprueba que el análisis se sostiene
+sobre ellos, que es lo que interesa antes de fiarse de una cifra:
+
+- **Sanidad**: sin huecos ni precios negativos, fechas ordenadas y sin repetir,
+  ningún salto diario de más del 50 % (casi siempre un split no ajustado o una
+  coma decimal mal puesta), ninguna serie congelada.
+- **Estimación**: el optimizador converge, el GARCH da una persistencia
+  estacionaria, la cópula t estima unos grados de libertad plausibles.
+- **Contraste**: VaR y ES coherentes entre niveles y entre sí, y el backtest de
+  cada método con Kupiec, Christoffersen y el semáforo de Basilea.
+
+La distinción importante: que se rechace la normalidad o que un método de VaR no
+supere el contraste **no es un fallo del código, es un resultado**, así que esas
+pruebas informan por pantalla en vez de fallar. Sólo falla si *ningún* método
+supera el contraste, porque entonces hay algo que revisar en los datos.
+
 ## Sobre las fuentes de datos
 
 **Yahoo Finance** es la fuente por defecto, vía `yfinance`. No publica un contrato
@@ -191,6 +259,12 @@ los datos que produce este paquete.
 
 ## Limitaciones conocidas
 
+- **Cornish-Fisher tiene un dominio de validez estrecho.** Es una expansión
+  asintótica: con asimetría y curtosis altas el polinomio deja de ser creciente
+  y el resultado ya no es un cuantil (puede dispararse a decenas de sigmas).
+  `var_cornish_fisher` avisa con un `UserWarning` cuando ocurre, y
+  `dominio_valido_cornish_fisher(s, k)` permite comprobarlo antes. Con colas muy
+  gruesas, el método histórico o la t de Student.
 - El escalado de un VaR diario a horizontes largos usa la raíz del tiempo, que
   supone independencia entre días. Con volatilidad agrupada infravalora el riesgo
   más allá de unas dos semanas.

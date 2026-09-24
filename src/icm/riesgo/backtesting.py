@@ -12,6 +12,7 @@ excepciones hay, Christoffersen mira si estan agrupadas.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -73,6 +74,8 @@ def serie_var_movil(
         return _var_movil_garch(serie, nivel, ventana, frecuencia_reajuste)
     if metodo == "parametrico_t":
         return _var_movil_t(serie, nivel, ventana)
+    if metodo == "cornish_fisher":
+        return _var_movil_cornish_fisher(serie, nivel, ventana)
 
     from icm.riesgo.var import var
 
@@ -107,6 +110,47 @@ def _var_movil_t(serie: pd.Series, nivel: float, ventana: int) -> pd.Series:
         gl, loc, escala = estimacion
         estimaciones[serie.index[posicion]] = -(loc + escala * stats.t.ppf(alfa, gl))
     return pd.Series(estimaciones, name=f"var_parametrico_t_{nivel:.0%}")
+
+
+def _var_movil_cornish_fisher(serie: pd.Series, nivel: float, ventana: int) -> pd.Series:
+    """VaR de Cornish-Fisher ventana a ventana, avisando una sola vez.
+
+    Llamar a :func:`~icm.riesgo.var.var_cornish_fisher` en cada ventana emitiria
+    un aviso por ventana cuando los momentos se salen de su dominio, lo que
+    llena la pantalla sin aportar nada. Aqui se cuentan y se resume en un unico
+    mensaje al final, que ademas dice en que proporcion de la muestra ocurre.
+    """
+    from icm.riesgo.var import (
+        _cuantil_cornish_fisher,
+        _momentos,
+        dominio_valido_cornish_fisher,
+    )
+
+    valores = serie.to_numpy(float)
+    alfa = 1.0 - nivel
+    estimaciones: dict = {}
+    fuera_de_dominio = 0
+
+    for posicion in range(ventana, len(serie)):
+        tramo = pd.Series(valores[posicion - ventana : posicion])
+        media, desviacion, s, k = _momentos(tramo)
+        if not dominio_valido_cornish_fisher(s, k):
+            fuera_de_dominio += 1
+        estimaciones[serie.index[posicion]] = -(
+            media + desviacion * _cuantil_cornish_fisher(alfa, s, k)
+        )
+
+    if fuera_de_dominio:
+        proporcion = fuera_de_dominio / len(estimaciones)
+        warnings.warn(
+            f"Cornish-Fisher se sale de su dominio de validez en {fuera_de_dominio} de "
+            f"{len(estimaciones)} ventanas ({proporcion:.0%}): en ellas el valor no es "
+            "un cuantil fiable y el backtest resultante no dice gran cosa. Con colas "
+            "tan gruesas, compare con el metodo historico o con la t de Student.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return pd.Series(estimaciones, name=f"var_cornish_fisher_{nivel:.0%}")
 
 
 def _var_movil_ewma(

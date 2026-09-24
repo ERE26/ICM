@@ -78,6 +78,15 @@ def test_todos_los_metodos_producen_un_var_positivo(serie_larga, metodo):
     assert len(var_movil) == 350
 
 
+def test_cornish_fisher_avisa_una_sola_vez_en_el_backtest(serie_larga):
+    # Un aviso por ventana llenaria la pantalla; el resumen debe decir en
+    # cuantas ventanas ocurre.
+    with pytest.warns(UserWarning, match=r"ventanas \(\d+%\)") as avisos:
+        serie_var_movil(serie_larga.tail(600), 0.99, 250, "cornish_fisher")
+    del_dominio = [a for a in avisos if "dominio de validez" in str(a.message)]
+    assert len(del_dominio) == 1
+
+
 def test_el_var_movil_garch_funciona(serie_larga):
     var_movil = serie_var_movil(
         serie_larga.tail(700), 0.99, 250, "garch", frecuencia_reajuste=100

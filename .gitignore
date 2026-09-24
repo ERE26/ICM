@@ -6,6 +6,10 @@ build/
 dist/
 .pytest_cache/
 .ipynb_checkpoints/
+# Cache de descargas: se regenera solo, no tiene sentido versionarlo.
 datos_cache/
-*.parquet
-!tests/datos/*.parquet
+
+# Los datos propios de datos/ SI se versionan: sin ellos el analisis no es
+# reproducible. Si el fichero es grande o no se puede redistribuir, descomenta:
+# datos/*
+# !datos/README.md
