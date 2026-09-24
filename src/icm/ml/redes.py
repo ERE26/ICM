@@ -211,6 +211,25 @@ class ConfiguracionRed:
         return (NUCLEO_TCN - 1) * (2**self.capas - 1) + 1
 
 
+#: Nombres de los hiperparametros, que son tambien los de ``get_params``.
+NOMBRES_HIPERPARAMETROS = tuple(campo.name for campo in fields(ConfiguracionRed))
+
+
+def _validar_nombres(parametros: dict[str, Any]) -> None:
+    """Rechaza hiperparametros inexistentes antes de que se pierdan en silencio.
+
+    Sin esta comprobacion, un ``RedSecuencial(tasa_de_aprendizaje=0.1)`` (con la
+    preposicion de mas) se aceptaria y entrenaria con la tasa por defecto, que
+    es el peor desenlace posible: ni error, ni el comportamiento pedido.
+    """
+    desconocidos = sorted(set(parametros) - set(NOMBRES_HIPERPARAMETROS))
+    if desconocidos:
+        raise ErrorDatos(
+            f"Hiperparametros desconocidos: {', '.join(desconocidos)}. "
+            f"Disponibles: {', '.join(sorted(NOMBRES_HIPERPARAMETROS))}."
+        )
+
+
 # --- construccion de las redes -------------------------------------------------
 
 
@@ -459,13 +478,7 @@ class RedSecuencial:
                 f"{type(base).__name__}. Pase los hiperparametros como argumentos con "
                 "nombre si no quiere construirla."
             )
-        nombres = {campo.name for campo in fields(ConfiguracionRed)}
-        desconocidos = sorted(set(kwargs) - nombres)
-        if desconocidos:
-            raise ErrorDatos(
-                f"Hiperparametros desconocidos: {', '.join(desconocidos)}. "
-                f"Disponibles: {', '.join(sorted(nombres))}."
-            )
+        _validar_nombres(kwargs)
         self.configuracion = replace(base, **kwargs) if kwargs else base
 
         self._red: Any = None
@@ -487,9 +500,7 @@ class RedSecuencial:
         que le paso. Con escalares eso se cumple; con un dataclass, que ``clone``
         copiaria en profundidad, no tendria por que.
         """
-        return {campo.name: getattr(self.configuracion, campo.name) for campo in fields(
-            ConfiguracionRed
-        )}
+        return {nombre: getattr(self.configuracion, nombre) for nombre in NOMBRES_HIPERPARAMETROS}
 
     def set_params(self, **parametros: Any) -> RedSecuencial:
         """Cambia hiperparametros y descarta el ajuste anterior.
@@ -501,13 +512,7 @@ class RedSecuencial:
         """
         if not parametros:
             return self
-        nombres = {campo.name for campo in fields(ConfiguracionRed)}
-        desconocidos = sorted(set(parametros) - nombres)
-        if desconocidos:
-            raise ErrorDatos(
-                f"Hiperparametros desconocidos: {', '.join(desconocidos)}. "
-                f"Disponibles: {', '.join(sorted(nombres))}."
-            )
+        _validar_nombres(parametros)
         self.configuracion = replace(self.configuracion, **parametros)
         self._red = None
         self._historial = []
@@ -565,7 +570,11 @@ class RedSecuencial:
             )
         if n_validacion >= n_muestras:
             n_validacion = n_muestras - 1
-        embargo = min(configuracion.ventana - 1, max(0, n_muestras - n_validacion - 1))
+        # Sin tramo de validacion no hay nada de lo que separarse, y aplicar el
+        # embargo solo tiraria muestras de entrenamiento a la basura.
+        embargo = 0
+        if n_validacion:
+            embargo = min(configuracion.ventana - 1, max(0, n_muestras - n_validacion - 1))
         return n_muestras - n_validacion - embargo, n_validacion
 
     def ajustar(self, X: pd.DataFrame, y: pd.Series) -> RedSecuencial:
@@ -598,15 +607,18 @@ class RedSecuencial:
             )
 
         n_entrenamiento, n_validacion = self._tramos(n_muestras)
-        # Las ventanas de entrenamiento abarcan estas filas de la tabla, y son
-        # las unicas que pueden intervenir en la estandarizacion.
+        # Las ventanas de entrenamiento abarcan las filas [0, filas_entrenamiento)
+        # de la tabla, y sus objetivos son los de [ventana - 1, filas_entrenamiento):
+        # las primeras ventana - 1 fechas aportan historia pero nunca son
+        # objetivo. Solo esos dos tramos pueden intervenir en la estandarizacion.
         filas_entrenamiento = n_entrenamiento + ventana - 1
         valores = marco.to_numpy(dtype=float)
+        objetivos_entrenamiento = objetivo[ventana - 1: filas_entrenamiento]
         self._columnas = list(marco.columns)
         self._media_X = valores[:filas_entrenamiento].mean(axis=0)
         self._escala_X = _escala(valores[:filas_entrenamiento])
-        self._media_y = float(objetivo[:filas_entrenamiento].mean())
-        self._escala_y = float(_escala(objetivo[:filas_entrenamiento].reshape(-1, 1))[0])
+        self._media_y = float(objetivos_entrenamiento.mean())
+        self._escala_y = float(_escala(objetivos_entrenamiento.reshape(-1, 1))[0])
 
         ventanas = _ventanas((valores - self._media_X) / self._escala_X, ventana)
         etiquetas = ((objetivo[ventana - 1:] - self._media_y) / self._escala_y).astype(np.float32)

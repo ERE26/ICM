@@ -66,6 +66,14 @@ _PICO_ALMACENAMIENTO = 300.0
 _GARCH_ALFA = 0.12
 _GARCH_BETA = 0.85
 
+#: Habilidad por defecto de las previsiones a 24 horas: correlacion entre lo
+#: previsto y lo que acaba ocurriendo. Vease :func:`prevision_exogena`.
+HABILIDAD_PREVISION = 0.90
+
+#: Exogenas de las que se publica prevision. El almacenamiento no esta: se
+#: conoce con rezago semanal, no por adelantado.
+EXOGENAS_PREVISTAS = ("hdd", "cdd", "viento")
+
 CATALOGO: dict[str, dict] = {
     "WTI": {
         "nombre": "Crudo West Texas Intermediate",
@@ -360,8 +368,10 @@ class EscenarioEnergia:
         Precios diarios, indice de fechas habiles y una columna por activo.
     exogenas:
         Variables observables que mueven el precio: ``temperatura``, ``hdd``,
-        ``cdd``, ``viento`` y ``almacenamiento``. Comparten indice con los
-        precios, de modo que se pueden concatenar sin reindexar.
+        ``cdd``, ``viento`` y ``almacenamiento``, mas las columnas
+        ``prevision_*`` descritas en :func:`prevision_exogena`. Comparten
+        indice con los precios, de modo que se pueden concatenar sin
+        reindexar.
     parametros:
         La verdad con la que se genero el escenario. Sirve para lo unico que
         no permite un mercado real: comparar lo que el modelo estima con lo
@@ -378,6 +388,103 @@ class EscenarioEnergia:
                 "Los precios y las exogenas de un escenario deben compartir indice; "
                 "reindexe antes de construir el EscenarioEnergia."
             )
+
+
+def prevision_exogena(
+    serie: pd.Series,
+    habilidad: float = HABILIDAD_PREVISION,
+    horizonte: int = 1,
+    semilla: int | None = None,
+) -> pd.Series:
+    """Prevision publicada en ``t`` para el valor de ``t + horizonte``.
+
+    Esta es la pieza que distingue al trading de energia del de renta variable,
+    y conviene entender bien por que no es mirar al futuro.
+
+    Nadie puede predecir el precio del gas de manana. Pero el frio que hara
+    manana **si** se sabe hoy: el operador del sistema y los servicios
+    meteorologicos publican previsiones de temperatura, demanda y produccion
+    renovable antes de que cierre el mercado diario. Esa prevision es un dato
+    disponible en ``t``, y una mesa real la usa. Excluirla no haria el analisis
+    mas honesto, lo haria irreal.
+
+    La frontera esta en la habilidad. Usar el valor futuro exacto si seria
+    trampa, porque ninguna prevision acierta del todo. La prevision se
+    construye como el valor futuro mas un error:
+
+        prevision(t) = x(t + horizonte) + error
+
+    y la habilidad se mide **sobre el cambio**, no sobre el nivel:
+
+        corr(prevision(t) - x(t),  x(t + horizonte) - x(t)) = habilidad
+
+    Esa eleccion no es un detalle tecnico. Medir la habilidad sobre el nivel
+    daria una cifra enganiosamente alta: con una variable persistente como la
+    temperatura, decir "manana hara como hoy" ya correlaciona 0,85 con lo que
+    ocurre, sin aportar nada. Lo unico que aniade valor es acertar el CAMBIO, y
+    es ahi donde hay que exigir la habilidad. Es el mismo principio que el
+    error escalado de :mod:`icm.ml.evaluacion`: una medida solo informa si esta
+    anclada a la referencia ingenua que hay que batir.
+
+    Parametros
+    ----------
+    habilidad:
+        Correlacion entre el cambio previsto y el cambio realizado, en (0, 1].
+        ``0`` seria no saber nada mas que la persistencia y ``1``, acertar el
+        cambio exactamente. Las previsiones meteorologicas a 24 horas se mueven
+        en 0,85-0,95.
+        Con ``habilidad=1`` no hay error y el resultado **si** constituye fuga
+        de informacion: se permite solo para poder medir cuanto valdria una
+        prevision perfecta, nunca para presentar resultados.
+    semilla:
+        Fija el error de prevision, para que el escenario sea reproducible.
+
+    Devuelve
+    --------
+    Serie indexada por ``t`` cuyo valor se refiere a ``t + horizonte``. Las
+    ultimas ``horizonte`` posiciones quedan a ``NaN``: la prevision de un dia
+    posterior al final de la muestra no existe.
+
+    Notas
+    -----
+    El nombre de la serie devuelta lleva el prefijo ``prevision_``, que es como
+    :func:`icm.ml.caracteristicas.construir_matriz` la reconoce como variable
+    conocida por adelantado y la usa con retardo cero.
+    """
+    if not isinstance(serie, pd.Series):
+        raise ErrorDatos("prevision_exogena espera una Series indexada por fecha.")
+    habilidad = float(habilidad)
+    if not 0.0 < habilidad <= 1.0:
+        raise ErrorDatos(
+            f"La habilidad de la prevision debe estar en (0, 1], se ha recibido {habilidad}. "
+            "Use 0,95 para temperatura a 24 horas y 0,85 para viento."
+        )
+    if horizonte < 1:
+        raise ErrorDatos("El horizonte de la prevision debe ser de al menos un periodo.")
+
+    futuro = serie.shift(-horizonte)
+    if habilidad == 1.0:
+        salida = futuro.copy()
+    else:
+        cambio = futuro - serie
+        desviacion = float(cambio.std(ddof=1))
+        if not np.isfinite(desviacion) or desviacion == 0.0:
+            # Una serie que no cambia es perfectamente previsible, y eso no es
+            # un caso patologico: los grados-dia de refrigeracion valen cero
+            # todo un invierno. Sin cambio que acertar no hay habilidad que
+            # calibrar, asi que la prevision es el propio valor futuro.
+            salida = futuro.copy()
+        else:
+            # corr(d + e, d) = sd(d) / sqrt(sd(d)^2 + sd(e)^2) = habilidad
+            escala_error = desviacion * np.sqrt(1.0 / habilidad**2 - 1.0)
+            generador = np.random.default_rng(semilla)
+            error = generador.standard_normal(len(serie)) * escala_error
+            salida = futuro + error
+            salida[futuro.isna()] = np.nan
+
+    nombre = serie.name if serie.name else "exogena"
+    salida.name = f"prevision_{nombre}"
+    return salida
 
 
 def _validar_activos(activos: Sequence[str] | None) -> list[str]:
@@ -438,6 +545,7 @@ def simular_energia(
     inicio: str | pd.Timestamp = "2018-01-01",
     semilla: int | None = 42,
     intensidad_saltos: float = 0.02,
+    habilidad_prevision: float = HABILIDAD_PREVISION,
 ) -> EscenarioEnergia:
     """Genera un mercado de energia completo: precios, exogenas y la verdad que los liga.
 
@@ -501,6 +609,20 @@ def simular_energia(
         index=fechas,
     )
 
+    # Las previsiones son el unico canal por el que un modelo puede anticipar
+    # el precio de manana: el efecto de las exogenas es contemporaneo, asi que
+    # conocer el frio de hoy no dice nada del rendimiento de manana, y conocer
+    # el frio PREVISTO para manana lo dice casi todo. Sin esta pieza el
+    # ejercicio no tiene senal explotable, que es exactamente lo que le pasa a
+    # una mesa que no mira el parte meteorologico.
+    for nombre in EXOGENAS_PREVISTAS:
+        prevision = prevision_exogena(
+            exogenas[nombre],
+            habilidad=habilidad_prevision,
+            semilla=generador.integers(0, 2**32 - 1),
+        )
+        exogenas[prevision.name] = prevision
+
     perfiles = [_perfil_activo(clave) for clave in claves]
 
     def campo(nombre: str) -> np.ndarray:
@@ -562,6 +684,8 @@ def simular_energia(
         "n_periodos": int(n_periodos),
         "semilla": semilla,
         "garch": {"alfa": _GARCH_ALFA, "beta": _GARCH_BETA},
+        "habilidad_prevision": float(habilidad_prevision),
+        "exogenas_previstas": list(EXOGENAS_PREVISTAS),
         "sensibilidad_hdd": _por_activo(claves, sensibilidades[0]),
         "sensibilidad_cdd": _por_activo(claves, sensibilidades[1]),
         "sensibilidad_viento": _por_activo(claves, sensibilidades[2]),

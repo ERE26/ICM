@@ -399,7 +399,16 @@ def objetivo_rendimiento_futuro(
 
     futuro = serie.shift(-paso)
     valores = np.log(futuro / serie) if tipo == "log" else futuro / serie - 1.0
-    return valores.rename(f"rend_futuro_{paso}")
+    salida = valores.rename(f"rend_futuro_{paso}")
+    # Se deja constancia de que la serie esta ADELANTADA: su valor en t es el
+    # rendimiento de t a t+paso, no el de t-1 a t. Sin esta marca,
+    # icm.ml.estrategia.ejecutar_estrategia no puede distinguirla de una serie
+    # de rendimientos corriente y aplicaria su retardo por defecto, desplazando
+    # dos veces y destruyendo el resultado sin dar ninguna senial de alarma.
+    salida.attrs["convencion"] = "futuro"
+    salida.attrs["horizonte"] = paso
+    salida.attrs["tipo_rendimiento"] = tipo
+    return salida
 
 
 # --- matriz de datos -----------------------------------------------------------
@@ -564,9 +573,15 @@ def construir_matriz(
             f"{horizonte}. Use una serie mas larga o reduzca 'incluir'."
         )
 
+    objetivo_alineado = completo[_CLAVE_OBJETIVO].rename(y.name)
+    # pandas no arrastra attrs a traves de la concatenacion y el filtrado, asi
+    # que la marca de convencion se vuelve a poner a mano: es la que evita el
+    # doble desplazamiento en el backtest.
+    objetivo_alineado.attrs.update(y.attrs)
+
     return MatrizDatos(
         X=completo.loc[:, X.columns],
-        y=completo[_CLAVE_OBJETIVO].rename(y.name),
+        y=objetivo_alineado,
         nombres_grupo=grupos,
     )
 

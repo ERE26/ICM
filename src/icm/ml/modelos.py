@@ -91,7 +91,8 @@ class MediaCero(RegressorMixin, BaseEstimator):
     """
 
     def fit(self, X: Any, y: Any = None) -> MediaCero:
-        self.n_variables_ = int(np.asarray(X).shape[1]) if np.asarray(X).ndim > 1 else 1
+        forma = getattr(X, "shape", None)
+        self.n_variables_ = int(forma[1]) if forma is not None and len(forma) > 1 else 1
         return self
 
     def predict(self, X: Any) -> np.ndarray:
@@ -102,13 +103,13 @@ class MediaCero(RegressorMixin, BaseEstimator):
 # --- utilidades internas -------------------------------------------------------
 
 
-def _n_filas(datos: Any) -> int:
+def _n_filas(datos: Any, nombre: str = "X") -> int:
     """Numero de observaciones de la entrada, sea pandas o numpy."""
     if isinstance(datos, (pd.DataFrame, pd.Series)):
         return len(datos.index)
     valores = np.asarray(datos)
     if valores.ndim == 0:
-        raise ErrorDatos("Se esperaba una tabla de variables, no un escalar.")
+        raise ErrorDatos(f"'{nombre}' debe ser una tabla o un vector, no un escalar.")
     return int(valores.shape[0])
 
 
@@ -116,7 +117,7 @@ def _indice(datos: Any, nombre: str) -> pd.Index:
     """Indice de la entrada; posiciones 0..n-1 si no tiene ninguno."""
     if isinstance(datos, (pd.DataFrame, pd.Series)):
         return datos.index
-    return pd.RangeIndex(_n_filas(datos))
+    return pd.RangeIndex(_n_filas(datos, nombre))
 
 
 def _envolver(estimador: Any, escalar: bool) -> Pipeline:
@@ -189,7 +190,7 @@ def _validar_columnas(X_entrena: Any, X_prueba: Any) -> None:
         )
 
 
-def _contrastar_orden_temporal(indice_entrena: pd.Index, indice_prueba: pd.Index) -> None:
+def _contrastar_orden_temporal(X_entrena: Any, X_prueba: Any) -> None:
     """Rechaza predecir fechas que ya estaban en el tramo de entrenamiento.
 
     Es el error que produce los resultados espectaculares: se ajusta con toda la
@@ -199,7 +200,19 @@ def _contrastar_orden_temporal(indice_entrena: pd.Index, indice_prueba: pd.Index
     Para medir el ajuste dentro de muestra a proposito (que es legitimo como
     diagnostico, no como resultado) se llama directamente a ``modelo.fit`` y
     ``modelo.predict``, que no llevan esta comprobacion.
+
+    Con matrices de numpy no se comprueba nada, y no por dejadez: sin indice no
+    hay fechas: las dos matrices empiezan en la posicion 0 y su orden temporal
+    relativo es indeterminable. Quien quiera esta garantia (que es la que
+    convierte un resultado en creible) trabaja con pandas, que es como salen las
+    matrices de :mod:`icm.ml.caracteristicas`.
     """
+    if not (
+        isinstance(X_entrena, (pd.DataFrame, pd.Series))
+        and isinstance(X_prueba, (pd.DataFrame, pd.Series))
+    ):
+        return
+    indice_entrena, indice_prueba = X_entrena.index, X_prueba.index
     if len(indice_entrena) == 0 or len(indice_prueba) == 0:
         return
     try:
@@ -494,12 +507,12 @@ def ajustar_y_predecir(
     scikit-learn, de modo que se puede pasar despues a
     :func:`importancia_variables` sin volver a estimarlo.
     """
-    indice_entrena = _alinear(X_entrena, y_entrena, sufijo="_entrena")
+    _alinear(X_entrena, y_entrena, sufijo="_entrena")
     indice_prueba = _indice(X_prueba, "X_prueba")
     if len(indice_prueba) == 0:
         raise ErrorDatos("'X_prueba' no contiene ninguna fila que predecir.")
     _validar_columnas(X_entrena, X_prueba)
-    _contrastar_orden_temporal(indice_entrena, indice_prueba)
+    _contrastar_orden_temporal(X_entrena, X_prueba)
 
     tiene_interfaz = callable(getattr(modelo, "fit", None)) and callable(
         getattr(modelo, "predict", None)
@@ -569,10 +582,10 @@ def importancia_variables(
         Si ya esta ajustado, se usa tal cual, y entonces ``X`` e ``y`` deberian
         ser un tramo que el modelo **no** haya visto: esa es la importancia
         honesta, la que dice de que se fia el modelo cuando acierta de verdad.
-        Si no lo esta, se ajusta aqui mismo sobre ``(X, y)`` y la cifra pasa a
-        medir en que se apoya el modelo dentro de muestra, que no es lo mismo:
-        un arbol sobreajustado puede apoyarse mucho en una variable que fuera de
-        muestra no vale nada.
+        Si no lo esta, se ajusta aqui mismo sobre ``(X, y)`` (y queda ajustado,
+        por el convenio de scikit-learn) y la cifra pasa a medir en que se apoya
+        el modelo dentro de muestra, que no es lo mismo: un arbol sobreajustado
+        puede apoyarse mucho en una variable que fuera de muestra no vale nada.
     n_repeticiones:
         Permutaciones por variable. La importancia es una media sobre
         barajados; con pocas repeticiones el ranking baila de una semilla a
@@ -719,8 +732,23 @@ def buscar_hiperparametros(
             f"recibido {type(rejilla).__name__}."
         )
 
+    modelo = crear_modelo(nombre)
+    prefijo = f"{PASO_MODELO}__"
+    admitidos = {
+        clave.removeprefix(prefijo)
+        for clave in modelo.get_params(deep=True)
+        if clave.startswith(prefijo)
+    }
+
     rejilla_pipeline: dict[str, list[Any]] = {}
     for clave, valores in rejilla.items():
+        # Se comprueba el nombre antes de ajustar nada: scikit-learn tambien lo
+        # detecta, pero a mitad de la busqueda y sin decir que si existe.
+        if clave not in admitidos:
+            raise ErrorDatos(
+                f"El modelo '{nombre}' no tiene el hiperparametro '{clave}'. "
+                f"Disponibles: {', '.join(sorted(admitidos))}."
+            )
         if isinstance(valores, (str, bytes)) or not isinstance(valores, Sequence):
             raise ErrorDatos(
                 f"Los valores de '{clave}' en la rejilla deben ser una lista, se ha "
@@ -728,25 +756,16 @@ def buscar_hiperparametros(
             )
         if len(valores) == 0:
             raise ErrorDatos(f"La rejilla de '{clave}' esta vacia: indique al menos un valor.")
-        rejilla_pipeline[f"{PASO_MODELO}__{clave}"] = list(valores)
+        rejilla_pipeline[f"{prefijo}{clave}"] = list(valores)
 
     busqueda = GridSearchCV(
-        crear_modelo(nombre),
+        modelo,
         rejilla_pipeline,
         scoring="neg_mean_squared_error",
         cv=ParticionSklearn(particion),
         refit=False,
     )
-    try:
-        busqueda.fit(X, y)
-    except ValueError as exc:
-        raise ErrorDatos(
-            f"La rejilla no es valida para el modelo '{nombre}' ({exc}). Use los "
-            f"nombres de hiperparametro de la fabrica MODELOS['{nombre}'], sin el "
-            f"prefijo '{PASO_MODELO}__'."
-        ) from exc
-
-    prefijo = f"{PASO_MODELO}__"
+    busqueda.fit(X, y)
     return {
         clave.removeprefix(prefijo): valor for clave, valor in busqueda.best_params_.items()
     }
@@ -804,12 +823,14 @@ def comparar_modelos(
 
     particion = particion if particion is not None else ParticionWalkForward()
     predicciones: dict[str, pd.Series] = {}
-    reales: pd.Series | None = None
+    # Los valores realizados los fija el primer modelo validado; como todos
+    # recorren la misma particion, los demas devuelven exactamente los mismos.
+    reales = pd.Series(dtype=float)
     for nombre in elegidos:
         resultado = validacion_walk_forward(crear_modelo(nombre), X, y, particion)
         predicciones[nombre] = resultado.predicciones.rename(nombre)
-        reales = resultado.reales
+        if predicciones[nombre].size and reales.empty:
+            reales = resultado.reales
 
-    assert reales is not None  # la lista de modelos nunca esta vacia aqui
     tabla = tabla_evaluacion(reales, predicciones, referencia=NOMBRE_REFERENCIA)
     return tabla, predicciones

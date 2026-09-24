@@ -23,11 +23,16 @@ from icm.energia.simulacion import (
     activos_con_yahoo,
     activos_sin_yahoo,
     grados_dia,
+    prevision_exogena,
     simular_energia,
     simular_temperatura,
 )
 
 EXOGENAS = ["hdd", "cdd", "viento", "almacenamiento"]
+
+#: Las exogenas de las que se publica prevision a 24 horas. El almacenamiento
+#: no esta: se conoce con rezago semanal, no por adelantado.
+PREVISIONES = ["prevision_hdd", "prevision_cdd", "prevision_viento"]
 
 
 def rendimientos_log(precios: pd.DataFrame) -> pd.DataFrame:
@@ -225,7 +230,7 @@ def test_los_precios_son_positivos_y_pasan_la_validacion(escenario):
 def test_precios_y_exogenas_comparten_indice_de_fechas_habiles(escenario):
     assert escenario.precios.index.equals(escenario.exogenas.index)
     assert escenario.precios.index.is_monotonic_increasing
-    assert list(escenario.exogenas.columns) == ["temperatura", *EXOGENAS]
+    assert list(escenario.exogenas.columns) == ["temperatura", *EXOGENAS, *PREVISIONES]
     assert (escenario.precios.index.dayofweek < 5).all()
 
 
@@ -454,3 +459,112 @@ def test_el_proveedor_avisa_si_la_ventana_queda_vacia():
 def test_el_proveedor_rechaza_activos_fuera_del_catalogo():
     with pytest.raises(ErrorDatos, match="fuera del catalogo"):
         ProveedorEnergiaSimulado().descargar(["AAPL"])
+
+
+# --- previsiones: la unica senal explotable ------------------------------------
+
+
+def test_la_prevision_apunta_al_periodo_siguiente():
+    serie = pd.Series([1.0, 2.0, 3.0, 4.0], index=pd.bdate_range("2024-01-01", periods=4))
+    prevision = prevision_exogena(serie, habilidad=1.0)
+    # Con habilidad perfecta, la prevision de t es exactamente el valor de t+1.
+    np.testing.assert_allclose(prevision.iloc[:-1].to_numpy(), [2.0, 3.0, 4.0])
+    assert pd.isna(prevision.iloc[-1]), "la prevision del dia siguiente al final no existe"
+
+
+def test_la_prevision_hereda_el_nombre_con_prefijo():
+    serie = pd.Series([1.0, 3.0, 2.0, 5.0], name="hdd")
+    assert prevision_exogena(serie).name == "prevision_hdd"
+
+
+def test_la_habilidad_se_mide_sobre_el_cambio_y_no_sobre_el_nivel():
+    # Una serie muy persistente: el nivel es casi predecible por inercia, asi
+    # que medir la habilidad sobre el nivel daria una cifra enganiosamente
+    # alta. Lo que importa es acertar el cambio.
+    generador = np.random.default_rng(4)
+    valores = [50.0]
+    for _ in range(3000):
+        valores.append(0.95 * valores[-1] + 0.05 * 50.0 + generador.standard_normal())
+    serie = pd.Series(valores, index=pd.bdate_range("2015-01-01", periods=len(valores)))
+
+    prevision = prevision_exogena(serie, habilidad=0.80, semilla=1)
+    cambio_real = serie.shift(-1) - serie
+    cambio_previsto = prevision - serie
+    ok = cambio_real.notna() & cambio_previsto.notna()
+    assert stats.pearsonr(cambio_previsto[ok], cambio_real[ok])[0] == pytest.approx(0.80, abs=0.03)
+
+
+@pytest.mark.parametrize("habilidad", [0.5, 0.7, 0.9])
+def test_la_habilidad_pedida_es_la_obtenida(habilidad):
+    generador = np.random.default_rng(6)
+    serie = pd.Series(
+        np.cumsum(generador.standard_normal(4000)),
+        index=pd.bdate_range("2010-01-01", periods=4000),
+        name="x",
+    )
+    prevision = prevision_exogena(serie, habilidad=habilidad, semilla=2)
+    real = serie.shift(-1) - serie
+    previsto = prevision - serie
+    ok = real.notna() & previsto.notna()
+    assert stats.pearsonr(previsto[ok], real[ok])[0] == pytest.approx(habilidad, abs=0.03)
+
+
+def test_una_serie_constante_se_preve_sin_error():
+    # Los grados-dia de refrigeracion valen cero todo un invierno: no hay
+    # cambio que acertar, y eso no es un caso patologico.
+    serie = pd.Series(np.zeros(20), index=pd.bdate_range("2024-01-01", periods=20), name="cdd")
+    prevision = prevision_exogena(serie, habilidad=0.9)
+    assert (prevision.dropna() == 0.0).all()
+
+
+@pytest.mark.parametrize("habilidad", [0.0, -0.1, 1.5])
+def test_una_habilidad_fuera_de_rango_se_rechaza(habilidad):
+    serie = pd.Series([1.0, 2.0, 3.0])
+    with pytest.raises(ErrorDatos, match="habilidad"):
+        prevision_exogena(serie, habilidad=habilidad)
+
+
+def test_la_prevision_exige_una_serie():
+    with pytest.raises(ErrorDatos, match="Series"):
+        prevision_exogena(pd.DataFrame({"a": [1.0, 2.0]}))
+
+
+def test_el_escenario_trae_prevision_de_las_exogenas_previsibles():
+    escenario = simular_energia(n_periodos=600, semilla=3)
+    for nombre in PREVISIONES:
+        assert nombre in escenario.exogenas.columns
+    # El almacenamiento se publica con rezago, no por adelantado.
+    assert "prevision_almacenamiento" not in escenario.exogenas.columns
+
+
+def test_la_prevision_del_escenario_tiene_la_habilidad_declarada():
+    escenario = simular_energia(n_periodos=2500, semilla=3, habilidad_prevision=0.85)
+    assert escenario.parametros["habilidad_prevision"] == pytest.approx(0.85)
+    real = escenario.exogenas["hdd"].shift(-1) - escenario.exogenas["hdd"]
+    previsto = escenario.exogenas["prevision_hdd"] - escenario.exogenas["hdd"]
+    ok = real.notna() & previsto.notna()
+    assert stats.pearsonr(previsto[ok], real[ok])[0] == pytest.approx(0.85, abs=0.04)
+
+
+def test_sin_la_prevision_no_habria_senal_explotable():
+    """El test que justifica que exista el modulo de previsiones.
+
+    El efecto de las exogenas sobre el precio es contemporaneo, asi que
+    conocer el frio de HOY no dice nada del rendimiento de MANANA. Solo la
+    prevision del frio de manana lo anticipa. Sin ella, un modelo no tendria
+    de donde sacar senal, que es exactamente lo que le ocurre a una mesa que
+    no mira el parte meteorologico.
+    """
+    escenario = simular_energia(n_periodos=2500, semilla=7)
+    rendimiento_manana = np.log(escenario.precios["TTF"]).diff().shift(-1)
+
+    nivel_hoy = escenario.exogenas["hdd"]
+    cambio_previsto = escenario.exogenas["prevision_hdd"] - nivel_hoy
+
+    ok = rendimiento_manana.notna() & cambio_previsto.notna()
+    r_nivel = abs(stats.pearsonr(nivel_hoy[ok], rendimiento_manana[ok])[0])
+    r_prevision = abs(stats.pearsonr(cambio_previsto[ok], rendimiento_manana[ok])[0])
+
+    assert r_nivel < 0.05, "el nivel de hoy no deberia anticipar el rendimiento de manana"
+    assert r_prevision > 0.12, "la prevision si debe anticiparlo"
+    assert r_prevision > 3 * r_nivel
