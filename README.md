@@ -155,6 +155,11 @@ Ambos intentan descargar datos reales y, si no hay salida a internet, **pasan
 automáticamente a datos simulados avisando de ello por pantalla**. Así se pueden
 ejecutar en cualquier entorno, pero las conclusiones sólo valen con datos reales.
 
+> Los notebooks se guardaron ejecutados **con datos simulados**, porque el entorno
+> donde se generaron no tenía acceso a Yahoo Finance. Las cifras que se ven sirven
+> para seguir el razonamiento; vuelve a ejecutarlos con conexión para obtener las
+> tuyas.
+
 ```bash
 jupyter lab notebooks/
 ```
