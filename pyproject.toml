@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icm"
+version = "0.1.0"
+description = "Analisis de carteras y modelos de riesgo de mercado"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "pyarrow>=14.0",
+    "arch>=6.2",
+    "yfinance>=0.2.40",
+]
+
+[project.optional-dependencies]
+graficos = ["matplotlib>=3.7"]
+notebooks = ["matplotlib>=3.7", "jupyter", "ipykernel"]
+dev = ["pytest>=7.4", "matplotlib>=3.7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]
