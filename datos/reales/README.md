@@ -1,9 +1,25 @@
 # Datos reales
 
-Doce series **no simuladas**, descargadas el 25 de septiembre de 2026. Hasta
-ahora todo el proyecto se había construido y validado contra
+Quince series **no simuladas**, 159 339 filas, descargadas el 25 de septiembre
+de 2026. Hasta ahora todo el proyecto se había construido y validado contra
 `icm.energia.simulacion`, así que esta carpeta es su primer contacto con datos
 que no ha generado él mismo.
+
+Las tres primeras son las que de verdad importan al proyecto, y vienen
+directamente de los operadores del mercado español:
+
+| Fichero | Contenido | Filas | Desde | Hasta |
+|---|---|---:|---|---|
+| `omie_horario.csv` | Precio marginal **horario** del pool ibérico, €/MWh (ES y PT) | 102 167 | 2018-01-01 | 2026-09-25 |
+| `omie_diario.csv` | Media aritmética diaria del pool ibérico, €/MWh | 3 185 | 2018-01-01 | 2026-09-25 |
+| `mibgas_diario.csv` | Gas spot español `GDAES_D+1` en el PVB, €/MWh | 3 877 | 2016-01-06 | 2026-09-26 |
+
+Comprobaciones de autenticidad que pasan: el máximo del pool es **700 €/MWh el
+8 de marzo de 2022** (récord histórico tras la invasión de Ucrania) y la media
+de ese día, 544,98 €/MWh, coincide al céntimo con la cifra que publicó OMIE —
+que es además cómo se determinó que la sexta columna del fichero
+`marginalpdbc` es España y la quinta Portugal. El máximo de MIBGAS es
+240 €/MWh el 30 de agosto de 2022, el pico de la crisis del gas.
 
 Los ficheros están **tal y como vienen del origen**, sin reformatear. Si alguno
 no entra bien por el cargador, el arreglo va en `icm.datos.ficheros`, no en el
@@ -89,11 +105,32 @@ Dicho de otro modo: la regla que protege los datos es la que impide analizar el
 día más interesante de la serie, y haría lo mismo con cualquier descarga de
 OMIE. Está anotado para arreglar.
 
-## Lo que falta
+## El pool español no entra por la puerta
 
-No están las series europeas, que son las que de verdad interesan al proyecto:
-**TTF**, **MIBGAS**, **OMIE** y los derechos de emisión (**EUA**). No se
-publican en repositorios abiertos con esta comodidad; hay que bajarlas de OMIE,
-MIBGAS y ESIOS, y este contenedor no llega a esos dominios (la política de red
-responde 403). Mientras tanto, Brent, WTI y Henry Hub cubren crudo y gas con
-histórico largo, y sirven para validar toda la maquinaria con datos de verdad.
+`omie_horario.csv` **no se puede cargar**, por la misma regla que tumba el WTI:
+
+```
+ErrorDatos: Se han encontrado precios nulos o negativos
+```
+
+En las 102 167 horas del fichero hay **2 315 exactamente a cero y 3 553
+negativas**, con un mínimo de −15 €/MWh: el 5,74 % del mercado, repartido por
+**390 días distintos**. No es una anomalía ni un error de descarga, es cómo
+funciona el pool cuando coinciden mucha renovable y poca demanda.
+
+`omie_diario.csv` sí carga, pero solo porque la media aritmética del día nunca
+llega a bajar de cero (mínimo 0,18 €/MWh). Es decir: la librería admite el
+mercado eléctrico español únicamente si se le borra antes la granularidad en la
+que ocurre lo interesante.
+
+## Lo que sigue faltando
+
+**TTF** (el gas de referencia europeo) y los derechos de emisión **EUA**. El
+primero lo publica ICE bajo licencia y el segundo EEX; ninguno tiene descarga
+abierta comparable. ESIOS (generación por tecnología, previsión eólica, demanda)
+necesita un token personal gratuito que hay que pedir por correo a
+`consultasios@ree.es`; con ese token entraría, porque el dominio ya es
+alcanzable — hoy devuelve 403 por falta de credencial, no por la red.
+
+Para el spark spread, MIBGAS y OMIE bastan: gas y electricidad españoles, ambos
+en €/MWh, con más de ocho años de solapamiento.

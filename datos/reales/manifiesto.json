@@ -133,6 +133,39 @@
    "desde": "2012-01-01",
    "hasta": "2015-12-31",
    "sha256_12": "27219f1ca8db"
+  },
+  {
+   "fichero": "omie_horario.csv",
+   "descripcion": "Precio marginal horario del pool iberico, EUR/MWh (ES y PT)",
+   "repo": "OMIE",
+   "ruta_origen": "file-download?parents=marginalpdbc",
+   "columna_fecha": "fecha",
+   "filas": 102167,
+   "desde": "2018-01-01",
+   "hasta": "2026-09-25",
+   "sha256_12": "91c615dd1f77"
+  },
+  {
+   "fichero": "omie_diario.csv",
+   "descripcion": "Media aritmetica diaria del pool iberico, EUR/MWh",
+   "repo": "OMIE",
+   "ruta_origen": "marginalpdbc agregado por dia",
+   "columna_fecha": "fecha",
+   "filas": 3185,
+   "desde": "2018-01-01",
+   "hasta": "2026-09-25",
+   "sha256_12": "d84835d4ab9a"
+  },
+  {
+   "fichero": "mibgas_diario.csv",
+   "descripcion": "Gas spot espanol GDAES_D+1 en el PVB, EUR/MWh",
+   "repo": "MIBGAS",
+   "ruta_origen": "file-access MIBGAS_Data_AAAA",
+   "columna_fecha": "fecha",
+   "filas": 3877,
+   "desde": "2016-01-06",
+   "hasta": "2026-09-26",
+   "sha256_12": "8892853a34ff"
   }
  ]
 }
