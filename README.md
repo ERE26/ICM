@@ -374,16 +374,28 @@ variable, donde no existe un boletín oficial de lo que va a pasar mañana.
 
 **2. El error de predicción y el dinero ordenan los modelos de forma opuesta.**
 
-| Modelo | MASE (error) | Sharpe (dinero) | Coste de equilibrio |
-|---|---|---|---|
-| árbol potenciado | **1,06** (el mejor) | **−0,13** | 0 pb |
-| ridge | 1,24 | +2,63 | 64 pb |
-| lasso | 1,26 (el peor) | **+2,99** | 69 pb |
+| Modelo | MASE (error) | Orden por error | Sharpe (dinero) | Orden por dinero |
+|---|---|---|---|---|
+| LSTM | **1,041** | 3.º | +0,945 | 3.º |
+| árbol potenciado | 1,143 | 4.º | +0,278 | 4.º |
+| ridge | 2,410 | 5.º | +1,122 | 2.º |
+| lasso | **4,251** (el peor) | 6.º | **+1,191** (el mejor) | 1.º |
+
+Cifras de la celda 33 del cuaderno 03. El lasso comete **cuatro veces** el error
+de la referencia ingenua y es el que más dinero gana; el orden se invierte por
+completo entre las dos últimas columnas.
 
 La razón es algebraica, no anecdótica. Como
 `MSE(pred) = MSE(0) − 2·cov(pred, y) + var(pred)`, minimizar el error premia la
 prudencia en la magnitud; y una posición no cobra por la magnitud, cobra por el
 signo. Elegir modelo por el RMSE es elegir el que pierde dinero.
+
+**Advertencia sobre estos números.** Salen del simulador, y la revisión
+adversarial de septiembre de 2026 encontró que el simulador los infla por dos
+vías (ver `docs/revision-adversarial-2.md`): su estacionalidad es un coseno
+determinista que se repite idéntico cada año, y la habilidad de las previsiones
+es un parámetro del fichero. Lo que sí sobrevive es el argumento algebraico de
+arriba, que no depende de los datos. Los niveles, no.
 
 ## Limitaciones conocidas
 
