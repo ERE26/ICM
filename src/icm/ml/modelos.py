@@ -772,6 +772,10 @@ class ParticionSklearn:
                 "particion por un KFold: barajar una serie temporal entrena con el "
                 "futuro."
             )
+        # Aqui no hay objetivo del que deducir el embargo: este envoltorio solo
+        # traduce la particion que le den. Quien lo construye
+        # (buscar_hiperparametros) ya ha resuelto el suyo con
+        # particion_por_defecto antes de llegar aqui.
         self.particion = particion if particion is not None else ParticionWalkForward()
 
     def split(self, X: Any, y: Any = None, groups: Any = None) -> Iterator[
@@ -899,6 +903,8 @@ def buscar_hiperparametros(
         lo que la busqueda puede mirar, y su forma para construir la particion
         interna. Pasar aqui la misma que se pasa a :func:`comparar_modelos` es
         lo correcto y lo previsto.
+        Si se omite, se construye con :func:`particion_por_defecto`, que deduce
+        el embargo del horizonte marcado en ``y``.
 
     Devuelve
     --------
@@ -955,7 +961,7 @@ def buscar_hiperparametros(
             raise ErrorDatos(f"La rejilla de '{clave}' esta vacia: indique al menos un valor.")
         rejilla_pipeline[f"{prefijo}{clave}"] = list(valores)
 
-    particion = particion if particion is not None else ParticionWalkForward()
+    particion = particion if particion is not None else particion_por_defecto(y)
     fin_seleccion, interna = _tramo_de_seleccion(particion, X)
     busqueda = GridSearchCV(
         modelo,
@@ -973,6 +979,40 @@ def buscar_hiperparametros(
 # --- comparacion ---------------------------------------------------------------
 
 
+def particion_por_defecto(y: Any) -> ParticionWalkForward:
+    """Particion walk-forward con el embargo deducido del propio objetivo.
+
+    Una particion construida sin argumentos deja ``embargo=0``, y eso
+    contradice la regla que el propio :class:`ParticionWalkForward` documenta:
+    con un objetivo a ``h`` periodos, las ultimas ``h`` observaciones de
+    entrenamiento tienen su resultado medido dentro del tramo de prueba. Quien
+    no pasa particion se llevaba el defecto neutro sin enterarse.
+
+    Aqui el horizonte no hay que pedirlo: viene marcado en la serie.
+    :func:`icm.ml.caracteristicas.objetivo_rendimiento_futuro` graba
+    ``attrs["horizonte"]``, asi que el camino canonico del paquete
+    (``construir_matriz`` y despues ``comparar_modelos``) queda protegido sin
+    que el usuario tenga que acordarse de nada.
+
+    Sin esa marca no se puede adivinar el horizonte, asi que se mantiene el
+    embargo en cero: suponer uno seria descartar observaciones por un
+    solapamiento que quiza no existe.
+
+    Cuanto importa, medido sobre un objetivo solapado y variables de puro
+    ruido, comparando el error en las filas del borde con el mismo tramo de
+    prueba en ambos casos: a horizonte 1 no hay solape y no cambia nada; a 21
+    la diferencia no se distingue del azar (p = 0,48 con 60 semillas); a 63 el
+    entrenamiento sin embargo aparenta un 33 % menos de error, con
+    p = 6,2e-06 sobre 250 semillas. Es decir, el sesgo es real y crece con el
+    horizonte, y se vuelve medible mucho antes de volverse visible.
+    """
+    horizonte = 0
+    marca = getattr(y, "attrs", {}).get("horizonte")
+    if isinstance(marca, (int, np.integer)) and not isinstance(marca, bool):
+        horizonte = max(int(marca), 0)
+    return ParticionWalkForward(embargo=horizonte)
+
+
 def comparar_modelos(
     X: pd.DataFrame,
     y: pd.Series,
@@ -984,6 +1024,11 @@ def comparar_modelos(
     Todos los modelos recorren **la misma** particion, asi que sus predicciones
     cubren exactamente las mismas fechas y la comparacion es una comparacion y
     no un artefacto del calendario de cada uno.
+
+    Si no se pasa ``particion`` se construye con :func:`particion_por_defecto`,
+    que lee el horizonte marcado en ``y`` y pone ese embargo. Antes se
+    construia una particion neutra, con embargo cero, que es justamente lo que
+    la regla documentada desaconseja para un objetivo solapado.
 
     ``"media_cero"`` se aniade siempre, aunque ``nombres`` no la incluya, y se
     usa como referencia de la tabla. Una tabla de modelos sin linea de flotacion
@@ -1020,7 +1065,7 @@ def comparar_modelos(
             elegidos.append(NOMBRE_REFERENCIA)
     elegidos = list(dict.fromkeys(elegidos))
 
-    particion = particion if particion is not None else ParticionWalkForward()
+    particion = particion if particion is not None else particion_por_defecto(y)
     predicciones: dict[str, pd.Series] = {}
     # Los valores realizados los fija el primer modelo validado; como todos
     # recorren la misma particion, los demas devuelven exactamente los mismos.

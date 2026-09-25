@@ -718,3 +718,67 @@ def test_la_referencia_admite_los_mismos_huecos_que_los_modelos_a_los_que_sirve(
 
     modelo = crear_modelo("media_cero").fit(X, y)
     np.testing.assert_array_equal(modelo.predict(X), np.zeros(50))
+
+
+# --- el embargo por defecto ----------------------------------------------------
+
+
+def test_sin_marca_de_horizonte_el_embargo_por_defecto_es_cero():
+    """No se adivina: sin horizonte conocido, descartar filas seria arbitrario."""
+    from icm.ml.modelos import particion_por_defecto
+
+    y = pd.Series(np.arange(100, dtype=float))
+    assert particion_por_defecto(y).embargo == 0
+
+
+@pytest.mark.parametrize("horizonte", [1, 5, 21, 63])
+def test_el_embargo_por_defecto_sale_del_horizonte_del_objetivo(horizonte):
+    """La marca que deja `objetivo_rendimiento_futuro` basta para deducirlo.
+
+    Antes, quien no pasaba particion se llevaba `embargo=0` aunque su objetivo
+    solapase, contradiciendo la regla que la propia particion documenta.
+    """
+    from icm.ml.caracteristicas import objetivo_rendimiento_futuro
+    from icm.ml.modelos import particion_por_defecto
+
+    generador = np.random.default_rng(1)
+    fechas = pd.bdate_range("2019-01-01", periods=400)
+    precios = pd.Series(100 * np.exp(np.cumsum(generador.standard_normal(400) * 0.01)),
+                        index=fechas)
+    y = objetivo_rendimiento_futuro(precios, horizonte=horizonte)
+    assert particion_por_defecto(y).embargo == horizonte
+
+
+def test_comparar_modelos_hereda_el_embargo_del_objetivo():
+    """El camino canonico queda protegido sin que el usuario haga nada.
+
+    Se compara contra una particion explicita con el mismo embargo: si
+    `comparar_modelos` no lo dedujese, las dos tablas saldrian distintas
+    porque los tramos no coincidirian.
+    """
+    from icm.ml.caracteristicas import construir_matriz
+    from icm.ml.validacion import ParticionWalkForward
+
+    generador = np.random.default_rng(2)
+    fechas = pd.bdate_range("2018-01-01", periods=700)
+    precios = pd.DataFrame(
+        100 * np.exp(np.cumsum(generador.standard_normal((700, 2)) * 0.01, axis=0)),
+        index=fechas, columns=["AAA", "BBB"],
+    )
+    datos = construir_matriz(precios, "AAA", horizonte=5)
+
+    deducido, _ = comparar_modelos(datos.X, datos.y, ["media_cero", "ridge"])
+    explicito, _ = comparar_modelos(
+        datos.X, datos.y, ["media_cero", "ridge"],
+        ParticionWalkForward(embargo=5),
+    )
+    pd.testing.assert_frame_equal(deducido, explicito)
+
+    # Y es distinto de no poner embargo, que es lo que se hacia antes.
+    sin_embargo, _ = comparar_modelos(
+        datos.X, datos.y, ["media_cero", "ridge"],
+        ParticionWalkForward(embargo=0),
+    )
+    assert not deducido.equals(sin_embargo), (
+        "si el embargo no cambiara nada, este arreglo no tendria sentido"
+    )
