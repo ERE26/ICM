@@ -145,13 +145,23 @@ class ConfiguracionRed:
         antes de parar. Al terminar se restauran los pesos de la **mejor**
         epoca, no los de la ultima, que es el motivo de que exista la parada
         temprana: los ultimos pesos son precisamente los que ya han empezado a
-        sobreajustar.
+        sobreajustar. Se ignora si ``proporcion_validacion`` es 0, porque sin
+        tramo reservado no hay ninguna perdida que vigilar.
     proporcion_validacion:
         Fraccion final de la muestra que se reserva para vigilar el
         sobreajuste. Es el ultimo tramo **temporal**. Con 0 no hay validacion
-        interna y la parada temprana pasa a vigilar la perdida de
-        entrenamiento, que es mucho peor sintoma de sobreajuste pero permite
-        aprovechar series muy cortas.
+        interna, y entonces **la parada temprana queda desactivada**: se
+        ejecutan las ``epocas`` completas y se conservan los pesos de la
+        ultima. Es el modo para series muy cortas, donde reservar un tramo
+        costaria demasiadas muestras, y vale a cambio de renunciar a la
+        vigilancia del sobreajuste. Vigilar en su lugar la perdida de
+        entrenamiento, que es lo que se hacia antes, no es una version debil de
+        la parada temprana sino una averia: esa perdida baja casi siempre, asi
+        que no avisa de nada, y su ruido de minilote y de abandono basta para
+        agotar la paciencia y cortar el entrenamiento por sorpresa (medido:
+        con abandono 0.2 y paciencia 2 paraba en la epoca 14 de 30 y se quedaba
+        con unos pesos de perdida real 0.0139 cuando la epoca 26 llegaba a
+        0.0063).
     semilla:
         Se aplica a PyTorch y al generador de numpy que ordena los minilotes,
         de modo que dos ajustes con la misma configuracion y los mismos datos
@@ -737,6 +747,18 @@ class RedSecuencial:
         # aspecto normal.
         mejores_pesos: dict[str, Any] | None = None
         epocas_sin_mejora = 0
+        # Sin tramo de validacion no hay parada temprana en absoluto: se corren
+        # las epocas pedidas y se conservan los pesos de la ultima. Sustituir la
+        # perdida de validacion por la de entrenamiento, como se hacia, no es
+        # una parada temprana peor sino una averia con el nombre de la buena. Por
+        # un lado no protege: la perdida de entrenamiento baja casi siempre, que
+        # es justo lo que hace un modelo al sobreajustar. Por otro hace dano: es
+        # la media de los minilotes medida en modo train, o sea con el abandono
+        # activo y con los pesos de ANTES de cada paso del optimizador, asi que
+        # su ruido agota la paciencia y corta el entrenamiento a media
+        # convergencia acreditando a los pesos guardados una cifra que
+        # corresponde a otro estado de la red.
+        parada_temprana = n_validacion > 0
 
         for epoca in range(1, configuracion.epocas + 1):
             red.train()
@@ -756,12 +778,11 @@ class RedSecuencial:
                 acumulada += float(perdida.detach()) * len(posiciones)
             perdida_entrenamiento = acumulada / n_entrenamiento
 
-            red.eval()
-            if n_validacion:
+            perdida_validacion = float("nan")
+            if parada_temprana:
+                red.eval()
                 with torch.no_grad():
                     perdida_validacion = float(criterio(red(X_validacion), y_validacion))
-            else:
-                perdida_validacion = perdida_entrenamiento
 
             historial.append(
                 {
@@ -771,6 +792,8 @@ class RedSecuencial:
                 }
             )
 
+            if not parada_temprana:
+                continue
             if perdida_validacion < mejor_perdida:
                 mejor_perdida = perdida_validacion
                 mejores_pesos = copy.deepcopy(red.state_dict())
@@ -780,20 +803,21 @@ class RedSecuencial:
                 if epocas_sin_mejora >= configuracion.paciencia:
                     break
 
-        if mejores_pesos is None:
-            raise ErrorDatos(
-                f"La perdida de validacion no fue finita en ninguna de las {len(historial)} "
-                "epocas, asi que no hay ninguna 'mejor epoca' que restaurar y devolver la "
-                "red con los pesos de su inicializacion aleatoria seria peor que fallar. "
-                "La causa habitual es un valor extremo en 'y' que desborda al elevarse al "
-                "cuadrado sobre la escala del entrenamiento (con validacion interna, en su "
-                "ultimo tramo): recortelo, pase a logaritmos o baje 'tasa_aprendizaje'."
-            )
-
-        # Los pesos que se conservan son los de la mejor epoca. Quedarse con
-        # los ultimos haria inutil la parada temprana: son justamente los que
-        # ya habian empezado a sobreajustar durante las epocas de paciencia.
-        red.load_state_dict(mejores_pesos)
+        if parada_temprana:
+            if mejores_pesos is None:
+                raise ErrorDatos(
+                    f"La perdida de validacion no fue finita en ninguna de las "
+                    f"{len(historial)} epocas, asi que no hay ninguna 'mejor epoca' que "
+                    "restaurar y devolver la red con los pesos de su inicializacion "
+                    "aleatoria seria peor que fallar. La causa habitual es un valor extremo "
+                    "en 'y' que desborda al elevarse al cuadrado sobre la escala del "
+                    "entrenamiento (con validacion interna, en su ultimo tramo): recortelo, "
+                    "pase a logaritmos o baje 'tasa_aprendizaje'."
+                )
+            # Los pesos que se conservan son los de la mejor epoca. Quedarse con
+            # los ultimos haria inutil la parada temprana: son justamente los que
+            # ya habian empezado a sobreajustar durante las epocas de paciencia.
+            red.load_state_dict(mejores_pesos)
         red.eval()
         self._red = red
         self._historial = historial
@@ -862,6 +886,17 @@ class RedSecuencial:
         suele significar que conviene subir ``epocas``. Las dos columnas juntas
         son el diagnostico habitual de sobreajuste: la de entrenamiento baja y
         la de validacion empieza a subir.
+
+        Con ``proporcion_validacion`` a 0, ``perdida_validacion`` es ``NaN``
+        entera: no hay tramo reservado sobre el que medirla. Antes se rellenaba
+        con una copia de la de entrenamiento, que daba dos columnas identicas y
+        aparentaba un diagnostico de sobreajuste donde no habia ninguno.
+
+        La de entrenamiento es la media ponderada de los minilotes de la epoca,
+        cada uno medido antes de su paso del optimizador y con el abandono
+        activo, asi que describe el recorrido de la epoca y no el estado en que
+        la red la termina. Sirve para ver si converge; no para comparar epocas
+        entre si.
         """
         if not self._historial:
             raise ErrorDatos(

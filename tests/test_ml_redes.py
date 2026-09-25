@@ -499,18 +499,24 @@ def test_un_tramo_de_entrenamiento_degenerado_se_rechaza() -> None:
         )
 
 
-def test_sin_validacion_interna_la_parada_temprana_vigila_el_entrenamiento() -> None:
-    """Con ``proporcion_validacion`` a cero el ajuste sigue funcionando.
+def test_sin_validacion_interna_no_hay_parada_temprana_en_absoluto() -> None:
+    """Con ``proporcion_validacion`` a cero se corren todas las epocas.
 
-    Es el modo para series muy cortas: no hay tramo que reservar, asi que las
-    dos columnas del historial coinciden.
+    La version anterior de esta prueba consagraba el fallo: afirmaba que las
+    dos columnas del historial coinciden, porque el codigo rellenaba la perdida
+    de validacion con una copia de la de entrenamiento. Eso no era una parada
+    temprana mas debil, era una averia con el nombre de la buena. La perdida de
+    entrenamiento baja casi siempre, asi que no avisa de nada; y al medirse por
+    minilotes, con el abandono activo y con los pesos de antes de cada paso del
+    optimizador, su ruido agota la paciencia y corta el entrenamiento a media
+    convergencia. Ahora la parada temprana queda desactivada y se dice.
     """
     X, y = _datos_suma_ventana(n=120, ventana=4)
     configuracion = ConfiguracionRed(
         ventana=4,
         unidades=8,
         epocas=4,
-        paciencia=4,
+        paciencia=1,   # con la averia, una paciencia de 1 cortaria por ruido
         tamano_lote=32,
         proporcion_validacion=0.0,
         semilla=3,
@@ -518,11 +524,37 @@ def test_sin_validacion_interna_la_parada_temprana_vigila_el_entrenamiento() -> 
     red = RedSecuencial(configuracion).ajustar(X, y)
     historial = red.historial
 
-    assert np.array_equal(
-        historial["perdida_entrenamiento"].to_numpy(),
-        historial["perdida_validacion"].to_numpy(),
+    assert len(historial) == 4, "sin tramo de validacion no se corta ninguna epoca"
+    assert historial["perdida_validacion"].isna().all(), (
+        "sin tramo reservado no hay perdida de validacion que informar, y "
+        "copiar la de entrenamiento aparentaria un diagnostico inexistente"
     )
+    assert np.isfinite(historial["perdida_entrenamiento"]).all()
     assert np.isfinite(red.predecir(X)[3:]).all()
+
+
+def test_con_validacion_interna_la_parada_temprana_si_actua() -> None:
+    """El contraste del test anterior: con tramo reservado, la parada funciona.
+
+    Sin este par, desactivar la parada temprana podria haberse colado como
+    "la parada temprana ya no hace nada nunca".
+    """
+    X, y = _datos_suma_ventana(n=200, ventana=4)
+    configuracion = ConfiguracionRed(
+        ventana=4,
+        unidades=8,
+        epocas=60,
+        paciencia=2,
+        tamano_lote=32,
+        tasa_aprendizaje=0.05,
+        proporcion_validacion=0.25,
+        semilla=3,
+    )
+    red = RedSecuencial(configuracion).ajustar(X, y)
+    historial = red.historial
+
+    assert len(historial) < 60, "con validacion interna la paciencia debe cortar"
+    assert np.isfinite(historial["perdida_validacion"]).all()
 
 
 # --- integracion con la validacion hacia delante -------------------------------

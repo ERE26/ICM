@@ -47,7 +47,7 @@ from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import check_is_fitted, validate_data
 
 from icm.comun import ErrorDatos
 from icm.ml.evaluacion import tabla_evaluacion
@@ -85,19 +85,44 @@ class MediaCero(RegressorMixin, BaseEstimator):
     pretenderia estimar, asi que introduce un sesgo direccional arbitrario. Cero
     no tiene ese problema y es la cifra que se defiende sola.
 
-    ``fit`` no aprende nada, pero si guarda el numero de variables: asi
+    ``fit`` no aprende nada, pero valida ``X`` con ``validate_data`` de
+    scikit-learn y con eso fija ``n_features_in_`` y ``feature_names_in_``: asi
     ``check_is_fitted`` distingue una instancia ajustada de una recien creada, y
-    el objeto se comporta como cualquier otro estimador de scikit-learn en la
-    validacion, en la busqueda de hiperparametros y en la tabla comparativa.
+    la referencia expone los mismos atributos que los cinco modelos con los que
+    comparte tabla. Sin ellos era el unico Pipeline del catalogo cuyo
+    ``n_features_in_`` lanzaba ``AttributeError``, de modo que cualquier codigo
+    generico que recorriera :data:`MODELOS` se rompia solo en su fila.
+
+    ``predict`` repite la validacion con ``reset=False``, que comprueba que
+    ``X`` traiga las mismas columnas del ajuste. Que la prediccion sea siempre
+    cero no hace inofensivo el desajuste: la referencia decide cuantas filas
+    devuelve, y un vector de una dimension o una tabla de otras columnas daban
+    en silencio una serie de ceros de la longitud equivocada, que luego se pega
+    por posicion contra los valores realizados.
+
+    La validacion eleva ``ValueError`` de scikit-learn y no ``ErrorDatos``
+    porque aqui el contrato que se cumple es el de estimador: ``Pipeline``,
+    ``GridSearchCV`` y ``check_estimator`` esperan esa excepcion, y quien llama
+    lo hace a traves de ellos y no de la API de ``icm``.
     """
 
     def fit(self, X: Any, y: Any = None) -> MediaCero:
-        forma = getattr(X, "shape", None)
-        self.n_variables_ = int(forma[1]) if forma is not None and len(forma) > 1 else 1
+        # Se permiten NaN porque 'arbol_potenciado' los admite y
+        # comparar_modelos anade siempre la referencia: si fuese mas estricta
+        # que los modelos a los que sirve de linea de flotacion, la tabla no se
+        # podria calcular con las entradas con las que si se calculan ellos.
+        if y is None:
+            X = validate_data(self, X, ensure_all_finite="allow-nan")
+        else:
+            X, _ = validate_data(
+                self, X, y, ensure_all_finite="allow-nan", y_numeric=True
+            )
+        self.n_variables_ = self.n_features_in_
         return self
 
     def predict(self, X: Any) -> np.ndarray:
         check_is_fitted(self)
+        X = validate_data(self, X, reset=False, ensure_all_finite="allow-nan")
         return np.zeros(_n_filas(X), dtype=float)
 
 

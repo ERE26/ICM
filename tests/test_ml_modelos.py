@@ -658,3 +658,63 @@ def test_comparar_modelos_con_lista_vacia_lanza_error_datos(datos_lineales, part
     X, y = datos_lineales
     with pytest.raises(ErrorDatos, match="vacio"):
         comparar_modelos(X, y, [], particion)
+
+
+# --- el contrato de estimador de la referencia --------------------------------
+
+
+def test_la_referencia_expone_los_mismos_atributos_que_los_demas_modelos():
+    """`media_cero` era el unico del catalogo sin `n_features_in_`.
+
+    Cualquier codigo generico que recorriese MODELOS se rompia solo en su fila,
+    y con un AttributeError que no explicaba por que ese modelo era distinto.
+    """
+    generador = np.random.default_rng(4)
+    X = pd.DataFrame(generador.standard_normal((60, 3)), columns=["a", "b", "c"])
+    y = pd.Series(generador.standard_normal(60))
+
+    # Se comprueba en el Pipeline, que es el objeto publico y el que delega
+    # estos atributos a su primer paso. En los lineales ese paso es el
+    # escalador, asi que el estimador final no ve los nombres de las columnas;
+    # en 'media_cero', que no necesita escalado, el primer paso es la propia
+    # referencia, y de ahi que fuese la unica fila que se rompia.
+    for nombre in MODELOS:
+        modelo = crear_modelo(nombre).fit(X, y)
+        assert modelo.n_features_in_ == 3, f"{nombre} no informa n_features_in_"
+        assert list(modelo.feature_names_in_) == ["a", "b", "c"], nombre
+
+
+def test_la_referencia_rechaza_un_numero_de_columnas_distinto_al_del_ajuste():
+    """Que la prediccion sea cero no hace inofensivo el desajuste.
+
+    La referencia decide CUANTAS filas devuelve, y su salida se pega contra los
+    valores realizados. Una tabla de otras columnas daba en silencio una serie
+    de ceros, y si la longitud no era la que se esperaba, el emparejamiento
+    posterior comparaba fechas distintas.
+    """
+    generador = np.random.default_rng(5)
+    X = pd.DataFrame(generador.standard_normal((40, 3)), columns=["a", "b", "c"])
+    y = pd.Series(generador.standard_normal(40))
+    modelo = crear_modelo("media_cero").fit(X, y)
+
+    otras = pd.DataFrame(generador.standard_normal((10, 7)))
+    with pytest.raises(ValueError):
+        modelo.predict(otras)
+
+    # Con las columnas del ajuste sigue devolviendo ceros, como debe.
+    np.testing.assert_array_equal(modelo.predict(X.head(5)), np.zeros(5))
+
+
+def test_la_referencia_admite_los_mismos_huecos_que_los_modelos_a_los_que_sirve():
+    """No puede ser mas estricta que el arbol potenciado, que admite NaN.
+
+    Si lo fuese, `comparar_modelos` no podria calcular la tabla con las mismas
+    entradas con las que si la calculan los modelos que la referencia mide.
+    """
+    generador = np.random.default_rng(6)
+    X = pd.DataFrame(generador.standard_normal((50, 3)), columns=["a", "b", "c"])
+    X.iloc[5, 1] = np.nan
+    y = pd.Series(generador.standard_normal(50))
+
+    modelo = crear_modelo("media_cero").fit(X, y)
+    np.testing.assert_array_equal(modelo.predict(X), np.zeros(50))
