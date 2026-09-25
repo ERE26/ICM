@@ -72,6 +72,11 @@ _TOLERANCIA_ABSOLUTA = 1e-12
 # dejaria de caber en una bateria de pruebas y se dejaria de ejecutar.
 _MAX_CORTES_POR_OMISION = 48
 
+# Dias que se desplazan las fechas posteriores al corte en el tercer
+# experimento. Cualquier valor positivo sirve; siete deja el hueco bien visible
+# sin romper el orden del indice.
+_DIAS_CALENDARIO_ALTERADO = 7
+
 
 # --- utilidades internas -------------------------------------------------------
 
@@ -140,6 +145,38 @@ def _validar_enteros(valores, nombre: str, minimo: int, motivo: str) -> tuple[in
     return tuple(dict.fromkeys(salida))
 
 
+def _validar_columnas_unicas(marco: pd.DataFrame, nombre: str) -> None:
+    """Exige nombres de columna distintos.
+
+    Con dos columnas homonimas, ``marco[objetivo]`` devuelve un DataFrame en vez
+    de una Series y la primera comprobacion que se haga sobre el revienta con un
+    mensaje de pandas que no dice ni cual es la columna culpable ni que hacer.
+    """
+    repetidas = sorted({str(c) for c in marco.columns[marco.columns.duplicated()]})
+    if repetidas:
+        raise ErrorDatos(
+            f"'{nombre}' tiene columnas con el mismo nombre ({', '.join(repetidas)}): no "
+            "se sabe cual de ellas es el activo. Renombrelas o quedese con una, por "
+            f"ejemplo con {nombre}.loc[:, ~{nombre}.columns.duplicated()]."
+        )
+
+
+def _validar_indice_sin_duplicados(indice: pd.Index, nombre: str) -> None:
+    """Exige un indice sin etiquetas repetidas.
+
+    Va aparte del orden porque hay entradas que se alinean por etiqueta y a las
+    que el desorden no afecta (una exogena se incorpora con ``reindex``, que
+    trabaja por etiqueta), mientras que las etiquetas repetidas rompen ese
+    mismo ``reindex`` y ademas dejan ambiguo que valor corresponde a la fecha.
+    """
+    if indice.has_duplicates:
+        repetidas = [_texto(f) for f in indice[indice.duplicated()].unique()[:3]]
+        raise ErrorDatos(
+            f"El indice de '{nombre}' tiene fechas repetidas ({', '.join(repetidas)}...): "
+            "agregue o elimine los duplicados antes de construir variables."
+        )
+
+
 def _validar_indice_temporal(indice: pd.Index, nombre: str) -> None:
     """Exige un indice ordenado y sin fechas repetidas.
 
@@ -149,18 +186,42 @@ def _validar_indice_temporal(indice: pd.Index, nombre: str) -> None:
     Ordenar por dentro y en silencio seria peor, porque el resto del analisis
     seguiria trabajando con el orden original.
     """
-    if indice.has_duplicates:
-        repetidas = [_texto(f) for f in indice[indice.duplicated()].unique()[:3]]
-        raise ErrorDatos(
-            f"El indice de '{nombre}' tiene fechas repetidas ({', '.join(repetidas)}...): "
-            "agregue o elimine los duplicados antes de construir variables."
-        )
+    _validar_indice_sin_duplicados(indice, nombre)
     if not indice.is_monotonic_increasing:
         raise ErrorDatos(
             f"El indice de '{nombre}' no esta ordenado de menor a mayor. Ordenelo con "
             ".sort_index(): con las filas desordenadas un retardo puede traer un valor "
             "posterior en el tiempo."
         )
+
+
+def huella_alineamiento(serie: pd.Series) -> tuple:
+    """Fechas del primer y del ultimo valor de ``serie``: su huella de alineamiento.
+
+    Sirve para desconfiar de una marca caducada. ``attrs`` viaja pegado al
+    objeto y sobrevive intacto a ``.shift()``, ``.dropna()``, ``.reindex()`` y a
+    la aritmetica, asi que ``attrs["convencion"] = "futuro"`` dice de donde
+    salio la serie y no como esta alineada **ahora**: quien la realinea con
+    ``.shift(1)`` se queda con una serie contemporanea que sigue diciendo
+    "futuro", y el consumidor
+    (:func:`icm.ml.estrategia.ejecutar_estrategia`) la ejecuta con retardo 0,
+    que es leer el futuro.
+
+    Estas dos fechas si se mueven con cualquier desplazamiento (``.shift()``
+    cambia al menos una de las dos, tambien con ``fill_value``) y en cambio no
+    cambian al limpiar los ausentes ni al reescalar, que son operaciones que no
+    tocan el alineamiento. Por eso son la huella: comparar
+    ``serie.attrs.get("huella")`` con ``huella_alineamiento(serie)`` distingue
+    una serie tal como la produjo este modulo de una que ya se ha realineado,
+    sin dar la alarma por operaciones inocentes.
+    """
+    return (serie.first_valid_index(), serie.last_valid_index())
+
+
+def _marcar_alineamiento(serie: pd.Series) -> pd.Series:
+    """Graba la huella del alineamiento actual de la serie en ``attrs``."""
+    serie.attrs["huella"] = huella_alineamiento(serie)
+    return serie
 
 
 def _nombre_base(columna, prefijo: str | None, era_serie: bool) -> str:
@@ -390,6 +451,14 @@ def objetivo_rendimiento_futuro(
 
     Las ultimas ``horizonte`` fechas quedan a NaN: su futuro todavia no ha
     ocurrido. Son justamente las filas sobre las que se predice en produccion.
+
+    La serie sale marcada en ``attrs``: ``convencion="futuro"``, ``horizonte``,
+    ``tipo_rendimiento`` y ``huella``, la huella del alineamiento que describe
+    la marca (vease :func:`huella_alineamiento`). El consumidor de la marca,
+    :func:`icm.ml.estrategia.ejecutar_estrategia`, deduce de ella el retardo de
+    ejecucion; con la huella puede comprobar ademas que la serie no se ha
+    realineado por el camino, porque ``attrs`` sobrevive a ``.shift()`` y la
+    marca sola no distingue una serie adelantada de una que ya no lo esta.
     """
     serie = _como_serie(precios, "precios", base="precio")
     if tipo not in {"log", "simple"}:
@@ -416,7 +485,10 @@ def objetivo_rendimiento_futuro(
     salida.attrs["convencion"] = "futuro"
     salida.attrs["horizonte"] = paso
     salida.attrs["tipo_rendimiento"] = tipo
-    return salida
+    # Y junto a la marca, la huella del alineamiento que describe: la marca sola
+    # sobrevive a .shift() y entonces afirma un adelanto que ya no existe.
+    # Vease :func:`huella_alineamiento`.
+    return _marcar_alineamiento(salida)
 
 
 # --- matriz de datos -----------------------------------------------------------
@@ -498,6 +570,7 @@ def construir_matriz(
     """
     marco = _como_marco(precios, "precios", base="precio")
     _validar_indice_temporal(marco.index, "precios")
+    _validar_columnas_unicas(marco, "precios")
     if objetivo not in marco.columns:
         disponibles = ", ".join(str(c) for c in marco.columns)
         raise ErrorDatos(
@@ -556,6 +629,9 @@ def construir_matriz(
 
     if exogenas is not None:
         exo = _como_marco(exogenas, "exogenas", base="exogena")
+        # El desorden no importa (el reindex posterior alinea por etiqueta, no
+        # por posicion), pero las fechas repetidas si: rompen ese reindex.
+        _validar_indice_sin_duplicados(exo.index, "exogenas")
         comunes = exo.index.intersection(marco.index)
         if len(comunes) == 0:
             raise ErrorDatos(
@@ -563,6 +639,18 @@ def construir_matriz(
                 "ninguna fecha en comun. Reindexe las exogenas al calendario de precios."
             )
         agregar("exogenas", retardos(exo.reindex(marco.index), retardos_exogenas, prefijo="exo"))
+
+    if not bloques:
+        # Pasa con incluir=('cruzadas',) y un solo activo: la familia existe, se
+        # pide, y no aporta ninguna columna porque no hay ningun OTRO activo.
+        # El control de arriba no lo ve, porque 'incluir' no esta vacio.
+        raise ErrorDatos(
+            "Las familias pedidas no han producido ninguna variable con "
+            f"{marco.shape[1]} activo(s) en 'precios': 'cruzadas' son los retardos de "
+            f"los DEMAS activos y '{objetivo}' es el unico que hay. Aniada al marco los "
+            "activos cruzados que quiera usar, o pida alguna familia mas de "
+            f"{{{', '.join(f for f in FAMILIAS if f != 'cruzadas')}}}."
+        )
 
     X = pd.concat(bloques, axis=1)
     repetidas = sorted(set(X.columns[X.columns.duplicated()]))
@@ -584,8 +672,12 @@ def construir_matriz(
     objetivo_alineado = completo[_CLAVE_OBJETIVO].rename(y.name)
     # pandas no arrastra attrs a traves de la concatenacion y el filtrado, asi
     # que la marca de convencion se vuelve a poner a mano: es la que evita el
-    # doble desplazamiento en el backtest.
+    # doble desplazamiento en el backtest. La huella, en cambio, se recalcula:
+    # la de 'y' describe la serie sin alinear y aqui sobran las filas del
+    # calentamiento, asi que copiarla tal cual acusaria de realineada a la
+    # unica serie que con seguridad no lo esta.
     objetivo_alineado.attrs.update(y.attrs)
+    _marcar_alineamiento(objetivo_alineado)
 
     return MatrizDatos(
         X=completo.loc[:, X.columns],
@@ -677,6 +769,46 @@ def _perturbar_futuro(marco: pd.DataFrame, corte, semilla: int = 0) -> pd.DataFr
     copia = marco.copy()
     copia.iloc[posterior] = marco.to_numpy()[posterior] * factores + desplazamientos
     return copia
+
+
+def _alterar_calendario_futuro(datos, corte):
+    """Cambia **cuando** ocurre el futuro, no solo cuanto vale.
+
+    Reescribir los valores deja el calendario intacto, asi que una variable que
+    use la POSICION de las observaciones posteriores en lugar de sus valores
+    (cuantos dias faltan para el siguiente dato, si maniana hay cotizacion,
+    cuantas fechas quedan en la muestra) sale igual en las tres llamadas y
+    atraviesa la auditoria sin dejar rastro. El experimento 1 tampoco la ve,
+    porque la unica fila que la delataria, la del borde, desaparece al eliminar
+    los NaN.
+
+    Se hacen las dos cosas que un calendario puede hacer distinto: se elimina
+    una de cada dos fechas posteriores al corte, empezando por la primera (que
+    es la que fija "cuando vuelve a haber dato", y ademas cambia cuantas
+    quedan), y se desplazan unos dias las que sobreviven. Lo anterior al corte
+    no se toca: sus fechas siguen siendo las mismas, asi que una variable
+    causal da exactamente el mismo numero y solo cambian las que miran el
+    calendario de despues. El desplazamiento es hacia delante y uniforme, de
+    modo que el indice sigue creciendo y sin repetidos, que es lo que exige
+    cualquier constructor razonable.
+    """
+    indice = datos.index
+    posteriores = np.flatnonzero(np.asarray(indice > corte))
+    if posteriores.size == 0:
+        return datos
+    sobran = {int(p) for p in posteriores[::2]} if posteriores.size > 1 else set()
+    salida = datos.iloc[[p for p in range(len(indice)) if p not in sobran]]
+    conservado = salida.index
+    if isinstance(conservado, pd.DatetimeIndex):
+        # .where sobre el propio indice para no perder la zona horaria por el
+        # camino: reconstruirlo desde numpy la dejaria en UTC y entonces ni una
+        # sola fecha anterior al corte casaria con la matriz de referencia.
+        desplazado = conservado.where(
+            np.asarray(conservado <= corte),
+            conservado + pd.Timedelta(days=_DIAS_CALENDARIO_ALTERADO),
+        )
+        salida = salida.set_axis(pd.DatetimeIndex(desplazado, name=conservado.name), axis=0)
+    return salida
 
 
 def _datos_de_kwargs(kwargs: dict) -> dict[str, pd.Series | pd.DataFrame]:
@@ -803,7 +935,7 @@ def comprobar_ausencia_de_fuga(
     :func:`construir_matriz` como sobre cualquier constructor que escriba el
     usuario, con la firma ``(precios, objetivo, **kwargs) -> MatrizDatos``.
 
-    Para cada fecha de corte se hacen dos experimentos:
+    Para cada fecha de corte se hacen tres experimentos:
 
     1. **Truncar.** Se reconstruye la matriz con la serie cortada en ``t`` y se
        comparan los valores. Detecta todo lo que dependa de la muestra
@@ -815,8 +947,15 @@ def comprobar_ausencia_de_fuga(
        da los mismos valores en la serie truncada (porque su ultima fila, la
        unica que la delataria, desaparece al eliminar los NaN) y en cambio
        reacciona de inmediato a que el futuro cambie.
+    3. **Reescribir el futuro y su calendario.** Lo mismo, pero moviendo
+       ademas las fechas posteriores al corte (se elimina una de cada dos y se
+       desplazan las demas). Detecta las variables que leen el calendario de
+       despues en lugar de los valores: cuantos dias faltan para el siguiente
+       dato, si maniana hay cotizacion, cuantas fechas quedan en la muestra.
+       En una serie de energia con calendario irregular, "cuando vuelve a
+       haber dato" no es informacion neutra.
 
-    Los dos experimentos se aplican a ``precios`` y a **todos** los argumentos
+    Los tres experimentos se aplican a ``precios`` y a **todos** los argumentos
     de ``kwargs`` que sean Series o DataFrame, no solo al que se llame
     ``exogenas``: un argumento que llegue igual a las tres llamadas produce por
     construccion las mismas columnas en las tres matrices, y entonces la
@@ -837,9 +976,8 @@ def comprobar_ausencia_de_fuga(
     fuga viaja ya cocinada dentro de ``precios`` y no hay eleccion de cortes que
     la encuentre, porque lo que se contrasta es el constructor y no su entrada.
     Interpole despues de auditar, o mejor, dentro del constructor, donde si se
-    ve. Tampoco se altera el **indice** del futuro, asi que una variable que lea
-    el calendario posterior (cuantos dias faltan para el siguiente dato, si
-    maniana hay cotizacion) pasa sin dejar rastro.
+    ve. Un "pasa" dice que el constructor es causal con los datos que recibio,
+    no que los datos que recibio sean limpios.
 
     Parametros
     ----------
@@ -889,3 +1027,23 @@ def comprobar_ausencia_de_fuga(
             perturbados[nombre] = _perturbar_datos(valor, nombre, corte, semilla=1)
         alterada = constructor(_perturbar_futuro(marco, corte), objetivo, **perturbados)
         _comparar(referencia, alterada, corte, experimento="al reescribir lo posterior a")
+
+        # Misma perturbacion, pero moviendo tambien el calendario del futuro:
+        # sin esto, una variable que lea cuando llega el siguiente dato en vez
+        # de cuanto vale pasa las dos pruebas anteriores.
+        recalendarizados = {**kwargs}
+        for nombre, valor in datos_extra.items():
+            recalendarizados[nombre] = _alterar_calendario_futuro(
+                _perturbar_datos(valor, nombre, corte, semilla=2), corte
+            )
+        alterada = constructor(
+            _alterar_calendario_futuro(_perturbar_futuro(marco, corte, semilla=2), corte),
+            objetivo,
+            **recalendarizados,
+        )
+        _comparar(
+            referencia,
+            alterada,
+            corte,
+            experimento="al cambiar los valores y las fechas posteriores a",
+        )

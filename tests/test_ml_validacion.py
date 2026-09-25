@@ -561,6 +561,45 @@ def test_los_parametros_imposibles_se_rechazan_al_construir(parametros):
         ParticionWalkForward(**parametros)
 
 
+@pytest.mark.parametrize(
+    ("parametros", "culpable"),
+    [
+        ({"n_particiones": 2.5}, "n_particiones"),
+        ({"tamano_prueba": 50.9}, "tamano_prueba"),
+        ({"embargo": 5.7}, "embargo"),
+        ({"tamano_entrenamiento_minimo": 100.5}, "tamano_entrenamiento_minimo"),
+        ({"embargo": True}, "embargo"),
+        ({"n_particiones": "5"}, "n_particiones"),
+    ],
+)
+def test_los_parametros_no_enteros_se_rechazan_al_construir_y_dicen_cual(parametros, culpable):
+    """Un parametro fraccionario tiene que morir aqui y con nombre y apellidos.
+
+    Antes se aceptaba al construir y el fallo salia mucho despues: ``embargo=5.7``
+    y ``tamano_entrenamiento_minimo=100.5`` daban cinco tramos con huecos
+    ``np.float64(5.0)`` y reventaban dentro de numpy con ``IndexError: arrays used
+    as indices must be of integer or boolean type``, que no dice que parametro lo
+    ha causado; ``n_particiones=2.5`` moria en ``range`` con un ``TypeError``
+    igual de mudo. El peor no avisaba: ``tamano_prueba=50.9`` se truncaba a 50 en
+    silencio, asi que la particion auditada no era la pedida.
+
+    ``embargo=True`` entra en la lista porque un ``bool`` es un entero en Python
+    y valdria 1, que no es lo que nadie quiere decir con una bandera.
+    """
+    with pytest.raises(ErrorDatos, match=culpable):
+        ParticionWalkForward(**parametros)
+
+
+def test_los_enteros_de_numpy_valen_como_parametros(X):
+    """Exigir enteros no puede excluir los de numpy, que salen de cualquier ``len``."""
+    particion = ParticionWalkForward(
+        n_particiones=np.int64(3), tamano_prueba=np.int32(50), embargo=np.int8(2)
+    )
+
+    assert particion.n_divisiones(X) == 3
+    assert isinstance(particion.embargo, int)
+
+
 def test_un_indice_desordenado_se_rechaza(X):
     desordenado = X.iloc[::-1]
 
@@ -615,3 +654,18 @@ def test_x_e_y_con_indices_distintos_se_rechazan(X, y):
 
     with pytest.raises(ErrorDatos, match="indice"):
         validacion_walk_forward(LinearRegression(), X, desplazado)
+
+
+def test_un_y_tabla_de_otro_periodo_se_rechaza_por_el_indice_y_no_por_la_forma(X, y):
+    """El guardian de alineacion tiene que actuar tambien con un ``y`` tabla.
+
+    Con ``isinstance(y, pd.Series)`` el guardian no miraba un ``DataFrame`` de una
+    columna, y el rechazo llegaba despues, del control de dimensiones: el mensaje
+    hablaba de la forma y callaba lo grave, que las fechas no son las mismas. Quien
+    obedecia y seleccionaba la columna se encontraba el desajuste intacto.
+    """
+    desplazado = y.copy()
+    desplazado.index = desplazado.index + pd.Timedelta(days=1)
+
+    with pytest.raises(ErrorDatos, match="no comparten indice"):
+        validacion_walk_forward(LinearRegression(), X, desplazado.to_frame())

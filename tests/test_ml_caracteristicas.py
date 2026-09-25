@@ -17,11 +17,13 @@ from icm.datos import simular_precios
 from icm.ml.caracteristicas import (
     FAMILIAS,
     MatrizDatos,
+    _alterar_calendario_futuro,
     _comparar,
     _perturbar_futuro,
     calendario,
     comprobar_ausencia_de_fuga,
     construir_matriz,
+    huella_alineamiento,
     medias_moviles,
     momento,
     objetivo_rendimiento_futuro,
@@ -269,6 +271,54 @@ def test_el_objetivo_rechaza_horizontes_no_positivos_y_tipos_desconocidos(serie_
         objetivo_rendimiento_futuro(serie_precios, tipo="geometrico")
 
 
+# --- huella del alineamiento ---------------------------------------------------
+
+
+def test_el_objetivo_guarda_la_huella_del_alineamiento_que_describe(serie_precios):
+    y = objetivo_rendimiento_futuro(serie_precios, horizonte=2)
+
+    assert y.attrs["huella"] == huella_alineamiento(y)
+    # El tramo con valor: desde la primera fecha hasta la ultima cuyo futuro ya
+    # ha ocurrido, que con horizonte 2 es la antepenultima.
+    assert y.attrs["huella"] == (serie_precios.index[0], serie_precios.index[-3])
+
+
+def test_la_huella_delata_una_serie_realineada_aunque_la_marca_sobreviva(serie_precios):
+    """Es el unico modo de desconfiar de una marca caducada.
+
+    ``attrs['convencion']`` sobrevive intacto a ``.shift()``, asi que una serie
+    ya realineada sigue diciendo "futuro" y ``ejecutar_estrategia`` deduce de
+    ella un retardo 0 sobre rendimientos contemporaneos, que es leer el futuro.
+    La huella si se mueve con el desplazamiento.
+    """
+    y = objetivo_rendimiento_futuro(serie_precios, horizonte=1)
+
+    for realineada in (y.shift(1), y.shift(-1), y.shift(1, fill_value=0.0)):
+        assert realineada.attrs["convencion"] == "futuro"
+        assert realineada.attrs["huella"] != huella_alineamiento(realineada)
+
+
+def test_la_huella_no_da_la_alarma_por_operaciones_que_no_realinean(serie_precios):
+    """Una huella que salta con todo no distingue nada y se acabaria ignorando."""
+    y = objetivo_rendimiento_futuro(serie_precios, horizonte=1)
+
+    for intacta in (y.dropna(), y * 2.0, y.copy(), y.rename("otro"), y.astype("float32")):
+        assert intacta.attrs["huella"] == huella_alineamiento(intacta)
+
+
+def test_la_matriz_rehace_la_huella_del_objetivo_ya_alineado(precios_cortos):
+    """La huella de 'y' describe la serie sin alinear: aqui sobra el calentamiento.
+
+    Copiarla tal cual acusaria de realineada a la unica serie que con seguridad
+    no lo esta, y el aviso dejaria de significar nada.
+    """
+    datos = construir_matriz(precios_cortos, "ALFA", horizonte=3)
+
+    assert datos.y.attrs["convencion"] == "futuro"
+    assert datos.y.attrs["huella"] == huella_alineamiento(datos.y)
+    assert datos.y.attrs["huella"] == (datos.y.index[0], datos.y.index[-1])
+
+
 # --- matriz completa -----------------------------------------------------------
 
 
@@ -369,6 +419,60 @@ def test_un_indice_con_fechas_repetidas_se_rechaza(precios_cortos):
         construir_matriz(duplicados, "ALFA")
 
 
+def test_las_cruzadas_con_un_solo_activo_dicen_que_falta_el_otro(precios_cortos):
+    """Un borde normal: 'incluir' no esta vacio, pero no queda ninguna columna.
+
+    Antes salia por el ``ValueError`` de ``pd.concat`` ("No objects to
+    concatenate"), que no dice ni que familia se ha quedado sin variables ni
+    que hacer.
+    """
+    with pytest.raises(ErrorDatos) as excepcion:
+        construir_matriz(precios_cortos[["ALFA"]], "ALFA", incluir=("cruzadas",))
+
+    mensaje = str(excepcion.value)
+    assert "cruzadas" in mensaje
+    assert "DEMAS activos" in mensaje
+
+
+def test_unas_columnas_de_precios_repetidas_se_rechazan_por_su_nombre(precios_cortos):
+    """Con dos columnas homonimas, marco[objetivo] deja de ser una Series.
+
+    Antes salia por 'The truth value of a Series is ambiguous', que no nombra la
+    columna culpable ni sugiere nada.
+    """
+    repetidas = pd.concat([precios_cortos["ALFA"], precios_cortos], axis=1)
+    with pytest.raises(ErrorDatos) as excepcion:
+        construir_matriz(repetidas, "ALFA")
+
+    mensaje = str(excepcion.value)
+    assert "ALFA" in mensaje
+    assert "duplicated" in mensaje
+
+
+def test_una_exogena_con_fechas_repetidas_se_rechaza_antes_del_reindex(precios_cortos, exogena):
+    """Antes salia por 'cannot reindex on an axis with duplicate labels'."""
+    duplicada = pd.concat([exogena, exogena.iloc[[10, 11]]]).sort_index()
+    with pytest.raises(ErrorDatos, match="repetidas"):
+        construir_matriz(precios_cortos, "ALFA", exogenas=duplicada)
+
+
+def test_una_exogena_desordenada_se_alinea_por_fecha_y_no_se_rechaza(precios_cortos, exogena):
+    """El desorden no es un defecto aqui: el reindex alinea por etiqueta.
+
+    Queda fijado para que la validacion de las fechas repetidas no se convierta
+    en una exigencia de orden que nadie necesita.
+    """
+    revuelta = exogena.sample(frac=1.0, random_state=0)
+    ordenada = construir_matriz(
+        precios_cortos, "ALFA", incluir=("retardos",), exogenas=exogena
+    )
+    igual = construir_matriz(
+        precios_cortos, "ALFA", incluir=("retardos",), exogenas=revuelta
+    )
+
+    pd.testing.assert_frame_equal(ordenada.X, igual.X)
+
+
 def test_matriz_datos_rechaza_x_e_y_desalineados(precios_cortos):
     datos = construir_matriz(precios_cortos, "ALFA", incluir=("retardos",))
     with pytest.raises(ErrorDatos, match="no comparten indice"):
@@ -449,6 +553,24 @@ def constructor_con_fuga_en_la_exogena(precios, objetivo, exogenas=None, horizon
     X = pd.concat(
         [pd.DataFrame({"rend_ret1": np.log(serie).diff().shift(1)}), exo.reindex(serie.index)],
         axis=1,
+    )
+    return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "fuga")
+
+
+def constructor_con_fuga_del_calendario_futuro(precios, objetivo, horizonte=1, **_):
+    """Constructor tramposo: lee CUANDO llega el siguiente dato, no cuanto vale.
+
+    En una serie de energia con festivos, saber que maniana no hay sesion es
+    informacion futura como cualquier otra, y no deja rastro en los valores: los
+    dos experimentos que solo reescriben numeros la dan por buena.
+    """
+    serie = precios[objetivo]
+    X = pd.DataFrame(
+        {
+            "rend_ret1": np.log(serie).diff().shift(1),
+            "dias_al_siguiente": -precios.index.to_series().diff(-1).dt.days.to_numpy(),
+        },
+        index=precios.index,
     )
     return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "fuga")
 
@@ -559,6 +681,60 @@ def test_truncar_por_si_solo_no_veria_la_fuga_de_un_dia(precios_cortos):
     )
     with pytest.raises(ErrorDatos, match="precio_de_maniana"):
         _comparar(referencia, perturbada, corte, "al reescribir lo posterior a")
+
+
+@pytest.fixture(scope="module")
+def precios_calendario_irregular(precios_cortos) -> pd.DataFrame:
+    """Los mismos precios sin seis sesiones, como un calendario con festivos."""
+    return precios_cortos.drop(precios_cortos.index[[130, 131, 132, 260, 261, 390]])
+
+
+def test_la_auditoria_detecta_una_variable_que_lee_el_calendario_futuro(
+    precios_calendario_irregular,
+):
+    with pytest.raises(ErrorDatos, match="dias_al_siguiente"):
+        comprobar_ausencia_de_fuga(
+            constructor_con_fuga_del_calendario_futuro,
+            precios_calendario_irregular,
+            "ALFA",
+        )
+
+
+def test_reescribir_solo_los_valores_no_veria_la_fuga_del_calendario(
+    precios_calendario_irregular,
+):
+    """Justifica el tercer experimento: sin mover las fechas, la fuga es invisible.
+
+    La variable no depende de ningun valor, asi que perturbarlos no la cambia; y
+    al truncar, la unica fila que la delataria (la del corte, cuyo "siguiente
+    dato" desaparece) se va con los NaN.
+    """
+    precios = precios_calendario_irregular
+    corte = precios.index[300]
+    constructor = constructor_con_fuga_del_calendario_futuro
+    referencia = constructor(precios, "ALFA")
+
+    _comparar(referencia, constructor(precios.loc[:corte], "ALFA"), corte, "al truncar en")
+    perturbada = constructor(_perturbar_futuro(precios, corte), "ALFA")
+    _comparar(referencia, perturbada, corte, "al reescribir lo posterior a")
+
+    recalendarizada = constructor(
+        _alterar_calendario_futuro(_perturbar_futuro(precios, corte), corte), "ALFA"
+    )
+    with pytest.raises(ErrorDatos, match="dias_al_siguiente"):
+        _comparar(referencia, recalendarizada, corte, "al cambiar las fechas tras")
+
+
+def test_alterar_el_calendario_futuro_no_toca_lo_anterior_al_corte(precios_cortos):
+    """El tercer experimento solo puede cambiar el futuro; si no, todo seria fuga."""
+    corte = precios_cortos.index[300]
+    alterado = _alterar_calendario_futuro(precios_cortos, corte)
+
+    anterior = precios_cortos.loc[:corte]
+    pd.testing.assert_frame_equal(alterado.loc[:corte], anterior)
+    assert alterado.index.is_monotonic_increasing
+    assert not alterado.index.has_duplicates
+    assert (alterado.index > corte).sum() < (precios_cortos.index > corte).sum()
 
 
 def test_la_auditoria_rechaza_una_fecha_de_corte_fuera_del_tramo(precios_cortos):

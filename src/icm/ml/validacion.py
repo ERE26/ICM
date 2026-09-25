@@ -306,6 +306,36 @@ def _metricas(
 # --- particion -----------------------------------------------------------------
 
 
+def _exigir_entero(valor: Any, nombre: str) -> int:
+    """Exige que el parametro sea un numero entero de observaciones.
+
+    Un valor fraccionario no falla al construir: se arrastra por la aritmetica
+    de la disposicion, ``np.arange`` devuelve posiciones en coma flotante y el
+    fallo aparece mucho despues, dentro de numpy, como ``IndexError: arrays used
+    as indices must be of integer or boolean type``, que no dice cual de los
+    cuatro parametros lo ha causado. ``n_particiones`` fracciona antes, en
+    ``range``, con un ``TypeError`` igual de opaco. Y el caso peor no avisa
+    siquiera: ``tamano_prueba=50.9`` lo trunca ``int()`` a 50 en silencio, de
+    modo que la particion que se audita no es la que se ha pedido.
+
+    Un ``bool`` se rechaza aunque en Python sea un entero, porque
+    ``embargo=True`` vale 1 y nadie ha querido decir eso; ``expansiva``, que si
+    es una bandera, no pasa por aqui.
+
+    Se devuelve un ``int`` para normalizar los enteros de numpy, que son validos
+    y llegan de cualquier calculo con ``shape`` o ``len``.
+    """
+    if isinstance(valor, bool) or not isinstance(valor, (int, np.integer)):
+        raise ErrorDatos(
+            f"'{nombre}' debe ser un numero entero de observaciones; se ha recibido "
+            f"{valor!r} ({type(valor).__name__}). Redondee al construir la particion, "
+            f"con {nombre}=int(...) o round(...), para que la particion sea la que "
+            "usted ha pedido: un valor fraccionario se arrastra hasta el indexado y "
+            "sale como un IndexError de numpy, o se trunca sin avisar."
+        )
+    return int(valor)
+
+
 @dataclass
 class ParticionWalkForward:
     """Particiones sucesivas hacia delante en el tiempo (*walk forward*).
@@ -357,6 +387,13 @@ class ParticionWalkForward:
     tamano_entrenamiento_minimo: int = 100
 
     def __post_init__(self) -> None:
+        self.n_particiones = _exigir_entero(self.n_particiones, "n_particiones")
+        if self.tamano_prueba is not None:
+            self.tamano_prueba = _exigir_entero(self.tamano_prueba, "tamano_prueba")
+        self.embargo = _exigir_entero(self.embargo, "embargo")
+        self.tamano_entrenamiento_minimo = _exigir_entero(
+            self.tamano_entrenamiento_minimo, "tamano_entrenamiento_minimo"
+        )
         if self.n_particiones < 1:
             raise ErrorDatos(
                 f"'n_particiones' debe ser al menos 1; se ha recibido {self.n_particiones}."
@@ -536,7 +573,19 @@ class ResultadoValidacion:
 
 
 def _alinear(X: Any, y: Any) -> pd.Index:
-    """Indice comun de ``X`` e ``y``, comprobando que de verdad lo sea."""
+    """Indice comun de ``X`` e ``y``, comprobando que de verdad lo sea.
+
+    La comparacion de indices cubre tambien un ``y`` que llegue como
+    ``DataFrame``. Mirar solo las ``Series`` dejaba el guardian desactivado justo
+    en el caso en que el usuario ya esta manejando columnas, que es cuando se
+    equivoca: un objetivo de otro periodo en un ``DataFrame`` de una columna
+    salia por la puerta del numero de dimensiones, de modo que el mensaje hablaba
+    de la forma y callaba lo grave, que las fechas no son las mismas. Quien
+    obedecia y seleccionaba la columna se topaba entonces con el desajuste que ya
+    estaba ahi. Es el mismo guardian que
+    :func:`icm.ml.modelos._alinear`, para que las dos puertas de entrada
+    rechacen lo mismo con el mismo motivo.
+    """
     indice = _indice_temporal(X, "X")
     indice_y = _indice_temporal(y, "y")
     if len(indice) != len(indice_y):
@@ -544,7 +593,7 @@ def _alinear(X: Any, y: Any) -> pd.Index:
             f"'X' tiene {len(indice)} filas e 'y' tiene {len(indice_y)}: alinee ambos "
             "con un unico 'dropna' conjunto antes de validar."
         )
-    if isinstance(X, (pd.DataFrame, pd.Series)) and isinstance(y, pd.Series):
+    if isinstance(X, (pd.DataFrame, pd.Series)) and isinstance(y, (pd.Series, pd.DataFrame)):
         if not indice.equals(indice_y):
             raise ErrorDatos(
                 "'X' e 'y' no comparten indice pese a tener la misma longitud: "
