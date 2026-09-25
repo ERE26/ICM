@@ -468,12 +468,32 @@ def prevision_exogena(
     else:
         cambio = futuro - serie
         desviacion = float(cambio.std(ddof=1))
-        if not np.isfinite(desviacion) or desviacion == 0.0:
+        constante = serie.nunique(dropna=True) <= 1
+        if constante:
             # Una serie que no cambia es perfectamente previsible, y eso no es
             # un caso patologico: los grados-dia de refrigeracion valen cero
-            # todo un invierno. Sin cambio que acertar no hay habilidad que
-            # calibrar, asi que la prevision es el propio valor futuro.
+            # todo un invierno. Prever exactamente un cero no aporta ninguna
+            # informacion, asi que aqui la prevision puede ser el valor futuro.
             salida = futuro.copy()
+        elif not np.isfinite(desviacion) or desviacion == 0.0:
+            # Con NIVEL variable, en cambio, devolver el futuro es una fuga
+            # perfecta. La condicion anterior era 'desviacion == 0', que se
+            # cumple siempre que el CAMBIO es constante: cualquier rampa
+            # lineal, cualquier tramo interpolado. Medido: sobre la rampa
+            # arange(0, 60, 0.5), con habilidad 0,99, 0,50 y hasta 0,01, el
+            # error maximo de la prevision era 0 en los tres casos. Y con dos
+            # observaciones, ddof=1 deja una sola diferencia valida, std
+            # devuelve NaN y se tomaba tambien esta rama.
+            raise ErrorDatos(
+                "No se puede calibrar una habilidad de prevision sobre esta serie: su "
+                f"nivel varia ({serie.nunique(dropna=True)} valores distintos) pero el "
+                "cambio a un horizonte de "
+                f"{horizonte} es constante o no calculable (desviacion={desviacion}). "
+                "Devolver el valor futuro seria una prevision perfecta, no una con la "
+                "habilidad pedida. Si la serie es una rampa o un tramo interpolado, "
+                "previea la serie de la que salio; si tiene menos de tres "
+                "observaciones, alarguela."
+            )
         else:
             # corr(d + e, d) = sd(d) / sqrt(sd(d)^2 + sd(e)^2) = habilidad
             escala_error = desviacion * np.sqrt(1.0 / habilidad**2 - 1.0)

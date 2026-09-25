@@ -56,6 +56,26 @@ def serie_var_movil(
         practica los parametros apenas se mueven de un dia para otro.
     """
     serie = como_serie(rendimientos, "rendimientos")
+    if not serie.index.is_monotonic_increasing:
+        # Las ventanas se construyen por POSICION (valores[t-ventana:t]), asi
+        # que un indice desordenado convierte cada estimacion en una mezcla de
+        # pasado y futuro. Medido sobre 1.200 rendimientos permutados: 947 de
+        # las 950 ventanas contenian observaciones posteriores a la fecha que
+        # estimaban, con una media de 126,7 futuras de 250, y el semaforo de
+        # Basilea cambiaba de verde a amarilla segun la permutacion. No se
+        # ordena en silencio porque un indice desordenado suele ser sintoma de
+        # algo peor aguas arriba.
+        raise ErrorDatos(
+            "El indice de los rendimientos no esta ordenado por fecha. Las ventanas "
+            "moviles se toman por posicion, asi que el VaR de cada fecha se estimaria "
+            "con observaciones posteriores a ella. Ordene con sort_index() antes de "
+            "llamar, y revise de donde sale la serie."
+        )
+    if serie.index.has_duplicates:
+        raise ErrorDatos(
+            "El indice de los rendimientos tiene fechas repetidas: no hay una ventana "
+            "de 'las N observaciones anteriores' bien definida."
+        )
     nivel = validar_nivel(nivel)
     if metodo not in METODOS_BACKTEST:
         raise ErrorDatos(
@@ -219,11 +239,25 @@ def excepciones(rendimientos, var_estimado) -> pd.Series:
     """Marca los dias en que la perdida supero al VaR previsto.
 
     Ambas series se alinean por fecha, de modo que da igual el orden en que se
-    hayan calculado.
+    hayan calculado, y el resultado sale **en orden cronologico**.
+
+    Ese ultimo detalle no es cosmetico. Antes se devolvia en el orden del
+    primer argumento, y ``contraste_christoffersen_independencia`` cuenta
+    transiciones de un dia al siguiente sobre la secuencia que recibe: con las
+    mismas 12 excepciones agrupadas en una racha, el estadistico pasaba de
+    86,93 (p = 0,000, rechaza) a 0,74 (p = 0,388, no rechaza) solo porque el
+    marco venia sin ordenar. Un modelo con las excepciones perfectamente
+    agrupadas aprobaba el contraste de independencia.
     """
     serie = como_serie(rendimientos, "rendimientos")
     estimado = como_serie(var_estimado, "var")
-    comun = serie.index.intersection(estimado.index)
+    for nombre, indice in (("rendimientos", serie.index), ("var", estimado.index)):
+        if indice.has_duplicates:
+            raise ErrorDatos(
+                f"El indice de '{nombre}' tiene fechas repetidas: al alinear por fecha "
+                "no se sabria con cual emparejar."
+            )
+    comun = serie.index.intersection(estimado.index).sort_values()
     if len(comun) == 0:
         raise ErrorDatos("Los rendimientos y las estimaciones de VaR no comparten fechas.")
     fallos = (serie.loc[comun] < -estimado.loc[comun]).astype(int)

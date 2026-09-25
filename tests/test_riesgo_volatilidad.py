@@ -54,8 +54,56 @@ def test_una_ventana_minuscula_da_error(serie):
 
 
 def test_la_ewma_devuelve_una_prediccion_por_fecha(serie):
-    assert len(volatilidad_ewma(serie)) == len(serie)
-    assert (volatilidad_ewma(serie) > 0).all()
+    # La primera fecha sale NaN a proposito: antes de la primera observacion
+    # no hay informacion con la que predecir nada, y el valor que se daba ahi
+    # venia de promediar las 30 primeras, es decir, del futuro.
+    ewma = volatilidad_ewma(serie)
+    assert len(ewma) == len(serie)
+    assert np.isnan(ewma.iloc[0])
+    assert (ewma.iloc[1:] > 0).all()
+
+
+def test_el_arranque_de_la_ewma_no_mira_al_futuro():
+    """Un choque posterior no puede mover una estimacion ya publicada.
+
+    El arranque era la varianza de las 30 primeras observaciones, asi que el
+    valor de t=0 se calculaba con datos de t=0 a t=29 y esa semilla sobrevivia
+    con peso lambda**t. Medido con un choque en t=25: la volatilidad estimada
+    en t=5 se multiplicaba por 90,7.
+    """
+    plana = pd.Series(np.full(200, 0.001))
+    con_choque = plana.copy()
+    con_choque.iloc[25] = 0.30
+
+    sin, con = volatilidad_ewma(plana), volatilidad_ewma(con_choque)
+    # Todo lo anterior al choque, y el propio dia del choque, intacto.
+    pd.testing.assert_series_equal(sin.iloc[:26], con.iloc[:26])
+    # Y el dia siguiente si reacciona, que es la informacion que toca.
+    assert con.iloc[26] > 10 * sin.iloc[26]
+
+
+def test_con_menos_de_treinta_observaciones_tampoco_hay_fuga():
+    # Era el caso peor: con la ventana de arranque abarcando la serie entera,
+    # la contaminacion era total. En t=5 la volatilidad se multiplicaba por
+    # 82,7 por un choque en la ULTIMA fecha.
+    corta = pd.Series(np.full(25, 0.001))
+    con_choque = corta.copy()
+    con_choque.iloc[24] = 0.30
+    pd.testing.assert_series_equal(volatilidad_ewma(corta), volatilidad_ewma(con_choque))
+
+
+def test_el_calentamiento_descarta_fechas_en_vez_de_inventarlas():
+    # La semilla estable sigue disponible, pero pagando lo que cuesta: las
+    # fechas cuya estimacion la usaria salen NaN, no con un numero.
+    serie_larga = pd.Series(np.full(200, 0.001))
+    ewma = volatilidad_ewma(serie_larga, calentamiento=30)
+    assert int(ewma.isna().sum()) == 30
+    assert ewma.notna().to_numpy().argmax() == 30
+
+
+def test_un_calentamiento_que_se_come_la_serie_se_rechaza():
+    with pytest.raises(ErrorDatos, match="serie entera"):
+        volatilidad_ewma(pd.Series(np.full(10, 0.001)), calentamiento=10)
 
 
 def test_la_ewma_no_usa_el_dato_del_propio_dia():

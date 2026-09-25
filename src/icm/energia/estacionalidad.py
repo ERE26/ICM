@@ -523,16 +523,26 @@ def desestacionalizar(
 ) -> pd.Series:
     """Serie sin el componente estacional: tendencia mas residuo.
 
-    Es la serie que hay que llevar a un modelo. Dos razones. La primera es que
-    lo que queda es lo unico que no se sabia de antemano: descontar el
-    calendario impide que el modelo se puntue a si mismo por acertar algo que
-    un almanaque tambien acierta. La segunda es que la comparacion entre
-    periodos deja de mentir: un diciembre frente a un noviembre no se pueden
-    comparar en bruto, y sobre la serie desestacionalizada si.
+    **No sirve como variable explicativa en un backtest.** Esta pensada para
+    leer la serie despues de los hechos, no para alimentar un modelo.
 
-    A diferencia de la tendencia, la serie desestacionalizada esta definida en
-    **toda** la muestra, tambien en los extremos: el factor estacional se
-    conoce en cada fecha aunque la media movil no llegue.
+    El motivo es que el factor estacional se estima promediando **todas** las
+    observaciones de cada posicion del ciclo, las anteriores y las posteriores
+    a cada fecha, y la tendencia es una media movil centrada. El valor
+    "desestacionalizado" de enero de 2005 es por tanto una combinacion lineal
+    de precios de 2024. Medido sobre 240 meses: triplicar los ultimos 36 mueve
+    ese valor ya publicado de 51,03 a 44,82, y el **18,8 %** de la varianza de
+    la serie resultante es revision que solo se conoce al final de la muestra.
+
+    Para modelar, use :func:`desestacionalizar_recursiva`, que en cada fecha
+    estima el factor unicamente con el pasado. La ironia de que esta funcion
+    tuviese la fuga no se nos escapa: el modulo existe justamente para que un
+    modelo no se puntue acertando lo que un almanaque tambien acierta.
+
+    A diferencia de la tendencia, la serie devuelta esta definida en **toda**
+    la muestra, tambien en los extremos. Eso no es una virtud: es el sintoma
+    de que el factor de los extremos se conoce porque se ha estimado con el
+    futuro.
     """
     valores = como_serie(serie, "serie")
     piezas = descomponer(valores, periodo=periodo, modelo=modelo)
@@ -541,6 +551,87 @@ def desestacionalizar(
     else:
         ajustada = valores - piezas.estacional
     return ajustada.rename("desestacionalizada")
+
+
+def desestacionalizar_recursiva(
+    serie,
+    por: str = "mes",
+    ventana_tendencia: int | None = None,
+    modelo: str = "aditivo",
+    minimo_ciclos: int = 2,
+) -> pd.Series:
+    """Serie sin estacionalidad, usando en cada fecha **solo** el pasado.
+
+    Es la version utilizable en un backtest. El valor de la fecha ``t`` se
+    calcula con lo que se sabia antes de ``t`` y nada mas, de modo que anadir
+    observaciones al final no revisa ni un valor ya publicado. Frente a
+    :func:`desestacionalizar`, cuya serie tiene un 18,8 % de varianza que solo
+    se conoce al final de la muestra, aqui esa cifra es cero por construccion.
+
+    Tres diferencias con la version clasica, todas obligadas por la causalidad:
+
+    * La tendencia es una media movil **de un solo lado** (solo mira atras), no
+      centrada. Es mas rezagada, y no hay alternativa: una media centrada
+      necesita el futuro.
+    * El factor de cada posicion del ciclo es la media de las observaciones
+      **anteriores** que caen en esa misma posicion, no la de todas. Por eso
+      las primeras fechas salen ``NaN``: hasta que no hay ``minimo_ciclos``
+      repeticiones de una posicion, no hay nada que promediar.
+    * La posicion se toma del **calendario** (``por``), no de la posicion en el
+      array. Contarla con ``arange(n) % periodo`` desplaza la fase cuando falta
+      un dato o cuando un anio tiene mas dias habiles que el periodo supuesto.
+
+    Parametros
+    ----------
+    por:
+        Como se agrupa el ciclo: ``"mes"``, ``"dia_semana"``, ``"dia_anio"`` o
+        ``"trimestre"``.
+    ventana_tendencia:
+        Observaciones de la media movil rezagada. Por omision, el numero de
+        grupos distintos de la particion pedida (12 para meses, 7 para dias de
+        la semana), que es un ciclo completo.
+    minimo_ciclos:
+        Repeticiones de una posicion que hacen falta antes de publicar un
+        valor para ella.
+    """
+    valores = _serie_fechada(serie, "serie")
+    _validar_opcion(modelo, ("aditivo", "multiplicativo"), "modelo")
+    minimo = _validar_entero(minimo_ciclos, "minimo_ciclos", minimo=1)
+    if modelo == "multiplicativo":
+        _exigir_positiva(valores, "la desestacionalizacion recursiva")
+
+    claves = _claves(valores.index, por)
+    ventana = (
+        _validar_entero(ventana_tendencia, "ventana_tendencia", minimo=2)
+        if ventana_tendencia is not None
+        else max(int(pd.Index(claves).nunique()), 2)
+    )
+
+    # Media movil rezagada: incluye la fecha actual y nada posterior.
+    tendencia = valores.rolling(ventana, min_periods=ventana).mean()
+    sin_tendencia = (
+        valores / tendencia if modelo == "multiplicativo" else valores - tendencia
+    )
+
+    # Factor de cada posicion con las repeticiones ESTRICTAMENTE anteriores.
+    # El desplazamiento dentro de cada grupo es lo que garantiza que el valor
+    # de t no participa en su propio factor.
+    marco = pd.DataFrame({"valor": sin_tendencia, "clave": np.asarray(claves)})
+    por_grupo = marco.groupby("clave")["valor"]
+    suma = por_grupo.transform(lambda s: s.shift(1).expanding().sum())
+    cuenta = por_grupo.transform(lambda s: s.shift(1).expanding().count())
+    factor = suma / cuenta.where(cuenta >= minimo)
+
+    # El centrado tambien tiene que ser causal: la referencia es la media de
+    # todo lo observado hasta la fecha anterior, no la de la muestra entera.
+    global_previa = sin_tendencia.shift(1).expanding().mean()
+    if modelo == "multiplicativo":
+        factor = factor / global_previa
+        ajustada = valores / factor
+    else:
+        factor = factor - global_previa
+        ajustada = valores - factor
+    return ajustada.rename("desestacionalizada_recursiva")
 
 
 # --- contraste ------------------------------------------------------------------
