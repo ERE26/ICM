@@ -10,8 +10,45 @@ de síntesis descartó duplicados y falsos positivos y ordenó el resto por dañ
 **30 hallazgos, 2 fusionados, 1 descartado: 28 defectos reales.** Ninguno lo
 cubrían las pruebas existentes, que pasaban todas.
 
-Lo que sigue es el informe tal como salió, sin recortar. Es la lista de trabajo
-pendiente del proyecto.
+Lo que sigue es el informe tal como salió, sin recortar.
+
+---
+
+## Estado: cerrado
+
+Los 28 defectos están arreglados, cada uno con la prueba que lo reproducía
+convertida en prueba de regresión. La suite pasa: **944 pruebas, 19 omitidas**.
+
+Dos apuntes sobre el cierre, porque el informe original los dejaba abiertos:
+
+- **D3 no era un defecto.** `comprobar_ausencia_de_fuga` solo puede auditar lo
+  que el constructor hace con los datos que recibe; un `interpolate()` aplicado
+  *antes* de la llamada queda fuera de su alcance por construcción. Lo que sí
+  faltaba era decirlo, y ahora lo dice el apartado «Alcance» de su docstring.
+
+- **La sospecha del embargo sí se pudo medir.** El último hallazgo del informe
+  quedó como «solo sospecha» porque con h=1 no se veía nada. No se veía porque
+  con h=1 *no hay solape*: el objetivo de la última fila de entrenamiento se
+  mide justo en el primer día de prueba, sin invadirlo. El efecto aparece al
+  subir el horizonte y mirar donde vive la fuga, que son las primeras h−1 filas
+  de cada tramo de prueba, no el tramo entero:
+
+  | horizonte | ECM sin embargo | ECM con embargo | diferencia | p |
+  |---|---|---|---|---|
+  | h=1  | — | — | sin solape posible | — |
+  | h=21 | 9.43e-03 | 9.52e-03 | +0.9 % | 0.48 |
+  | h=63 | 7.54e-03 | 1.13e-02 | **+33.15 %** | 6.19e-06 |
+
+  Sobre 250 semillas, con h=63 el embargo=0 «gana» en 144 de ellas: el error
+  medido es un 33 % mejor de lo que el modelo merece, y esa mejora es futuro
+  colado en el entrenamiento. Por eso `comparar_modelos` y
+  `buscar_hiperparametros` ya no heredan `embargo=0`, sino que lo derivan del
+  horizonte que `objetivo_rendimiento_futuro` deja marcado en `attrs`.
+
+Además de los 28, se cerró un hueco que la revisión no llegó a listar: el
+arreglo del hallazgo 15 (rechazar un panel con `MultiIndex`) se había aplicado
+en `validacion.py` pero no en `redes.py`, donde el daño es mayor porque la
+ventana se construye por posición y cada muestra mezclaba activos distintos.
 
 ---
 
