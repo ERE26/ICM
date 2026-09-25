@@ -692,6 +692,56 @@ def test_una_serie_sin_ajustar_no_se_puede_descomponer(cadena_contango):
         descomponer_rendimiento(sin_ajustar)
 
 
+def test_el_metodo_del_ajuste_sobrevive_a_un_viaje_por_disco(cadena_contango, tmp_path):
+    """Guardar la serie y descomponerla otro dia tiene que dar lo mismo.
+
+    El ajuste se marcaba solo en .attrs, que no sobrevive a un to_csv, asi que la
+    serie que volvia del disco se descomponia con la formula de 'ratio' aunque
+    fuese aditiva: el total acumulado salia igual, pero el reparto entre precio y
+    roll -- lo unico que aporta la funcion -- quedaba 18 veces mayor sin error.
+    """
+    serie = serie_continua(cadena_contango, VENCIMIENTOS_CADENA, metodo="diferencia")
+    # El recorte deja fuera el tramo final (ajuste neutro) y cruza el primer
+    # empalme: todos los ajustes son positivos, asi que el control del ajuste
+    # multiplicativo no salta y el error pasa desapercibido.
+    recorte = serie.loc["2024-01-05":"2024-02-10"]
+    ruta = tmp_path / "continua.csv"
+    recorte.to_csv(ruta)
+    del_disco = pd.read_csv(ruta, index_col=0, parse_dates=True)
+    assert del_disco.attrs == {}
+
+    esperado = descomponer_rendimiento(recorte, metodo="diferencia")
+    obtenido = descomponer_rendimiento(del_disco)
+    dia_del_roll = pd.Timestamp("2024-01-26")
+    assert esperado.at[dia_del_roll, "rendimiento_roll"] == pytest.approx(-0.056604, abs=1e-6)
+    assert np.allclose(obtenido["rendimiento_roll"], esperado["rendimiento_roll"])
+    assert np.allclose(obtenido["rendimiento_precio"], esperado["rendimiento_precio"])
+
+
+def test_sin_marca_del_metodo_se_exige_el_argumento_en_vez_de_adivinarlo(cadena_contango):
+    """Mejor pedir el dato que repartir el rendimiento con la formula equivocada."""
+    serie = serie_continua(cadena_contango, VENCIMIENTOS_CADENA, metodo="diferencia")
+    sin_marca = serie.drop(columns="metodo")
+    sin_marca.attrs = {}
+    with pytest.raises(ErrorDatos, match="No se sabe con que ajuste"):
+        descomponer_rendimiento(sin_marca)
+    # La marca vieja en attrs sigue valiendo para las series ya guardadas.
+    con_attrs = sin_marca.copy()
+    con_attrs.attrs["metodo"] = "diferencia"
+    assert np.allclose(
+        descomponer_rendimiento(con_attrs)["rendimiento_roll"],
+        descomponer_rendimiento(serie, metodo="diferencia")["rendimiento_roll"],
+    )
+
+
+def test_una_columna_de_metodo_con_varios_ajustes_da_error(cadena_contango):
+    """Dos series pegadas no se descomponen juntas: cada ajuste tiene su formula."""
+    serie = serie_continua(cadena_contango, VENCIMIENTOS_CADENA, metodo="diferencia")
+    mezcla = pd.concat([serie.iloc[:40], serie.iloc[40:].assign(metodo="ratio")])
+    with pytest.raises(ErrorDatos, match="varios ajustes"):
+        descomponer_rendimiento(mezcla)
+
+
 def test_descomponer_exige_la_salida_de_serie_continua():
     with pytest.raises(ErrorDatos, match="serie_continua"):
         descomponer_rendimiento(pd.DataFrame({"precio": [1.0, 2.0]}))

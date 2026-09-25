@@ -24,6 +24,8 @@ una sola semilla puede dar 0,8 sin que nada este roto.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -271,6 +273,81 @@ def test_las_fechas_sin_volatilidad_utilizable_quedan_planas(caso_dos_regimenes)
 
     assert (posiciones.iloc[:8] == 0.0).all()
     assert (posiciones.iloc[8:] != 0.0).all()
+
+
+def test_la_salida_del_objetivo_de_volatilidad_se_marca_como_posicion(caso_dos_regimenes):
+    """La marca es lo unico que permite avisar de que se deshace el escalado."""
+    senal, _, volatilidad = caso_dos_regimenes
+
+    posiciones = objetivo_volatilidad(senal, volatilidad, objetivo_anual=0.10, limite=10.0)
+
+    assert posiciones.attrs["tipo"] == "posicion"
+
+
+def test_ejecutar_unas_posiciones_con_los_valores_por_omision_avisa(caso_dos_regimenes):
+    """El footgun del que nada avisaba: los valores por omision renormalizan.
+
+    Se comprueba tambien el danio, porque el aviso no sirve de nada si no
+    corresponde a un resultado equivocado: la volatilidad realizada se va muy
+    por encima del objetivo y la posicion vuelve a valer 1 en todas las fechas.
+    """
+    senal, rendimientos, volatilidad = caso_dos_regimenes
+    posiciones = objetivo_volatilidad(senal, volatilidad, objetivo_anual=0.10, limite=10.0)
+
+    with pytest.warns(UserWarning, match="posiciones ya dimensionadas"):
+        renormalizada = ejecutar_estrategia(posiciones, rendimientos, coste_bps=0.0)
+    bien = ejecutar_estrategia(
+        posiciones, rendimientos, coste_bps=0.0, modo="proporcional", escala=1.0, limite=10.0
+    )
+
+    np.testing.assert_allclose(renormalizada.posiciones.abs().to_numpy(), 1.0)
+    assert abs(volatilidad_anualizada(bien.pnl) - 0.10) < 0.01
+    assert volatilidad_anualizada(renormalizada.pnl) > 1.5 * volatilidad_anualizada(bien.pnl)
+
+
+def test_la_receta_documentada_ejecuta_las_posiciones_sin_avisar(caso_dos_regimenes):
+    """La otra mitad del aviso: no debe saltar cuando la senal queda intacta."""
+    senal, rendimientos, volatilidad = caso_dos_regimenes
+    posiciones = objetivo_volatilidad(senal, volatilidad, objetivo_anual=0.10, limite=10.0)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        resultado = ejecutar_estrategia(
+            posiciones, rendimientos, coste_bps=0.0, modo="proporcional", escala=1.0, limite=10.0
+        )
+
+    np.testing.assert_allclose(
+        resultado.posiciones.to_numpy(), posiciones.shift(1).iloc[1:].to_numpy()
+    )
+
+
+def test_el_aviso_del_dimensionamiento_tambien_salta_por_el_coste_de_equilibrio(
+    caso_dos_regimenes,
+):
+    """coste_de_equilibrio arrastra los mismos valores por omision."""
+    senal, rendimientos, volatilidad = caso_dos_regimenes
+    posiciones = objetivo_volatilidad(senal, volatilidad, objetivo_anual=0.10, limite=10.0)
+
+    with pytest.warns(UserWarning, match="posiciones ya dimensionadas"):
+        coste_de_equilibrio(posiciones, rendimientos)
+
+
+def test_una_marca_de_posicion_caducada_avisa_pero_no_bloquea(caso_dos_regimenes):
+    """Por que es un UserWarning y no un ErrorDatos.
+
+    ``attrs`` describe el origen de la serie y sobrevive a la aritmetica, asi
+    que quien reescale unas posiciones se queda con una marca que ya no
+    describe nada. Con un error, esa marca caducada haria irrejecutable una
+    llamada legitima; con un aviso, el peor caso es una alarma de mas.
+    """
+    senal, rendimientos, volatilidad = caso_dos_regimenes
+    reescaladas = objetivo_volatilidad(senal, volatilidad, limite=10.0) * 3.0
+    assert reescaladas.attrs["tipo"] == "posicion"
+
+    with pytest.warns(UserWarning, match="attrs.pop"):
+        resultado = ejecutar_estrategia(reescaladas, rendimientos, coste_bps=0.0)
+
+    assert len(resultado) == len(rendimientos) - 1
 
 
 # --- ejecucion -----------------------------------------------------------------

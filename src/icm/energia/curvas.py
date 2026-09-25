@@ -250,9 +250,14 @@ def serie_continua(
 
     Devuelve
     --------
-    DataFrame con el mismo indice y tres columnas: ``"precio"`` (serie continua
-    ya ajustada), ``"contrato"`` (cual esta activo en cada fecha) y ``"ajuste"``
-    (el factor multiplicativo aplicado, o el sumando si ``metodo="diferencia"``).
+    DataFrame con el mismo indice y cuatro columnas: ``"precio"`` (serie continua
+    ya ajustada), ``"contrato"`` (cual esta activo en cada fecha), ``"ajuste"``
+    (el factor multiplicativo aplicado, o el sumando si ``metodo="diferencia"``)
+    y ``"metodo"`` (el ajuste con el que se construyo). La ultima existe para
+    que :func:`descomponer_rendimiento` no tenga que adivinar el ajuste: es una
+    columna y no solo una marca en ``.attrs`` porque los metadatos de pandas no
+    sobreviven a un ``to_csv`` ni a un parquet, y guardar la serie para
+    descomponerla otro dia es lo normal.
 
     Por que el ajuste va hacia atras
     --------------------------------
@@ -347,11 +352,11 @@ def serie_continua(
     precio = crudo + ajuste if metodo == "diferencia" else crudo * ajuste
 
     salida = pd.DataFrame(
-        {"precio": precio, "contrato": activo, "ajuste": ajuste},
+        {"precio": precio, "contrato": activo, "ajuste": ajuste, "metodo": metodo},
         index=marco.index,
     )
-    # Se deja constancia del metodo para que descomponer_rendimiento pueda
-    # deshacer el ajuste sin que haya que recordarselo.
+    # La marca en attrs se mantiene por compatibilidad con quien ya la lea, pero
+    # el dato que cuenta es la columna: attrs se pierde al guardar en disco.
     salida.attrs["metodo"] = metodo
     salida.attrs["dias_antes"] = dias_antes
     return salida
@@ -629,6 +634,38 @@ def interpolar_curva(
 # --- descomposicion de la rentabilidad -----------------------------------------
 
 
+def _metodo_de_la_serie(marco: pd.DataFrame) -> str:
+    """Ajuste con el que se construyo la serie, sin adivinarlo nunca.
+
+    Suponer ``"ratio"`` cuando falta la marca no deja ningun rastro: el total
+    acumulado no cambia (solo depende de ``"precio"``), pero el reparto entre
+    precio y roll -- que es para lo que sirve la descomposicion -- se calcula
+    con la formula equivocada y puede salir casi veinte veces mayor sin un solo
+    error. La columna ``"metodo"`` viaja con los datos; ``.attrs`` se pierde al
+    guardar en csv o en parquet, y se lee solo como respaldo para las series
+    guardadas antes de que la columna existiera.
+    """
+    if "metodo" in marco.columns:
+        marcas = pd.unique(marco["metodo"].dropna())
+        if len(marcas) > 1:
+            raise ErrorDatos(
+                f"La columna 'metodo' trae varios ajustes ({sorted(map(str, marcas))}) "
+                "y la salida de serie_continua se construye con uno solo. Descomponga "
+                "cada serie por separado o pase 'metodo' explicitamente."
+            )
+        if len(marcas) == 1:
+            return str(marcas[0])
+    marca = marco.attrs.get("metodo")
+    if marca is not None:
+        return str(marca)
+    raise ErrorDatos(
+        "No se sabe con que ajuste se construyo la serie: no trae la columna 'metodo' "
+        "y '.attrs' viene vacio (los metadatos de pandas se pierden al guardar en csv "
+        "o en parquet). Pase el argumento 'metodo' con el mismo valor que uso en "
+        "serie_continua: 'ratio' o 'diferencia'."
+    )
+
+
 def descomponer_rendimiento(
     serie_continua: pd.DataFrame,
     metodo: str | None = None,
@@ -669,10 +706,13 @@ def descomponer_rendimiento(
     ----------
     serie_continua:
         La salida de :func:`serie_continua`, con sus columnas ``"precio"``,
-        ``"contrato"`` y ``"ajuste"``.
+        ``"contrato"``, ``"ajuste"`` y ``"metodo"``.
     metodo:
-        Ajuste con el que se construyo la serie. Si se omite se lee la marca que
-        deja :func:`serie_continua` y, a falta de ella, se supone ``"ratio"``.
+        Ajuste con el que se construyo la serie. Si se omite se lee de la columna
+        ``"metodo"`` y, en las series guardadas antes de que existiera, de la
+        marca en ``.attrs``; si no hay ninguna de las dos se exige el argumento
+        en lugar de suponer un ajuste, porque acertar el reparto entre precio y
+        roll depende de el.
     """
     marco = serie_continua
     if not isinstance(marco, pd.DataFrame) or not {"precio", "ajuste"}.issubset(marco.columns):
@@ -680,8 +720,10 @@ def descomponer_rendimiento(
             "Se esperaba la salida de serie_continua, con las columnas 'precio', "
             "'contrato' y 'ajuste'."
         )
+    if len(marco) < 2:
+        raise ErrorDatos("Hacen falta al menos dos fechas para calcular un rendimiento.")
     if metodo is None:
-        metodo = marco.attrs.get("metodo", "ratio")
+        metodo = _metodo_de_la_serie(marco)
     if metodo == "ninguno":
         raise ErrorDatos(
             "Una serie sin ajustar no permite separar precio y roll, porque el escalon "
@@ -692,8 +734,6 @@ def descomponer_rendimiento(
         raise ErrorDatos(
             f"Metodo de ajuste '{metodo}' desconocido. Disponibles: 'ratio', 'diferencia'."
         )
-    if len(marco) < 2:
-        raise ErrorDatos("Hacen falta al menos dos fechas para calcular un rendimiento.")
 
     precio = marco["precio"].astype(float)
     ajuste = marco["ajuste"].astype(float)

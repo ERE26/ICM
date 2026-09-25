@@ -250,6 +250,64 @@ def _escala_de_la_senal(serie: pd.Series, escala: float | None) -> float:
     return desviacion
 
 
+def _es_identidad(modo: str, escala: Any, limite: float, maximo: float) -> bool:
+    """Si :func:`senal_desde_prediccion` devolveria su entrada sin tocarla.
+
+    Solo el modo proporcional deja pasar la magnitud (``"signo"`` la aplasta a
+    ``+-limite`` y ``"umbral"`` exige una banda muerta que anula las posiciones
+    pequenias), y solo lo hace intacta si el divisor es 1 y el recorte no llega
+    a morder el valor absoluto maximo de la serie. El maximo se mide sobre los
+    datos y no sobre el ``limite`` con el que se pidieron, porque lo que importa
+    es si de hecho se recorta algo.
+    """
+    if modo != "proporcional" or escala is None:
+        return False
+    try:
+        unitaria = float(escala) == 1.0
+    except (TypeError, ValueError):
+        # Una escala que no es un numero la rechaza despues _escala_de_la_senal
+        # con su propio mensaje; aqui solo interesa que no sea 1.
+        return False
+    return unitaria and limite >= maximo
+
+
+def _avisar_si_llega_una_posicion(
+    serie: pd.Series, modo: str, escala: Any, limite: float, maximo: float
+) -> None:
+    """Avisa cuando se reconstruye una senal sobre lo que ya eran posiciones.
+
+    ``objetivo_volatilidad`` devuelve posiciones dimensionadas y las marca con
+    ``attrs["tipo"] = "posicion"``. Pasarlas a :func:`ejecutar_estrategia` con
+    los valores por defecto (``modo="signo"``, ``limite=1.0``) las renormaliza a
+    ``+-1`` y deshace el dimensionamiento sin dar ningun error: medido, una
+    peticion de 10 % de volatilidad anual acaba en 27,6 % y la media de
+    ``|posicion|`` sube de 0,47 a 1,00. Es un fallo que deja un resultado
+    plausible, que es la familia contra la que este modulo se defiende.
+
+    Es un ``UserWarning`` y no un ``ErrorDatos`` a proposito. La marca dice de
+    donde salio la serie, no como esta escalada ahora: sobrevive a ``.shift()``,
+    ``.reindex()``, ``.astype()`` y a la aritmetica, asi que quien multiplique
+    esas posiciones por algo se queda con una serie que sigue diciendo
+    "posicion". Con un error, esa marca caducada bloquearia una llamada
+    legitima; con un aviso, el peor caso es una alarma de mas, y el mensaje
+    explica como borrarla.
+    """
+    if serie.attrs.get("tipo") != "posicion" or _es_identidad(modo, escala, limite, maximo):
+        return
+    warnings.warn(
+        "La serie recibida viene marcada como posiciones ya dimensionadas "
+        "(attrs['tipo'] = 'posicion', que pone objetivo_volatilidad), pero con "
+        f"modo={modo!r}, escala={escala!r} y limite={limite:g} se vuelve a construir la senal "
+        "desde cero y el dimensionamiento se pierde sin dejar rastro en el resultado. Pase "
+        f"modo='proporcional', escala=1.0 y limite>={maximo:.4g} para que la construccion de "
+        "la senal sea la identidad. Si la serie ya no son posiciones porque la ha transformado, "
+        "borre la marca con serie.attrs.pop('tipo', None): esa marca dice de donde salio la "
+        "serie, no como esta escalada ahora.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 # --- de la prediccion a la senal -----------------------------------------------
 
 
@@ -309,6 +367,12 @@ def senal_desde_prediccion(
     Las predicciones ausentes o infinitas dan posicion 0. Es la lectura
     conservadora: donde no hay opinion no se toma riesgo, y nunca se arrastra
     la opinion de ayer, que es lo que haria un ``ffill`` silencioso.
+
+    Si la serie que llega ya son posiciones dimensionadas (las que devuelve
+    :func:`objetivo_volatilidad`, marcadas con ``attrs["tipo"] = "posicion"``) y
+    los parametros no dejan la serie intacta, se avisa con un ``UserWarning``:
+    reconstruir la senal sobre unas posiciones deshace el dimensionamiento sin
+    que se note en el resultado.
     """
     serie = _como_serie_con_huecos(prediccion, "prediccion")
 
@@ -347,6 +411,10 @@ def senal_desde_prediccion(
             "La prediccion no tiene ningun valor finito: no hay nada que operar. Compruebe "
             "el periodo de calentamiento del modelo o el alineamiento de las fechas."
         )
+
+    _avisar_si_llega_una_posicion(
+        serie, modo, escala, limite, float(np.max(np.abs(valores[finitos])))
+    )
 
     posiciones = np.zeros_like(valores)
     opera = finitos & (np.abs(valores) > umbral)
@@ -426,8 +494,14 @@ def objetivo_volatilidad(
     ...     posiciones, rendimientos, modo="proporcional", escala=1.0, limite=2.0
     ... )
 
-    con ``escala=1.0`` y un ``limite`` no menor que el de aqui, combinacion en la
-    que :func:`senal_desde_prediccion` es la identidad.
+    con ``escala=1.0`` y un ``limite`` no menor que la posicion mas grande que
+    salga de aqui, combinacion en la que :func:`senal_desde_prediccion` es la
+    identidad. Con los valores por defecto (``modo="signo"``, ``limite=1.0``) la
+    senal se reconstruye a ``+-1`` y el dimensionamiento se pierde; por eso el
+    resultado sale marcado con ``attrs["tipo"] = "posicion"`` y
+    :func:`senal_desde_prediccion` avisa con un ``UserWarning`` si lo recibe y
+    no va a dejarlo intacto. El aviso llega tambien por
+    :func:`coste_de_equilibrio`, que construye la senal por el mismo camino.
     """
     serie_senal = _como_serie_con_huecos(senal, "senal")
     serie_vol = _como_serie_con_huecos(volatilidad_realizada, "volatilidad_realizada")
@@ -481,7 +555,12 @@ def objetivo_volatilidad(
         index=indice,
         name="posicion_objetivo_volatilidad",
     )
-    posiciones.attrs.update({"objetivo_anual": objetivo_anual, "limite": limite})
+    # La marca 'tipo' es lo que permite que senal_desde_prediccion avise si
+    # alguien vuelve a construir la senal sobre estas posiciones y deshace el
+    # dimensionamiento; vease _avisar_si_llega_una_posicion.
+    posiciones.attrs.update(
+        {"tipo": "posicion", "objetivo_anual": objetivo_anual, "limite": limite}
+    )
     return posiciones
 
 
@@ -546,7 +625,11 @@ def ejecutar_estrategia(
         sus tramos se solapan y no hay retardo que lo arregle.
     **opciones_senal:
         Se pasan tal cual a :func:`senal_desde_prediccion` (``modo``, ``umbral``,
-        ``escala``, ``limite``).
+        ``escala``, ``limite``). Los valores por defecto construyen la senal
+        desde cero, asi que si lo que se pasa ya son posiciones dimensionadas
+        (:func:`objetivo_volatilidad`) hacen falta ``modo="proporcional"``,
+        ``escala=1.0`` y un ``limite`` que no recorte; cuando no se cumple, la
+        serie marcada avisa con un ``UserWarning``.
 
     Por que ``retardo=1`` y por que ``retardo=0`` es el error clasico
     ----------------------------------------------------------------
@@ -934,7 +1017,10 @@ def coste_de_equilibrio(
     **opciones:
         Se pasan a :func:`ejecutar_estrategia` (``retardo``, ``modo``,
         ``umbral``, ``escala``, ``limite``). ``coste_bps`` no, porque es
-        justamente la incognita.
+        justamente la incognita. Arrastran los mismos valores por defecto, de
+        modo que unas posiciones de :func:`objetivo_volatilidad` pasadas sin
+        ``modo="proporcional"`` y ``escala=1.0`` se renormalizan aqui tambien y
+        avisan igual.
 
     Devuelve
     --------
