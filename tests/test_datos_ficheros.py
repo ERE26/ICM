@@ -148,12 +148,28 @@ def test_los_huecos_se_arrastran_hacia_delante(tmp_path):
     assert precios.loc["2024-01-03", "AAA"] == pytest.approx(100.0)
 
 
-def test_las_fechas_duplicadas_se_resuelven_con_la_ultima(tmp_path):
+def test_las_fechas_duplicadas_se_denuncian_en_vez_de_resolverse_solas(tmp_path):
+    # Antes se quedaba con la ultima fila del fichero sin decir nada. Eso es
+    # doblemente peligroso: en un fichero ordenado de mas reciente a mas
+    # antiguo (como exporta casi todo portal) la ultima fila es la version
+    # VIEJA, y en una serie horaria del ultimo domingo de octubre borra una de
+    # las dos veces que dieron las 02:00, que es una hora real del anio.
     ruta = tmp_path / "duplicadas.csv"
     ruta.write_text("fecha,AAA\n2024-01-02,100\n2024-01-02,105\n2024-01-03,101\n")
-    precios = cargar_precios_fichero(ruta)
+    with pytest.raises(ErrorDatos, match="fechas repetidas"):
+        cargar_precios_fichero(ruta)
+
+
+@pytest.mark.parametrize(
+    ("criterio", "esperado"),
+    [("ultimo", 105.0), ("primero", 100.0), ("media", 102.5)],
+)
+def test_las_fechas_duplicadas_se_resuelven_si_se_dice_como(tmp_path, criterio, esperado):
+    ruta = tmp_path / "duplicadas.csv"
+    ruta.write_text("fecha,AAA\n2024-01-02,100\n2024-01-02,105\n2024-01-03,101\n")
+    precios = cargar_precios_fichero(ruta, resolver_duplicados=criterio)
     assert len(precios) == 2
-    assert precios.loc["2024-01-02", "AAA"] == pytest.approx(105.0)
+    assert precios.loc["2024-01-02", "AAA"] == pytest.approx(esperado)
 
 
 def test_una_columna_sin_numeros_se_denuncia(tmp_path):
@@ -222,21 +238,26 @@ def test_se_lee_un_parquet(tmp_path):
 
 
 def test_se_admiten_rendimientos_y_se_reconstruye_el_precio():
+    # La serie de precios arranca en el 'precio_inicial', fechado un periodo
+    # antes del primer rendimiento, y despues lo compone.
     tabla = pd.DataFrame({"AAA": [0.01, -0.02, 0.03]}, index=FECHAS[:3])
     precios = ProveedorMarco(tabla, contenido="rendimientos").descargar(["AAA"])
-    esperado = 100.0 * np.cumprod([1.01, 0.98, 1.03])
+    esperado = np.concatenate([[100.0], 100.0 * np.cumprod([1.01, 0.98, 1.03])])
     np.testing.assert_allclose(precios["AAA"].to_numpy(), esperado)
 
 
-def test_el_ciclo_rendimientos_precios_rendimientos_es_exacto():
+def test_el_ciclo_rendimientos_precios_rendimientos_no_pierde_el_primero():
+    # Antes la reconstruccion consumia el primer rendimiento al fijar el nivel
+    # y la prueba lo daba por bueno comparando contra 'originales.iloc[1:]'.
+    # Con la fila del precio inicial el ciclo se cierra entero.
     originales = pd.DataFrame(
         {"AAA": [0.01, -0.02, 0.03, 0.005], "BBB": [-0.01, 0.02, 0.0, 0.01]}, index=FECHAS[:4]
     )
     precios = ProveedorMarco(originales, contenido="rendimientos").descargar(["AAA", "BBB"])
+    assert len(precios) == len(originales) + 1
     recuperados = rendimientos(precios, "simple")
-    np.testing.assert_allclose(
-        recuperados.to_numpy(), originales.iloc[1:].to_numpy(), atol=1e-12
-    )
+    np.testing.assert_allclose(recuperados.to_numpy(), originales.to_numpy(), atol=1e-12)
+    pd.testing.assert_index_equal(recuperados.index, originales.index, check_names=False)
 
 
 def test_se_admiten_rendimientos_logaritmicos():
@@ -244,9 +265,8 @@ def test_se_admiten_rendimientos_logaritmicos():
     precios = ProveedorMarco(
         tabla, contenido="rendimientos", tipo_rendimiento="log"
     ).descargar(["AAA"])
-    np.testing.assert_allclose(
-        precios["AAA"].to_numpy(), 100.0 * np.cumprod(np.exp([0.01, -0.02]))
-    )
+    esperado = np.concatenate([[100.0], 100.0 * np.cumprod(np.exp([0.01, -0.02]))])
+    np.testing.assert_allclose(precios["AAA"].to_numpy(), esperado)
 
 
 def test_unos_rendimientos_en_porcentaje_se_denuncian():
@@ -263,8 +283,10 @@ def test_un_hueco_en_los_rendimientos_no_se_arrastra():
         {"AAA": [0.01, np.nan, 0.03], "BBB": [0.02, 0.01, -0.01]}, index=FECHAS[:3]
     )
     precios = ProveedorMarco(tabla, contenido="rendimientos").descargar(["AAA", "BBB"])
-    assert len(precios) == 2
-    np.testing.assert_allclose(precios["AAA"].to_numpy(), 100.0 * np.cumprod([1.01, 1.03]))
+    assert len(precios) == 3  # el nivel inicial mas los dos rendimientos que quedan
+    np.testing.assert_allclose(
+        precios["AAA"].to_numpy(), np.concatenate([[100.0], 100.0 * np.cumprod([1.01, 1.03])])
+    )
 
 
 def test_un_contenido_desconocido_da_error():
@@ -296,7 +318,20 @@ def test_el_proveedor_de_marco_encaja_con_cargar_precios():
     assert list(precios.columns) == ["AAA"]
 
 
-def test_los_precios_no_positivos_se_rechazan():
+def test_los_precios_no_positivos_se_admiten_al_cargar():
+    # Esta prueba pedia antes lo contrario, y era justo lo que hacia la
+    # libreria inservible para el mercado al que se dirige: de las 102.167
+    # horas del pool espaniol entre 2018 y 2026, 5.868 casaron a cero o en
+    # negativo, y el WTI cerro a -36,98 el 20 de abril de 2020.
+    tabla = pd.DataFrame({"AAA": [100.0, -5.0, 0.0]}, index=FECHAS[:3])
+    precios = ProveedorMarco(tabla).descargar(["AAA"])
+    np.testing.assert_allclose(precios["AAA"].to_numpy(), [100.0, -5.0, 0.0])
+
+
+def test_el_logaritmo_si_rechaza_los_precios_no_positivos():
+    # La proteccion no desaparece, se muda a la unica operacion que de verdad
+    # no admite un cero, y el mensaje dice por donde salir.
     tabla = pd.DataFrame({"AAA": [100.0, -5.0]}, index=FECHAS[:2])
-    with pytest.raises(ErrorDatos, match="nulos o negativos"):
-        ProveedorMarco(tabla).descargar(["AAA"])
+    precios = ProveedorMarco(tabla).descargar(["AAA"])
+    with pytest.raises(ErrorDatos, match="logaritmo no esta definido"):
+        rendimientos(precios, "log")

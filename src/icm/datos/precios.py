@@ -83,13 +83,36 @@ def rendimientos(
     """
     if tipo not in {"log", "simple"}:
         raise ErrorDatos(f"Tipo de rendimiento '{tipo}' desconocido: use 'log' o 'simple'.")
-    if (precios <= 0).any().any() if isinstance(precios, pd.DataFrame) else (precios <= 0).any():
-        raise ErrorDatos("Hay precios nulos o negativos: no se pueden calcular rendimientos.")
+    no_positivos = (
+        (precios <= 0).any().any() if isinstance(precios, pd.DataFrame) else (precios <= 0).any()
+    )
+    if tipo == "log" and no_positivos:
+        # Solo el logaritmo necesita esta garantia. La carga si admite ceros y
+        # negativos, porque en el pool electrico son normales: rechazarlos ahi
+        # dejaba fuera 390 dias de OMIE y el 20 de abril de 2020 del WTI.
+        raise ErrorDatos(
+            "Hay precios nulos o negativos y el logaritmo no esta definido en ellos. "
+            "En un mercado electrico eso es normal, no un error del fichero: use "
+            "tipo='simple', o trabaje con la diferencia de precios en lugar de con "
+            "el rendimiento."
+        )
 
     if tipo == "log":
         salida = np.log(precios).diff()
     else:
-        salida = precios.pct_change()
+        if no_positivos:
+            # Un paso de -10 a 5 da un "rendimiento" del -150 %: el cociente
+            # deja de medir nada cuando el denominador cambia de signo o es
+            # cero. Se avisa en vez de devolver la cifra en silencio.
+            warnings.warn(
+                "Hay precios nulos o negativos: la variacion porcentual no es "
+                "interpretable en esos pasos (dividir por un precio negativo invierte "
+                "el signo, y por cero da infinito). Para un mercado electrico use la "
+                "diferencia de precios, no el rendimiento.",
+                UserWarning,
+                stacklevel=2,
+            )
+        salida = precios.pct_change().replace([np.inf, -np.inf], np.nan)
     salida = salida.dropna(how="all")
     # Se deja constancia de la convencion para que las funciones que agregan
     # carteras no tengan que adivinarla.

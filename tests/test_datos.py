@@ -63,10 +63,40 @@ def test_normalizar_tickers_rechaza_entradas_vacias(entrada):
         normalizar_tickers(entrada)
 
 
-def test_validar_marco_rechaza_precios_no_positivos():
-    marco = pd.DataFrame({"A": [1.0, -2.0]}, index=pd.date_range("2024-01-01", periods=2))
-    with pytest.raises(ErrorDatos, match="nulos o negativos"):
+def test_validar_marco_admite_precios_no_positivos():
+    # Un precio negativo no es un error del fichero: es lo que hace un mercado
+    # electrico cuando sobra renovable. Rechazarlo aqui dejaba fuera 390 dias
+    # del pool espaniol y el dia mas interesante de la serie del WTI.
+    marco = pd.DataFrame({"A": [1.0, -2.0, 0.0]}, index=pd.date_range("2024-01-01", periods=3))
+    validado = validar_marco_precios(marco, ["A"])
+    np.testing.assert_allclose(validado["A"].to_numpy(), [1.0, -2.0, 0.0])
+
+
+def test_validar_marco_rechaza_una_columna_entera_sin_datos():
+    # Es lo que devuelve Yahoo para un ticker que no existe, y antes pasaba:
+    # la unica comprobacion de valores era '<= 0', y NaN <= 0 es False.
+    marco = pd.DataFrame(
+        {"A": [1.0, 2.0], "ZZZZ": [np.nan, np.nan]},
+        index=pd.date_range("2024-01-01", periods=2),
+    )
+    with pytest.raises(ErrorDatos, match="sin un solo dato"):
+        validar_marco_precios(marco, ["A", "ZZZZ"])
+
+
+def test_validar_marco_rechaza_fechas_repetidas():
+    marco = pd.DataFrame({"A": [1.0, 2.0]}, index=pd.to_datetime(["2024-01-01", "2024-01-01"]))
+    with pytest.raises(ErrorDatos, match="fechas repetidas"):
         validar_marco_precios(marco, ["A"])
+
+
+def test_validar_marco_no_lee_un_indice_entero_como_nanosegundos():
+    # pd.to_datetime lee un entero como nanosegundos desde 1970, asi que un
+    # indice AAAAMMDD se convertia en 1970 sin protestar. Es el mismo fallo
+    # que ya se habia corregido en convertir_fechas y aqui seguia vivo.
+    marco = pd.DataFrame({"A": [100.0, 101.0]}, index=[20240102, 20240103])
+    validado = validar_marco_precios(marco, ["A"])
+    assert validado.index[0] == pd.Timestamp("2024-01-02")
+    assert validado.index[-1] == pd.Timestamp("2024-01-03")
 
 
 def test_validar_marco_detecta_tickers_ausentes():

@@ -135,17 +135,6 @@
    "sha256_12": "27219f1ca8db"
   },
   {
-   "fichero": "omie_horario.csv",
-   "descripcion": "Precio marginal horario del pool iberico, EUR/MWh (ES y PT)",
-   "repo": "OMIE",
-   "ruta_origen": "file-download?parents=marginalpdbc",
-   "columna_fecha": "fecha",
-   "filas": 102167,
-   "desde": "2018-01-01",
-   "hasta": "2026-09-25",
-   "sha256_12": "91c615dd1f77"
-  },
-  {
    "fichero": "omie_diario.csv",
    "descripcion": "Media aritmetica diaria del pool iberico, EUR/MWh",
    "repo": "OMIE",
@@ -166,6 +155,17 @@
    "desde": "2016-01-06",
    "hasta": "2026-09-26",
    "sha256_12": "8892853a34ff"
+  },
+  {
+   "fichero": "omie_intradiario.csv",
+   "descripcion": "Precio marginal por periodo de casacion del pool iberico, EUR/MWh (ES y PT). Horario hasta 2025-09-30 y cuarto-horario desde 2025-10-01",
+   "repo": "OMIE",
+   "ruta_origen": "file-download?parents=marginalpdbc",
+   "columna_fecha": "fecha",
+   "filas": 102143,
+   "desde": "2018-01-01",
+   "hasta": "2026-09-25",
+   "sha256_12": "dad79abd1bec"
   }
  ]
 }

@@ -10,9 +10,28 @@ directamente de los operadores del mercado español:
 
 | Fichero | Contenido | Filas | Desde | Hasta |
 |---|---|---:|---|---|
-| `omie_horario.csv` | Precio marginal **horario** del pool ibérico, €/MWh (ES y PT) | 102 167 | 2018-01-01 | 2026-09-25 |
+| `omie_intradiario.csv` | Precio marginal por **período de casación** del pool ibérico, €/MWh (ES y PT) | 102 143 | 2018-01-01 | 2026-09-25 |
 | `omie_diario.csv` | Media aritmética diaria del pool ibérico, €/MWh | 3 185 | 2018-01-01 | 2026-09-25 |
 | `mibgas_diario.csv` | Gas spot español `GDAES_D+1` en el PVB, €/MWh | 3 877 | 2016-01-06 | 2026-09-26 |
+
+**El período no siempre dura una hora.** El 1 de octubre de 2025 OMIE pasó de
+casar 24 períodos horarios al día a casar 96 cuarto-horarios, así que la misma
+serie trae los dos regímenes: 2 813 días con 24 períodos y 355 con 96, más los
+del cambio de hora (23 o 25 horarios, 92 o 100 cuarto-horarios). Por eso el
+fichero no se llama «horario». El cargador lo deduce solo de cuántos períodos
+tiene cada día:
+
+```python
+precios = cargar_precios_fichero(
+    "datos/reales/omie_intradiario.csv",
+    columna_hora="periodo", huso="Europe/Madrid",
+)
+```
+
+El `huso` hace falta para el último domingo de octubre, que tiene 25 períodos:
+sin él, las dos veces que dan las 02:00 comparten etiqueta y una desaparece.
+Con él son dos instantes distintos y sobreviven las dos, que es lo correcto —
+en 2018 costaron 52,40 y 50,12 €/MWh.
 
 Comprobaciones de autenticidad que pasan: el máximo del pool es **700 €/MWh el
 8 de marzo de 2022** (récord histórico tras la invasión de Ucrania) y la media
@@ -105,23 +124,19 @@ Dicho de otro modo: la regla que protege los datos es la que impide analizar el
 día más interesante de la serie, y haría lo mismo con cualquier descarga de
 OMIE. Está anotado para arreglar.
 
-## El pool español no entra por la puerta
+## Los precios negativos del pool
 
-`omie_horario.csv` **no se puede cargar**, por la misma regla que tumba el WTI:
-
-```
-ErrorDatos: Se han encontrado precios nulos o negativos
-```
-
-En las 102 167 horas del fichero hay **2 315 exactamente a cero y 3 553
-negativas**, con un mínimo de −15 €/MWh: el 5,74 % del mercado, repartido por
+De los 102 143 períodos del fichero, **2 315 casaron a cero exacto y 3 553 en
+negativo**, con un mínimo de −15 €/MWh: el 5,74 % del mercado, repartido por
 **390 días distintos**. No es una anomalía ni un error de descarga, es cómo
 funciona el pool cuando coinciden mucha renovable y poca demanda.
 
-`omie_diario.csv` sí carga, pero solo porque la media aritmética del día nunca
-llega a bajar de cero (mínimo 0,18 €/MWh). Es decir: la librería admite el
-mercado eléctrico español únicamente si se le borra antes la granularidad en la
-que ocurre lo interesante.
+Durante un tiempo la librería no pudo cargar este fichero: `validar_marco_precios`
+rechazaba la serie entera en cuanto encontraba un precio no positivo, igual que
+hacía con el WTI del 20 de abril de 2020. Ya no. La protección vive ahora donde
+de verdad hace falta, en `rendimientos(tipo="log")`, que es la única operación
+que no admite un cero; para una serie eléctrica lo correcto es trabajar con la
+diferencia de precios, y el mensaje de error lo dice.
 
 ## Lo que sigue faltando
 
