@@ -166,6 +166,17 @@
    "desde": "2018-01-01",
    "hasta": "2026-09-25",
    "sha256_12": "dad79abd1bec"
+  },
+  {
+   "fichero": "meteo_madrid.csv",
+   "descripcion": "Temperatura diaria de Madrid en grados Celsius: media, maxima y minima. La media es TAVG cuando la estacion la publica y (max+min)/2 el resto",
+   "repo": "NOAA NCEI",
+   "ruta_origen": "daily-summaries, estacion SP000003195",
+   "columna_fecha": "fecha",
+   "filas": 3078,
+   "desde": "2018-01-01",
+   "hasta": "2026-09-19",
+   "sha256_12": "378720e2f33f"
   }
  ]
 }

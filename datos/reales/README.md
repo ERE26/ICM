@@ -13,6 +13,7 @@ directamente de los operadores del mercado español:
 | `omie_intradiario.csv` | Precio marginal por **período de casación** del pool ibérico, €/MWh (ES y PT) | 102 143 | 2018-01-01 | 2026-09-25 |
 | `omie_diario.csv` | Media aritmética diaria del pool ibérico, €/MWh | 3 185 | 2018-01-01 | 2026-09-25 |
 | `mibgas_diario.csv` | Gas spot español `GDAES_D+1` en el PVB, €/MWh | 3 877 | 2016-01-06 | 2026-09-26 |
+| `meteo_madrid.csv` | Temperatura diaria de Madrid: media, máxima y mínima, °C | 3 078 | 2018-01-01 | 2026-09-19 |
 
 **El período no siempre dura una hora.** El 1 de octubre de 2025 OMIE pasó de
 casar 24 períodos horarios al día a casar 96 cuarto-horarios, así que la misma
@@ -138,14 +139,40 @@ de verdad hace falta, en `rendimientos(tipo="log")`, que es la única operación
 que no admite un cero; para una serie eléctrica lo correcto es trabajar con la
 diferencia de precios, y el mensaje de error lo dice.
 
-## Lo que sigue faltando
+## Sobre la temperatura
 
-**TTF** (el gas de referencia europeo) y los derechos de emisión **EUA**. El
-primero lo publica ICE bajo licencia y el segundo EEX; ninguno tiene descarga
-abierta comparable. ESIOS (generación por tecnología, previsión eólica, demanda)
-necesita un token personal gratuito que hay que pedir por correo a
-`consultasios@ree.es`; con ese token entraría, porque el dominio ya es
-alcanzable — hoy devuelve 403 por falta de credencial, no por la red.
+Viene de la estación NOAA `SP000003195` (Madrid). Dos cautelas que importan para
+los grados-día:
 
-Para el spark spread, MIBGAS y OMIE bastan: gas y electricidad españoles, ambos
-en €/MWh, con más de ocho años de solapamiento.
+- La columna `TAVG` solo está en 1 626 de los 3 078 días. El resto de la media
+  es `(máxima + mínima) / 2`, que es la convención con la que el sector publica
+  los grados-día pero queda algo por encima de la media real del día, y por
+  tanto **subestima ligeramente los HDD**.
+- Faltan unos 11 días al año. Con `grados_dia` eso no desplaza nada porque la
+  transformación es puntual, pero cualquier acumulado móvil sí lo nota.
+
+Los grados-día que salen (base 15,5 / 22 °C) van de 1 341 HDD en 2018 a 924 en
+2024, con los CDD subiendo de 404 a 468. La tendencia es real, pero parte de la
+caída de 2025-2026 es que la muestra termina en septiembre y se queda sin los
+meses fríos.
+
+## Lo que no se pudo conseguir
+
+Tres cosas, y ninguna es sustituible por algo parecido:
+
+- **Generación eólica y demanda españolas.** ESIOS necesita un token personal
+  gratuito que se pide por correo a `consultasios@ree.es`. El dominio ya es
+  alcanzable: devuelve 403 por falta de credencial, no por la red. La API
+  `apidatos.ree.es` está detrás de protección anti-bot y no se intentó rodear.
+- **Previsiones meteorológicas publicadas**, que es la pata sobre la que
+  descansaba el primer resultado del proyecto. `open-meteo` tiene un archivo de
+  previsiones pasadas y no pide clave, pero su cuota diaria gratuita se agotó
+  con las pruebas de conexión. Se puede reintentar al día siguiente.
+- **TTF y derechos de emisión EUA.** El primero lo publica ICE bajo licencia y
+  el segundo EEX; ninguno tiene descarga abierta comparable.
+
+Sin previsiones publicadas, la afirmación *«la señal está en las previsiones y
+no en el historial»* **no se puede contrastar** con estos datos. Lo que sí se
+puede medir es su otra mitad: si los valores rezagados sirven o no. Para el
+spark spread, en cambio, MIBGAS y OMIE bastan — gas y electricidad españoles,
+ambos en €/MWh, con más de ocho años de solapamiento.
