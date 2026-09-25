@@ -70,6 +70,81 @@ class ModeloMudo:
         raise AssertionError("la validacion no deberia haber llegado hasta aqui")
 
 
+class ModeloConHueco:
+    """Imita a ``RedSecuencial``: NaN en las primeras filas de cada tramo.
+
+    Es el modelo con el que se descubrio que ``acierto_direccional`` contaba los
+    huecos como fallos, y por eso no es un caso inventado: la red del
+    repositorio devuelve NaN en las ``ventana - 1`` primeras filas de la tabla
+    que recibe, y cada tramo de prueba empieza con ese hueco.
+    """
+
+    def __init__(self, ventana: int = 10) -> None:
+        self.ventana = ventana
+        self.coeficientes: np.ndarray | None = None
+
+    def ajustar(self, X: pd.DataFrame, y: pd.Series) -> ModeloConHueco:
+        self.coeficientes = np.linalg.lstsq(
+            X.to_numpy(dtype=float), y.to_numpy(dtype=float), rcond=None
+        )[0]
+        return self
+
+    def predecir(self, X: pd.DataFrame) -> np.ndarray:
+        # El coseno degrada el ajuste a proposito: con una prediccion perfecta
+        # el acierto verdadero seria 1.0 y no distinguiria un acierto bien
+        # calculado de uno sesgado a la baja.
+        salida = X.to_numpy(dtype=float) @ self.coeficientes + 0.12 * np.cos(
+            np.arange(len(X))
+        )
+        salida[: self.ventana - 1] = np.nan
+        return salida
+
+
+class ModeloEtiquetado(ModeloPrimeraColumna):
+    """Devuelve la prediccion como ``Series`` indexada, y opcionalmente reordenada.
+
+    Reordenar la salida es lo que hace por dentro cualquier modelo que agrupe u
+    ordene (``groupby``, ``sort_values``, ``sort_index``) antes de devolver:
+    el tamanio cuadra y solo el indice delata el desorden.
+    """
+
+    def __init__(self, reordenar: bool = False) -> None:
+        super().__init__()
+        self.reordenar = reordenar
+
+    def predecir(self, X: pd.DataFrame) -> pd.Series:
+        salida = pd.Series(X[self.columna].to_numpy(dtype=float), index=X.index)
+        return salida.sort_values() if self.reordenar else salida
+
+
+class RedDeArranqueCaliente:
+    """Modelo del convenio del repositorio, sin ``get_params`` y sin reiniciar.
+
+    ``sklearn.base.clone`` no puede copiarlo (no expone ``get_params``), asi que
+    cae en la via de ``copy.deepcopy``, y su ajuste sigue desde los pesos
+    actuales en vez de reinicializarlos: si llega ya entrenado, cada particion
+    arranca desde unos pesos que han visto las fechas de prueba.
+    """
+
+    def __init__(self, pasos: int = 25, tasa: float = 0.05) -> None:
+        self.pasos = pasos
+        self.tasa = tasa
+        self.pesos: np.ndarray | None = None
+
+    def ajustar(self, X, y) -> RedDeArranqueCaliente:
+        matriz = np.asarray(X, dtype=float)
+        objetivo = np.asarray(y, dtype=float)
+        if self.pesos is None:
+            self.pesos = np.zeros(matriz.shape[1])
+        for _ in range(self.pasos):
+            residuo = matriz @ self.pesos - objetivo
+            self.pesos -= self.tasa * (matriz.T @ residuo) / len(objetivo)
+        return self
+
+    def predecir(self, X) -> np.ndarray:
+        return np.asarray(X, dtype=float) @ self.pesos
+
+
 # --- datos ---------------------------------------------------------------------
 
 
@@ -290,6 +365,33 @@ def test_la_validacion_admite_arrays_de_numpy(X, y):
     assert resultado.predicciones.index.is_unique
 
 
+def test_con_x_sin_indice_no_se_exige_que_el_modelo_reproduzca_las_posiciones(X):
+    """Las fechas de un ``ndarray`` las inventa este modulo, no el modelo.
+
+    El emparejamiento por etiqueta solo tiene sentido cuando las etiquetas
+    vienen de los datos; con ``X`` sin indice se comprueba el numero de filas y
+    se empareja por posicion, que es la unica nocion de tiempo que hay.
+    """
+
+    class ModeloSerieDesdeCero:
+        def ajustar(self, X, y):
+            self.media = float(np.asarray(y, dtype=float).mean())
+            return self
+
+        def predecir(self, X):
+            return pd.Series(np.full(len(X), self.media))
+
+    objetivo = X["senal"].rename("objetivo")
+    resultado = validacion_walk_forward(
+        ModeloSerieDesdeCero(),
+        X.to_numpy(),
+        objetivo.to_numpy(),
+        ParticionWalkForward(n_particiones=3),
+    )
+
+    assert resultado.predicciones.nunique() == 3
+
+
 def test_una_prediccion_bidimensional_se_aplana_sin_desalinearse(X):
     class ModeloColumna(ModeloPrimeraColumna):
         def predecir(self, X: pd.DataFrame) -> np.ndarray:
@@ -301,6 +403,107 @@ def test_una_prediccion_bidimensional_se_aplana_sin_desalinearse(X):
     np.testing.assert_allclose(
         resultado.predicciones.to_numpy(), resultado.reales.to_numpy()
     )
+
+
+def test_las_fechas_sin_prediccion_no_cuentan_como_fallo_direccional(X, y):
+    """El acierto debe medirse solo donde hay prediccion, no diluirse en huecos.
+
+    ``np.sign(nan)`` es NaN y NaN nunca iguala al signo real, asi que cada hueco
+    entraba en el denominador contado como fallo. Eso convertia el acierto en la
+    unica metrica que no avisaba de un hueco: las demas salen NaN.
+    """
+    particion = ParticionWalkForward(n_particiones=5, tamano_prueba=50)
+    resultado = validacion_walk_forward(ModeloConHueco(ventana=10), X, y, particion)
+
+    predicciones = resultado.predicciones.to_numpy(dtype=float)
+    reales = resultado.reales.to_numpy(dtype=float)
+    validas = np.isfinite(predicciones) & np.isfinite(reales) & (reales != 0.0)
+    esperado = float(np.mean(np.sign(predicciones[validas]) == np.sign(reales[validas])))
+
+    assert validas.sum() == 205  # 45 huecos de los 250; el 18 % de las filas
+    assert resultado.resumen["acierto_direccional"] == pytest.approx(esperado)
+    assert resultado.resumen["n_validas"] == 205
+    assert resultado.resumen["observaciones"] == 250
+    assert np.isnan(resultado.resumen["rmse"])
+    assert (resultado.por_particion["n_validas"] == 41).all()
+
+
+def test_una_prediccion_etiquetada_y_reordenada_se_realinea_por_fecha(X):
+    """Si el modelo trae el indice, se usa para emparejar y no la posicion.
+
+    Desetiquetar con ``np.asarray`` y volver a etiquetar por posicion pegaba
+    cada prediccion a la fecha de otra en cuanto el modelo reordenaba su salida,
+    con el tamanio cuadrando y sin ningun aviso.
+    """
+    objetivo = X["senal"].rename("objetivo")
+    particion = ParticionWalkForward(n_particiones=5, tamano_prueba=50)
+
+    ordenado = validacion_walk_forward(ModeloEtiquetado(), X, objetivo, particion)
+    reordenado = validacion_walk_forward(
+        ModeloEtiquetado(reordenar=True), X, objetivo, particion
+    )
+
+    pd.testing.assert_series_equal(reordenado.predicciones, ordenado.predicciones)
+    np.testing.assert_allclose(
+        reordenado.predicciones.to_numpy(), reordenado.reales.to_numpy()
+    )
+    assert reordenado.resumen["correlacion"] > 0.99
+
+
+def test_una_prediccion_con_fechas_ajenas_al_tramo_se_rechaza(X):
+    """Un indice que no es el del tramo no se puede emparejar por posicion."""
+
+    class ModeloDesplazado(ModeloEtiquetado):
+        def predecir(self, X: pd.DataFrame) -> pd.Series:
+            salida = super().predecir(X)
+            salida.index = salida.index + pd.Timedelta(days=400)
+            return salida
+
+    objetivo = X["senal"].rename("objetivo")
+
+    with pytest.raises(ErrorDatos, match="no coincide"):
+        validacion_walk_forward(ModeloDesplazado(), X, objetivo)
+
+
+def test_una_prediccion_de_dos_columnas_no_se_aplana_a_la_callada(X):
+    """Aplanar una tabla de dos columnas hacia cuadrar el tamanio es desalinear.
+
+    ``reshape(-1)`` hacia que una salida de forma ``(n/2, 2)`` cuadrase con las
+    ``n`` fechas del tramo, asi que el control de tamanio no la veia.
+    """
+
+    class ModeloDosColumnas(ModeloEtiquetado):
+        def predecir(self, X: pd.DataFrame) -> pd.DataFrame:
+            valores = X[self.columna].to_numpy(dtype=float)
+            mitad = len(valores) // 2
+            return pd.DataFrame(
+                {"a": valores[:mitad], "b": valores[mitad:]}, index=X.index[:mitad]
+            )
+
+    objetivo = X["senal"].rename("objetivo")
+
+    with pytest.raises(ErrorDatos, match="filas de predicciones"):
+        validacion_walk_forward(ModeloDosColumnas(), X, objetivo)
+
+
+def test_un_modelo_ya_ajustado_sin_get_params_se_rechaza(X, y):
+    """La copia por ``deepcopy`` arrastra el ajuste, asi que hay que rechazarlo.
+
+    Con un modelo entrenado sobre toda la serie, cada particion arrancaria desde
+    unos pesos que ya han visto las fechas de prueba; medido con ``y`` de ruido
+    puro, la correlacion informada pasaba de -0,02 a +0,20.
+    """
+    preajustada = RedDeArranqueCaliente().ajustar(X, y)
+
+    with pytest.raises(ErrorDatos, match="ya ajustado"):
+        validacion_walk_forward(preajustada, X, y, ParticionWalkForward(n_particiones=3))
+
+    sin_ajustar = RedDeArranqueCaliente()
+    resultado = validacion_walk_forward(
+        sin_ajustar, X, y, ParticionWalkForward(n_particiones=3)
+    )
+    assert len(resultado.modelos) == 3
+    assert sin_ajustar.pesos is None
 
 
 # --- errores -------------------------------------------------------------------
@@ -370,6 +573,30 @@ def test_un_indice_con_fechas_repetidas_se_rechaza(X):
 
     with pytest.raises(ErrorDatos, match="repetidas"):
         list(ParticionWalkForward().dividir(repetido))
+
+
+def test_un_panel_con_multiindex_se_rechaza(X):
+    """El MultiIndex burla el control de duplicados sin dejar de romperlo.
+
+    Los pares ``(fecha, activo)`` son unicos y crecientes, asi que la particion
+    los aceptaba: cortaba una fecha por la mitad, dejando unos activos del dia
+    ``t`` en entrenamiento y otros en prueba, y contaba el embargo en filas, de
+    modo que compraba ``embargo / n_activos`` dias de hueco.
+    """
+    fechas = pd.bdate_range("2018-01-01", periods=140)
+    activos = ["A", "B", "C", "D", "E"]
+    panel_indice = pd.MultiIndex.from_product([fechas, activos], names=["fecha", "activo"])
+    panel = pd.DataFrame(
+        np.random.default_rng(7).normal(size=(len(panel_indice), 2)),
+        index=panel_indice,
+        columns=["u", "v"],
+    )
+    particion = ParticionWalkForward(n_particiones=4, tamano_prueba=48)
+
+    with pytest.raises(ErrorDatos, match="panel"):
+        list(particion.dividir(panel))
+    with pytest.raises(ErrorDatos, match="panel"):
+        particion.describir(panel)
 
 
 def test_un_modelo_sin_interfaz_conocida_se_rechaza(X, y):

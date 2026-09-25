@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -322,6 +323,52 @@ def test_la_ventana_no_mira_al_futuro(
     assert original[-1] != perturbada[-1]
 
 
+def test_una_tabla_con_el_indice_descendente_se_rechaza() -> None:
+    """La cuarta fuga: con la tabla al reves la ventana mira al futuro.
+
+    Las ventanas se recortan por posicion, asi que pasar la serie de mas
+    reciente a mas antigua -el orden en que la sirven casi todos los
+    proveedores- convierte el "hacia atras" en hacia delante. Medido antes del
+    arreglo, con un objetivo construido para depender SOLO del futuro
+    (``y[t] = x[t+1]+...+x[t+5]``): con el indice creciente la red no aprende
+    nada (RMSE 2.3890 frente a 2.4000 de predecir la media) y con la tabla
+    invertida el RMSE bajaba a 1.0411, sin ninguna queja y con ``ajustada`` a
+    True.
+    """
+    X, y = _datos_suma_ventana(n=60, ventana=4)
+
+    with pytest.raises(ErrorDatos, match="no esta ordenado de menor a mayor"):
+        RedSecuencial(ventana=4, epocas=1).ajustar(X.iloc[::-1], y.iloc[::-1])
+
+
+def test_un_indice_con_fechas_repetidas_se_rechaza() -> None:
+    """Con filas de la misma fecha no hay forma de saber cual es el pasado."""
+    X, y = _datos_suma_ventana(n=60, ventana=4)
+    repetido = pd.DatetimeIndex([X.index[0]] * len(X), name="fecha")
+
+    with pytest.raises(ErrorDatos, match="fechas repetidas"):
+        RedSecuencial(ventana=4, epocas=1).ajustar(
+            X.set_axis(repetido), y.set_axis(repetido)
+        )
+
+
+def test_predecir_con_la_tabla_desordenada_se_rechaza(
+    red_ajustada: RedSecuencial,
+    datos_suma: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """``predecir`` sufre la fuga del orden por si solo.
+
+    Una red entrenada con la tabla bien ordenada sigue construyendo ventanas por
+    posicion, asi que si despues le dan la tabla al reves predice cada fecha con
+    las siguientes. Y no se puede ordenar por dentro: la salida se devuelve
+    alineada por posicion con la tabla recibida.
+    """
+    X, _ = datos_suma
+
+    with pytest.raises(ErrorDatos, match="no esta ordenado de menor a mayor"):
+        red_ajustada.predecir(X.iloc[::-1])
+
+
 def test_la_normalizacion_y_el_entrenamiento_ignoran_el_tramo_de_validacion() -> None:
     """Cambiar el tramo final no puede alterar los pesos ni la normalizacion.
 
@@ -408,6 +455,48 @@ def test_la_parada_temprana_corta_antes_del_maximo_y_restaura_los_mejores_pesos(
     assert np.array_equal(predicciones[VENTANA - 1:], en_la_mejor[VENTANA - 1:])
     perdidas = historial["perdida_validacion"]
     assert perdidas.iloc[-1] > perdidas.min()
+
+
+def test_si_ninguna_epoca_mejora_el_ajuste_falla_en_vez_de_devolver_pesos_aleatorios() -> None:
+    """Un solo valor extremo en el tramo de validacion hacia inf la perdida.
+
+    Al estandarizarse con la escala del entrenamiento y elevarse al cuadrado en
+    float32, un ``y`` del orden de 1e21 desborda, y ni ``inf < inf`` ni
+    ``nan < inf`` son ciertos: ninguna epoca "mejoraba", de modo que se
+    restauraban los pesos de la inicializacion aleatoria. Medido antes del
+    arreglo, con los mismos datos y la misma configuracion: RMSE 2.2773 frente
+    a 0.0764 con ``y`` limpia, peor que predecir la media (2.2486), con
+    ``ajustada`` a True, la perdida de entrenamiento del historial bajando de
+    0.4202 a 0.0019 y los pesos devueltos identicos tensor a tensor a los de una
+    red sin entrenar.
+    """
+    X, y = _datos_suma_ventana()
+    envenenada = y.copy()
+    envenenada.iloc[-5] = 1e21  # dentro del 20 % final, el tramo de validacion
+    configuracion = replace(_configuracion_aprendizaje(), epocas=3, paciencia=3)
+
+    with pytest.raises(ErrorDatos, match="no fue finita en ninguna"):
+        RedSecuencial(configuracion).ajustar(X, envenenada)
+
+
+def test_un_tramo_de_entrenamiento_degenerado_se_rechaza() -> None:
+    """La guarda de tamanio mira el total, no lo que queda tras el embargo.
+
+    Medido antes del arreglo: ``ventana=30`` con 40 filas deja 11 muestras, de
+    las que ``_tramos`` destina 1 a entrenar (2 a validacion y 8 al embargo); la
+    desviacion de un unico objetivo es nula, ``_escala_y`` colapsaba a 1.0 y el
+    ajuste completaba sus epocas y predecia sin queja. Segundo caso:
+    ``proporcion_validacion=0.99`` con 30 filas y ``ventana=4`` deja (1, 26).
+    """
+    X, y = _datos_suma_ventana(n=40, ventana=30)
+    with pytest.raises(ErrorDatos, match="solo 1 para entrenar"):
+        RedSecuencial(ventana=30, epocas=3, paciencia=3).ajustar(X, y)
+
+    X_corta, y_corta = _datos_suma_ventana(n=30, ventana=4)
+    with pytest.raises(ErrorDatos, match="baje 'proporcion_validacion'"):
+        RedSecuencial(ventana=4, epocas=3, paciencia=3, proporcion_validacion=0.99).ajustar(
+            X_corta, y_corta
+        )
 
 
 def test_sin_validacion_interna_la_parada_temprana_vigila_el_entrenamiento() -> None:
@@ -582,6 +671,29 @@ def test_predecir_no_depende_del_orden_de_las_columnas(
 
 def test_el_alcance_de_la_tcn_crece_de_forma_exponencial_con_las_capas() -> None:
     """Sirve para detectar una ventana mucho mayor que lo que la TCN alcanza a ver."""
-    assert ConfiguracionRed(arquitectura="tcn", capas=1).alcance_tcn == 3
-    assert ConfiguracionRed(arquitectura="tcn", capas=2).alcance_tcn == 7
+    with pytest.warns(UserWarning):
+        assert ConfiguracionRed(arquitectura="tcn", capas=1).alcance_tcn == 3
+    with pytest.warns(UserWarning):
+        assert ConfiguracionRed(arquitectura="tcn", capas=2).alcance_tcn == 7
     assert ConfiguracionRed(arquitectura="tcn", capas=5).alcance_tcn == 63
+
+
+def test_una_tcn_que_no_cubre_la_ventana_avisa_del_alcance_efectivo() -> None:
+    """El alcance se calculaba pero no se consultaba, asi que nadie se enteraba.
+
+    Con los valores por omision (``ventana=30``, ``capas=1``) la TCN alcanza 3
+    fechas: medido antes del arreglo, perturbar la fila ``t-k`` en +50 movia la
+    prediccion de ``t`` para k = 0, 1 y 2 y daba ``|delta| = 0.000e+00``
+    EXACTAMENTE para k = 3, 5, 10 y 29, mientras ``predecir`` seguia marcando
+    las 29 primeras filas con NaN como si usara 30 fechas de historia.
+
+    Con ``capas=5`` el alcance es 63 y cubre la ventana: ahi no debe avisar, que
+    es lo que impide que el aviso se convierta en ruido de fondo.
+    """
+    with pytest.warns(UserWarning, match="solo alcanza a ver 3 de las 30 fechas"):
+        ConfiguracionRed(arquitectura="tcn", ventana=30, capas=1)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ConfiguracionRed(arquitectura="tcn", ventana=30, capas=5)
+        ConfiguracionRed(arquitectura="lstm", ventana=30, capas=1)

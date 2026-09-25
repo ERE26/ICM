@@ -327,10 +327,11 @@ def test_el_retardo_cero_es_trampa_y_no_una_opcion(rendimientos_ruido):
     precios y que ninguna estrategia real roza. Con retardo=1, la misma senal
     no vale nada, que es lo que de verdad valia.
 
-    Por eso retardo=0 no es una opcion legitima del backtest. Si lo que se
-    tiene es una prediccion indexada en la fecha del rendimiento que predice
-    (la convencion de icm.ml.evaluacion), hay que desplazarla con .shift(-1) y
-    dejar retardo=1, no bajar el retardo.
+    Por eso retardo=0 no es una opcion legitima del backtest. Solo hay que
+    desplazar la prediccion con .shift(-1) si viene indexada en la fecha del
+    rendimiento que predice, es decir construida sobre una y contemporanea;
+    ResultadoValidacion.predicciones no es ese caso y adelantarla reproduce
+    exactamente esta trampa (vease tests/test_ml_convencion.py).
     """
     contemporanea = rendimientos_ruido
 
@@ -612,6 +613,75 @@ def test_el_coste_de_equilibrio_separa_el_sharpe_positivo_del_negativo(caso_con_
 
     justo = ejecutar_estrategia(prediccion, rendimientos, coste_bps=equilibrio)
     assert resumen_estrategia(justo)["ratio_sharpe"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_el_sharpe_y_el_coste_de_equilibrio_no_cambian_al_apalancar(caso_con_ventaja):
+    """La misma senal a x1, x2 y x3 tiene que publicar las mismas dos cifras.
+
+    Los Sharpe se tomaban de icm.cartera.metricas.ratio_sharpe, cuyo numerador
+    es la CAGR geometrica, sobre un pnl que este modulo define como aditivo por
+    unidad de capital. Al apalancar, el denominador crece exactamente por k
+    pero el numerador no, porque el arrastre de volatilidad va con el cuadrado:
+    la misma senal publicaba 7,39 / 12,02 / 20,08 a x1/x2/x3 y
+    comparar_estrategias la ordenaba ['x3','x2','x1'], es decir, repartia
+    capital por apalancamiento y no por senal. El coste de equilibrio arrastraba
+    el mismo defecto, cayendo de 32,8 a 19,1 bps sobre una senal identica cuyo
+    equilibrio aritmetico es 33,5 bps en todos los casos.
+    """
+    prediccion, rendimientos = caso_con_ventaja
+    desviacion = float(prediccion.std(ddof=1))
+
+    resumenes, equilibrios = [], []
+    for k in (1, 2, 3):
+        # limite alto para que el recorte no ate la posicion: lo que se quiere
+        # comparar es la misma senal a distinta escala, no una senal recortada.
+        opciones = {"modo": "proporcional", "escala": desviacion / k, "limite": 50.0}
+        resumenes.append(
+            resumen_estrategia(
+                ejecutar_estrategia(prediccion, rendimientos, coste_bps=2.0, **opciones)
+            )
+        )
+        equilibrios.append(coste_de_equilibrio(prediccion, rendimientos, **opciones))
+
+    for k, resumen in enumerate(resumenes[1:], start=2):
+        assert resumen["ratio_sharpe"] == pytest.approx(resumenes[0]["ratio_sharpe"])
+        assert resumen["sharpe_bruto"] == pytest.approx(resumenes[0]["sharpe_bruto"])
+        assert equilibrios[k - 1] == pytest.approx(equilibrios[0])
+        # Y el apalancamiento estaba puesto de verdad: la volatilidad si escala.
+        assert resumen["volatilidad_anualizada"] == pytest.approx(
+            k * resumenes[0]["volatilidad_anualizada"]
+        )
+
+
+def test_un_unico_periodo_ruinoso_no_deja_el_coste_de_equilibrio_en_cero(caso_con_ventaja):
+    """Un solo dia con pnl <= -1 anulaba la cifra que publica este modulo.
+
+    icm.cartera.metricas.rentabilidad_anualizada devuelve -1.0 cuando el
+    producto de (1+pnl) no es positivo, asi que un unico periodo con la
+    posicion puesta y un rendimiento de -1,4 bastaba para que el Sharpe
+    geometrico fuese negativo y coste_de_equilibrio devolviese 0,0 bps con el
+    mensaje de que la estrategia no aguanta ninguna friccion, cuando la suma
+    del pnl era +1,25 y sin ese dia el equilibrio pasaba de 26 bps. En energia
+    hay precios negativos y el modulo admite posiciones apalancadas, asi que el
+    caso no es de laboratorio.
+    """
+    prediccion, rendimientos = caso_con_ventaja
+    largas = ejecutar_estrategia(prediccion, rendimientos, coste_bps=0.0).posiciones
+    largas = largas[largas > 0]
+    fecha = largas.index[len(largas) // 2]
+    ruinoso = rendimientos.copy()
+    ruinoso.loc[fecha] = -1.4
+
+    resultado = ejecutar_estrategia(prediccion, ruinoso, coste_bps=0.0)
+    resumen = resumen_estrategia(resultado)
+
+    assert resultado.pnl.loc[fecha] == pytest.approx(-1.4)
+    assert resultado.pnl.sum() > 0.0
+    # La CAGR si queda truncada, y ahi es la cifra correcta: el capital se ha
+    # ido a cero. Lo que no puede arrastrar es al Sharpe ni al equilibrio.
+    assert resumen["rentabilidad_anualizada"] == -1.0
+    assert resumen["ratio_sharpe"] > 0.0
+    assert coste_de_equilibrio(prediccion, ruinoso) > 5.0
 
 
 def test_el_coste_de_equilibrio_es_cero_si_ni_sin_costes_se_gana(caso_con_ventaja):

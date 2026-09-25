@@ -14,23 +14,36 @@ Convencion temporal
 -------------------
 ``prediccion[t]`` se construye con informacion **hasta t incluido** y apuesta
 por el rendimiento de ``t+1``. La posicion se toma al cierre de t y cobra el
-rendimiento de t+1. De ahi ``retardo=1``, que es el valor por defecto y el
-unico correcto bajo esta convencion.
+rendimiento de t+1. De ahi ``retardo=1`` con rendimientos contemporaneos, que
+es el unico valor correcto bajo esta convencion.
 
-Cuidado, porque **no** es la convencion de :mod:`icm.ml.evaluacion`: alli
-``prediccion[t]`` es la prevision *del* rendimiento de t, para poder comparar
-termino a termino, y lo mismo vale para ``ResultadoValidacion.predicciones``.
-Una serie asi esta indexada en la fecha del rendimiento que predice, no en la
-fecha en que se decide, y hay que desplazarla antes de traerla aqui:
+``ResultadoValidacion.predicciones`` **ya viene** en esa convencion y por eso
+se pasa tal cual, sin desplazarla. Conviene saber por que: esa serie se indexa
+con las filas de ``X``/``y``, y la ``y`` de
+:func:`icm.ml.caracteristicas.construir_matriz` esta indexada en la fecha de
+DECISION (``y[t]`` es el rendimiento de t a t+h). Hay dos formas correctas de
+traerla aqui:
 
->>> prediccion = resultado.predicciones.shift(-1)   # doctest: +SKIP
+>>> r = ejecutar_estrategia(p.predicciones, md.y)                  # doctest: +SKIP
+>>> r = ejecutar_estrategia(p.predicciones, contemporaneos, retardo=1)  # doctest: +SKIP
 
-La tentacion es compensarlo con ``retardo=0``, que en ese caso concreto da el
-mismo numero. Es una mala costumbre: en cuanto una serie del montaje no sigue
-la misma convencion que las demas, ``retardo=0`` pasa de compensar un desfase
-a leer el futuro, y nada en el resultado lo delata salvo que sea
-sospechosamente bueno. Una sola convencion, indexar siempre en la fecha de
-decision, y ``retardo=1``.
+En la primera el retardo deducido es 0 porque el desplazamiento lo lleva ya la
+serie de rendimientos; en la segunda lo pone ``retardo``. Las dos imputan el
+mismo importe, una en la fecha de decision y otra en la de liquidacion.
+
+Lo que **nunca** hay que hacer es adelantar esa serie con ``.shift(-1)``:
+produce exactamente la cuenta de resultados de ``retardo=0``, la trampa que
+este modulo dedica cuarenta lineas a prohibir, y encima sin el aviso, porque
+el retardo declarado sigue siendo 1. Medido sobre un proceso con momento y un
+Ridge validado hacia delante: Sharpe +4,22 con ``.shift(-1)`` frente a +1,57
+emparejando bien, y el pnl coincide fecha a fecha con el de ``retardo=0``.
+
+``.shift(-1)`` solo corrige una prediccion indexada en la fecha del
+rendimiento que predice, que es lo que sale de construirla sobre una ``y``
+contemporanea. Ahi desplazarla y quedarse con ``retardo=1`` es preferible a
+compensar con ``retardo=0``: lo primero deja una sola convencion en todo el
+montaje, lo segundo deja dos y la proxima serie que entre lo hara por la
+equivocada.
 
 Convencion de signos y unidades
 -------------------------------
@@ -49,7 +62,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from icm.cartera.metricas import ratio_sharpe, resumen_metricas
+from icm.cartera.metricas import resumen_metricas
 from icm.comun import DIAS_HABILES_ANIO, ErrorDatos, periodos_por_anio
 
 #: Modos de construccion de la senal que admite :func:`senal_desde_prediccion`.
@@ -157,6 +170,41 @@ def _como_entero(valor: Any, nombre: str) -> int:
             f"'{nombre}' debe ser un numero entero de periodos, se ha recibido {valor!r}."
         )
     return int(valor)
+
+
+def _sharpe_aritmetico(pnl: pd.Series, periodos_anio: int) -> float:
+    """Sharpe del ``pnl``, con numerador aritmetico e invariante a la escala.
+
+    Aqui no se reutiliza :func:`icm.cartera.metricas.ratio_sharpe` a proposito.
+    Su numerador es la CAGR geometrica, que es la cifra correcta para una
+    cartera que compone, pero el ``pnl`` de este modulo es aditivo por unidad de
+    capital y :func:`curva_beneficio` lo dice expresamente. Mezclar las dos
+    convenciones rompe justo la propiedad por la que un Sharpe sirve para
+    comparar: al multiplicar la posicion por k el denominador se multiplica por
+    k exactamente, pero el numerador geometrico no, porque el arrastre de
+    volatilidad crece con el cuadrado.
+
+    Medido con la misma senal y el mismo coste a x1, x2 y x3 de apalancamiento:
+    la via geometrica publicaba 7,39 / 12,02 / 20,08 y ``comparar_estrategias``
+    ordenaba ``['x3', 'x2', 'x1']``, es decir, repartia capital por
+    apalancamiento; con este estimador las tres dan 4,71. Y en el extremo el
+    arrastre volvia negativo el numerador, con lo que
+    :func:`coste_de_equilibrio` caia de 32,8 a 19,1 bps sobre la misma senal
+    (equilibrio aritmetico 33,5 bps en los cinco casos) y devolvia exactamente
+    0 bps en cuanto un unico periodo tenia ``pnl <= -1``, porque ahi la CAGR se
+    trunca a -1.
+
+    La CAGR sigue publicandose, pero solo donde significa lo que dice: en la
+    clave ``rentabilidad_anualizada``.
+    """
+    valores = pnl.to_numpy(dtype=float)
+    if valores.size < 2:
+        return float("nan")
+    desviacion = float(np.std(valores, ddof=1))
+    if not np.isfinite(desviacion) or desviacion <= 0.0:
+        # Volatilidad nula: no hay Sharpe que comparar.
+        return float("nan")
+    return float(np.mean(valores) / desviacion * np.sqrt(periodos_anio))
 
 
 def _escala_de_la_senal(serie: pd.Series, escala: float | None) -> float:
@@ -493,7 +541,9 @@ def ejecutar_estrategia(
         :func:`icm.ml.caracteristicas.objetivo_rendimiento_futuro`, marcados
         con ``attrs["convencion"] = "futuro"``). Pasar un retardo positivo
         junto con una serie adelantada es un error y se rechaza, porque
-        desplazaria dos veces sin dar ninguna senial.
+        desplazaria dos veces sin dar ninguna senial. Una serie adelantada con
+        ``attrs["horizonte"] > 1`` se rechaza siempre, con retardo o sin el:
+        sus tramos se solapan y no hay retardo que lo arregle.
     **opciones_senal:
         Se pasan tal cual a :func:`senal_desde_prediccion` (``modo``, ``umbral``,
         ``escala``, ``limite``).
@@ -518,17 +568,35 @@ def ejecutar_estrategia(
     Por eso ``retardo=0`` avisa con un ``UserWarning`` en lugar de estar
     prohibido: sirve para medir el tamanio del sesgo (comparelo con
     ``retardo=1`` y vea de donde salia el beneficio), nunca para presentar un
-    resultado. Y si lo que se tiene es una prediccion indexada en la fecha del
-    rendimiento que predice, como
-    ``ResultadoValidacion.predicciones`` o cualquier serie de
-    :mod:`icm.ml.evaluacion`, la forma correcta de arreglarlo es desplazarla
-    (``.shift(-1)``) y quedarse con ``retardo=1``, no bajar el retardo: lo
-    primero deja una sola convencion en todo el montaje, lo segundo deja dos y
-    la proxima serie que entre lo hara por la equivocada.
+    resultado. El aviso salta **tambien** cuando el 0 lo ha deducido la marca
+    de la serie de rendimientos, con otro texto; vease mas abajo por que.
+
+    Lo que **no** arregla nada es adelantar la prediccion con ``.shift(-1)``
+    cuando ya esta indexada en la fecha de decision, como
+    ``ResultadoValidacion.predicciones``: eso da la misma cuenta de resultados
+    que ``retardo=0``, y sin aviso, porque el retardo declarado es 1.
+    ``.shift(-1)`` corrige unicamente una prediccion indexada en la fecha del
+    rendimiento que predice, es decir construida sobre una ``y``
+    contemporanea.
 
     Un retardo mayor que 1 es legitimo y a veces obligatorio: modela que la
     orden no se ejecuta hasta la apertura siguiente, o que el dato del que vive
     el modelo se publica con un dia de demora.
+
+    Por que la marca de la serie no basta para callar el aviso
+    ---------------------------------------------------------
+    ``attrs["convencion"]`` dice de donde salio la serie, no como esta
+    alineada ahora: sobrevive intacta a ``.shift()``, ``.dropna()``,
+    ``.reindex()``, ``.rename()``, ``.astype()``, ``.copy()`` y a la
+    aritmetica. Quien realinea la serie con ``.shift(1)`` -- la operacion mas
+    natural del mundo, y la que deja el rendimiento contemporaneo de toda la
+    vida -- se queda con una serie que sigue diciendo "futuro". Medido: sobre
+    esa serie el retardo deducido es 0, el pnl sumo 5,5292, exactamente la
+    suma de los rendimientos en valor absoluto (la huella inconfundible de
+    leer el futuro), el Sharpe publicado fue 66,3 y no se emitio ni un aviso.
+    De ahi que el aviso se emita siempre que el retardo resuelto sea 0, y que
+    el rechazo de ``retardo=1`` explique como borrar la marca en lugar de
+    mandar al usuario a ``retardo=0``.
 
     Notas
     -----
@@ -561,17 +629,44 @@ def ejecutar_estrategia(
     adelantada = rendimientos.attrs.get("convencion") == "futuro" if hasattr(rendimientos, "attrs") else False
     horizonte_serie = int(rendimientos.attrs.get("horizonte", 1)) if adelantada else 1
 
+    # Con horizonte h > 1 los tramos de rendimiento se solapan h-1 periodos, asi
+    # que ejecutar uno por fecha cobra cada movimiento del precio hasta h veces y
+    # autocorrelaciona el pnl, con lo que ninguna de las cifras anualizadas del
+    # resumen significa nada. Medido con comprar y mantener sobre un activo cuyo
+    # rendimiento log total es -0,1667: suma de pnl -0,1667 con h=1, -0,8444 con
+    # h=5 (5,06 veces) y -3,5744 con h=21 (21,44 veces), con la autocorrelacion
+    # del pnl subiendo a +0,955 y la volatilidad anual de 0,163 a 0,758. Una
+    # posicion fija de 1 no puede rendir 21 veces lo que rinde el activo.
+    if adelantada and horizonte_serie != 1:
+        raise ErrorDatos(
+            f"Los rendimientos vienen adelantados {horizonte_serie} periodos y por tanto se "
+            f"solapan: el valor en t y el de t+1 comparten {horizonte_serie - 1} periodos de "
+            f"movimiento. Ejecutar uno por fecha cobra cada movimiento hasta {horizonte_serie} "
+            "veces y el pnl deja de ser reproducible con una unidad de capital. Quedese con "
+            f"una decision cada {horizonte_serie} periodos (prediccion.iloc[::"
+            f"{horizonte_serie}] y rendimientos.iloc[::{horizonte_serie}], reponiendo attrs "
+            "con .attrs.update(...) si se pierden) y anualice el resumen con "
+            f"periodos_anio={DIAS_HABILES_ANIO // horizonte_serie} si los datos son diarios; "
+            "o construya el objetivo con horizonte=1 si lo que quiere es operar todas las "
+            "fechas."
+        )
+
     if retardo is None:
         retardo = 0 if adelantada else 1
     else:
         retardo = _como_entero(retardo, "retardo")
         if adelantada and retardo > 0:
             raise ErrorDatos(
-                f"Los rendimientos vienen adelantados {horizonte_serie} periodo(s) (su valor "
-                f"en t es el rendimiento de t a t+{horizonte_serie}), asi que el "
-                f"desplazamiento ya esta hecho. Con retardo={retardo} se desplazaria dos "
-                "veces y el resultado seria plausible pero falso. Pase retardo=0 con esta "
-                "serie, o use los rendimientos contemporaneos con retardo=1."
+                f"Los rendimientos vienen marcados como adelantados {horizonte_serie} "
+                f"periodo(s) (su valor en t seria el rendimiento de t a t+{horizonte_serie}), "
+                f"asi que el desplazamiento ya estaria hecho y con retardo={retardo} se "
+                "desplazaria dos veces: el resultado seria plausible y falso. Si la serie "
+                "sigue adelantada, pase retardo=0, o use los rendimientos contemporaneos con "
+                "retardo=1. Si la ha realineado usted (por ejemplo con .shift(1)), lo que "
+                "pasa es que la marca ha sobrevivido al desplazamiento y ya no describe el "
+                "alineamiento: borrela con rendimientos.attrs.pop('convencion', None) y "
+                "vuelva a llamar, porque si no se ejecutaria con retardo=0 sobre una serie "
+                "contemporanea, que es exactamente leer el futuro."
             )
 
     if retardo < 0:
@@ -579,15 +674,34 @@ def ejecutar_estrategia(
             f"'retardo' no puede ser negativo (se ha recibido {retardo}): seria ejecutar la "
             "posicion contra un rendimiento anterior a la decision, es decir, leer el futuro."
         )
-    if retardo == 0 and not adelantada:
-        warnings.warn(
-            "retardo=0 ejecuta la posicion contra el rendimiento del mismo periodo cuya "
-            "informacion ha usado la prediccion: el resultado incluye informacion futura y no "
-            "es replicable. Si la prediccion viene indexada en la fecha del rendimiento que "
-            "predice, desplacela con .shift(-1) y deje retardo=1.",
-            UserWarning,
-            stacklevel=2,
-        )
+    # El aviso se emite siempre que el retardo resuelto sea 0, tambien por la via
+    # de la marca: attrs sobrevive a .shift(), asi que una serie ya realineada
+    # llega aqui diciendo "futuro" y callar el aviso por eso era suprimirlo justo
+    # en el caso de fuga (vease el docstring).
+    if retardo == 0:
+        if adelantada:
+            warnings.warn(
+                "Se ejecuta con retardo=0 porque la serie de rendimientos viene marcada como "
+                "adelantada (attrs['convencion'] = 'futuro'). Compruebe que sigue estandolo: "
+                "esa marca dice de donde salio la serie, no como esta alineada ahora, y "
+                "sobrevive intacta a .shift(), .dropna(), .reindex() y a la aritmetica. Si la "
+                "ha realineado a rendimientos contemporaneos, borre la marca con "
+                "rendimientos.attrs.pop('convencion', None) y deje el retardo por defecto; si "
+                "no, el resultado incluye informacion futura y no es replicable.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            warnings.warn(
+                "retardo=0 ejecuta la posicion contra el rendimiento del mismo periodo cuya "
+                "informacion ha usado la prediccion: el resultado incluye informacion futura "
+                "y no es replicable. Si la prediccion viene indexada en la fecha del "
+                "rendimiento que predice, desplacela con .shift(-1) y deje retardo=1; si ya "
+                "viene indexada en la fecha de decision, como ResultadoValidacion."
+                "predicciones, no la desplace y deje el retardo por defecto.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     senal = senal_desde_prediccion(prediccion, **opciones_senal)
     serie_rendimientos = _como_serie_con_huecos(rendimientos, "rendimientos")
@@ -661,10 +775,12 @@ def resumen_estrategia(
 ) -> pd.Series:
     """Las cifras que deciden si una estrategia vale, en una sola columna.
 
-    Se apoya en :func:`icm.cartera.resumen_metricas`, que ya sabe anualizar,
-    calcular el Sharpe, la maxima caida y el VaR historico, y se le anaden las
-    tres cifras propias de una estrategia: la rotacion, el coste anualizado y el
-    Sharpe que se habria presentado sin costes.
+    Se apoya en :func:`icm.cartera.resumen_metricas` para la rentabilidad, la
+    volatilidad, la maxima caida y el VaR historico, y se le anaden las tres
+    cifras propias de una estrategia: la rotacion, el coste anualizado y el
+    Sharpe que se habria presentado sin costes. Los dos Sharpe se calculan aqui
+    (:func:`_sharpe_aritmetico`) y no se toman de ``resumen_metricas``, por el
+    motivo que explica esa funcion.
 
     Ese ultimo par es el que hay que leer junto. ``sharpe_bruto`` es lo que mide
     la capacidad predictiva; ``ratio_sharpe`` es lo que se cobra; y
@@ -675,30 +791,38 @@ def resumen_estrategia(
     :func:`senal_desde_prediccion`).
 
     ``coste_total_anualizado`` es el coste medio por periodo llevado a un anio,
-    es decir, cuantos puntos de rentabilidad anual se pagan en friccion, y se
-    compara directamente con ``rentabilidad_anualizada``. ``rotacion_media`` es
-    el nominal medio movido por periodo: 1,0 significa renovar la posicion
-    entera cada periodo, y con datos diarios eso son unas 252 veces al anio.
+    es decir, cuantos puntos de rentabilidad anual se pagan en friccion.
+    Cuidado al restarlo de ``rentabilidad_anualizada``: aquel es aritmetico y
+    esta es una CAGR, asi que la caida real de la CAGR al pagar ese coste no es
+    la misma cifra (medido: 0,0493 declarado frente a 0,0780 de caida efectiva,
+    un 37 % menos). Para leerlos juntos sin sorpresas, compare
+    ``coste_total_anualizado`` con ``rotacion_media * coste_bps / 10000 * n``,
+    que es la misma cuenta, o mire directamente ``merma_sharpe``.
+    ``rotacion_media`` es el nominal medio movido por periodo: 1,0 significa
+    renovar la posicion entera cada periodo, y con datos diarios eso son unas
+    252 veces al anio.
 
     El ``pnl`` se trata como rendimiento simple del capital (vease la nota de
-    :func:`ejecutar_estrategia`). Los dos Sharpe se calculan con la misma
-    funcion y las mismas convenciones para que su diferencia signifique solo lo
-    que dice significar.
+    :func:`ejecutar_estrategia`). Los dos Sharpe salen de
+    :func:`_sharpe_aritmetico`, con numerador aritmetico y no CAGR, para que
+    sean invariantes a la escala de la posicion y para que su diferencia
+    signifique solo lo que dice significar.
     """
     resultado = _validar_resultado(resultado)
     n = periodos_por_anio(periodos_anio)
 
     neto = resumen_metricas(resultado.pnl, periodos_anio=n, tipo="simple")
-    bruto = resumen_metricas(resultado.pnl_bruto, periodos_anio=n, tipo="simple")
+    sharpe_neto = _sharpe_aritmetico(resultado.pnl, n)
+    sharpe_bruto = _sharpe_aritmetico(resultado.pnl_bruto, n)
 
     resumen = pd.Series(
         {
             "observaciones": float(len(resultado.pnl)),
             "rentabilidad_anualizada": float(neto["rentabilidad_anualizada"]),
             "volatilidad_anualizada": float(neto["volatilidad_anualizada"]),
-            "ratio_sharpe": float(neto["ratio_sharpe"]),
-            "sharpe_bruto": float(bruto["ratio_sharpe"]),
-            "merma_sharpe": float(bruto["ratio_sharpe"] - neto["ratio_sharpe"]),
+            "ratio_sharpe": sharpe_neto,
+            "sharpe_bruto": sharpe_bruto,
+            "merma_sharpe": float(sharpe_bruto - sharpe_neto),
             "maxima_caida": float(neto["maxima_caida"]),
             "var_historico_95": float(neto["var_historico_95"]),
             "rotacion_media": float(resultado.rotacion.mean()),
@@ -773,15 +897,11 @@ def _sharpe_con_coste(
 
     No hace falta volver a ejecutar la estrategia: ni la senal ni las posiciones
     ni la rotacion dependen del coste, asi que el pnl con cualquier coste es el
-    bruto menos la rotacion escalada. Se usa el mismo ``ratio_sharpe`` que
-    :func:`resumen_estrategia` para que las dos cifras sean la misma cifra.
+    bruto menos la rotacion escalada. Se usa el mismo :func:`_sharpe_aritmetico`
+    que :func:`resumen_estrategia` para que las dos cifras sean la misma cifra.
     """
     pnl = resultado.pnl_bruto - resultado.rotacion * (coste_bps / BPS)
-    try:
-        return ratio_sharpe(pnl, periodos_anio=periodos_anio, tipo="simple")
-    except ErrorDatos:
-        # Volatilidad nula: no hay Sharpe que comparar.
-        return float("nan")
+    return _sharpe_aritmetico(pnl, periodos_anio)
 
 
 def coste_de_equilibrio(
@@ -833,7 +953,11 @@ def coste_de_equilibrio(
 
     No hay parametro ``periodos_anio`` porque no cambiaria el resultado: el
     signo del Sharpe no depende de la anualizacion, que solo multiplica
-    numerador y denominador por constantes positivas.
+    numerador y denominador por constantes positivas. Por el mismo motivo la
+    cifra es invariante a la escala de la posicion, que es lo que se espera de
+    ella: el Sharpe que se usa aqui tiene numerador aritmetico (vease
+    :func:`_sharpe_aritmetico`), asi que apalancar la misma senal no mueve el
+    coste de equilibrio.
     """
     maximo_bps = float(maximo_bps)
     if not np.isfinite(maximo_bps) or maximo_bps <= 0.0:

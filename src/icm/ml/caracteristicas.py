@@ -64,6 +64,14 @@ _CLAVE_OBJETIVO = "__objetivo__"
 _TOLERANCIA_RELATIVA = 1e-9
 _TOLERANCIA_ABSOLUTA = 1e-12
 
+# Cuantos cortes usa la auditoria cuando no se le indican fechas. Son muchos
+# mas que los tres de antes porque una fuga condicionada a los datos (un
+# relleno hacia atras, una interpolacion) solo se delata si algun corte cae
+# junto al hueco que la dispara. Y estan acotados porque cada corte cuesta dos
+# reconstrucciones completas de la matriz: sin tope, auditar una serie larga
+# dejaria de caber en una bateria de pruebas y se dejaria de ejecutar.
+_MAX_CORTES_POR_OMISION = 48
+
 
 # --- utilidades internas -------------------------------------------------------
 
@@ -589,17 +597,48 @@ def construir_matriz(
 # --- auditoria de fuga de informacion ------------------------------------------
 
 
-def _fechas_de_corte(indice: pd.Index, fechas) -> list:
-    """Fechas en las que se parte la serie para auditar el constructor."""
+def _reparto(posiciones: Sequence[int], maximo: int) -> list[int]:
+    """Adelgaza una lista de posiciones, dejandolas repartidas por todo el tramo."""
+    lista = list(posiciones)
+    if len(lista) <= maximo:
+        return lista
+    elegidas = np.linspace(0, len(lista) - 1, maximo)
+    return sorted({lista[int(round(float(i)))] for i in elegidas})
+
+
+def _posiciones_de_hueco(marco: pd.DataFrame | None) -> list[int]:
+    """Posiciones con algun ausente, y la inmediatamente anterior a cada una.
+
+    Un relleno hacia atras o una interpolacion solo mienten en las fechas con
+    hueco: para cualquier otra fila los tres calculos (serie completa, truncada
+    y perturbada) dan el mismo numero, porque el valor que se arrastra es
+    anterior al corte. Cortar justo en el hueco y el dia antes pone el dato que
+    se arrastra al otro lado de la frontera, que es lo unico que lo delata.
+    """
+    if marco is None:
+        return []
+    ausentes = np.flatnonzero(np.asarray(marco.isna().to_numpy()).any(axis=1))
+    return sorted({int(p) for p in ausentes} | {int(p) - 1 for p in ausentes})
+
+
+def _fechas_de_corte(indice: pd.Index, fechas, datos: pd.DataFrame | None = None) -> list:
+    """Fechas en las que se parte la serie para auditar el constructor.
+
+    Por omision se barre la segunda mitad de la muestra (que es donde hay
+    calentamiento suficiente para que la matriz truncada tenga filas) y se
+    aniaden los cortes pegados a los huecos de ``datos``, esten donde esten:
+    esos son los unicos que ven una fuga condicionada a los ausentes.
+    """
     if fechas is None:
         n = len(indice)
         if n < 4:
             raise ErrorDatos("La serie es demasiado corta para auditar la fuga de informacion.")
-        posiciones = sorted({int(n * f) for f in (0.5, 0.7, 0.85)})
-        candidatas = [indice[p] for p in posiciones if 0 < p < n - 1]
-        if not candidatas:
+        candidatas = set(_reparto(range(n // 2, n - 1), _MAX_CORTES_POR_OMISION))
+        candidatas.update(_reparto(_posiciones_de_hueco(datos), _MAX_CORTES_POR_OMISION))
+        posiciones = sorted(p for p in candidatas if 0 < p < n - 1)
+        if not posiciones:
             raise ErrorDatos("La serie es demasiado corta para auditar la fuga de informacion.")
-        return candidatas
+        return [indice[p] for p in posiciones]
 
     convertidas = []
     for fecha in fechas:
@@ -640,19 +679,83 @@ def _perturbar_futuro(marco: pd.DataFrame, corte, semilla: int = 0) -> pd.DataFr
     return copia
 
 
+def _datos_de_kwargs(kwargs: dict) -> dict[str, pd.Series | pd.DataFrame]:
+    """Separa los argumentos del constructor que son datos de los que son opciones.
+
+    Solo los datos hay que truncar y perturbar. Un entero, una cadena o una
+    secuencia de retardos no puede esconder informacion del futuro.
+    """
+    return {n: v for n, v in kwargs.items() if isinstance(v, (pd.Series, pd.DataFrame))}
+
+
+def _exigir_auditable(datos, nombre: str, indice: pd.Index) -> None:
+    """Rechaza un argumento de datos que la auditoria no sabe alterar.
+
+    Un visto bueno que no significa nada es peor que un error: si un argumento
+    llega identico a las tres llamadas, las columnas que salgan de el coinciden
+    por construccion en las tres matrices y la comparacion no puede ver nada,
+    ni siquiera un ``shift(-1)`` descarado.
+    """
+    try:
+        bool(np.asarray(datos.index <= indice[-1]).any())
+    except TypeError as exc:
+        raise ErrorDatos(
+            f"La auditoria no puede garantizar nada sobre el argumento '{nombre}': su "
+            f"indice ({datos.index.dtype}) no se puede comparar con el de 'precios' "
+            f"({indice.dtype}), asi que no hay forma de truncarlo en cada corte. "
+            "Reindexelo al calendario de 'precios' antes de auditar."
+        ) from exc
+    try:
+        _como_marco(datos, nombre, base=nombre)
+    except ErrorDatos as exc:
+        raise ErrorDatos(
+            f"La auditoria no puede garantizar nada sobre el argumento '{nombre}' "
+            f"porque no sabe reescribir sus valores: {exc} Pase solo datos numericos "
+            "o incorporelos ya calculados a 'precios'."
+        ) from exc
+
+
+def _perturbar_datos(datos, nombre: str, corte, semilla: int):
+    """Perturba un argumento de datos **conservando el tipo que se recibio**.
+
+    Si la llamada de referencia recibe una Series y la perturbada un DataFrame,
+    un constructor que bautice las columnas segun el tipo (vease
+    :func:`_nombre_base`) devuelve nombres distintos en las dos matrices, y la
+    comparacion se queda sin nada que mirar precisamente en las variables que
+    salen del argumento sospechoso.
+    """
+    perturbado = _perturbar_futuro(
+        _como_marco(datos, nombre, base=nombre), corte, semilla=semilla
+    )
+    if isinstance(datos, pd.Series):
+        return perturbado.iloc[:, 0].rename(datos.name)
+    return perturbado
+
+
 def _comparar(
     referencia: MatrizDatos,
     alterada: MatrizDatos,
     corte,
     experimento: str,
 ) -> None:
-    """Compara dos matrices hasta el corte y denuncia la primera discrepancia."""
-    columnas = [c for c in referencia.X.columns if c in alterada.X.columns]
-    if not columnas:
+    """Compara dos matrices hasta el corte y denuncia la primera discrepancia.
+
+    Si los dos conjuntos de columnas no coinciden se aborta en vez de intersecar:
+    una columna que se queda fuera de la comparacion no da ningun aviso, asi que
+    el desajuste seria indistinguible de la ausencia de fuga, que es justo lo que
+    la auditoria tiene que poder afirmar.
+    """
+    columnas = list(referencia.X.columns)
+    faltan = [c for c in columnas if c not in set(alterada.X.columns)]
+    sobran = [c for c in alterada.X.columns if c not in set(columnas)]
+    if faltan or sobran:
         raise ErrorDatos(
-            f"La auditoria no puede comparar nada en el corte {_texto(corte)}: el "
-            "constructor devuelve columnas distintas segun los datos que reciba, lo "
-            "que ya es motivo de sospecha."
+            f"La auditoria no puede comparar la matriz del corte {_texto(corte)}: el "
+            f"constructor devuelve columnas distintas segun los datos que reciba "
+            f"(faltan {faltan}, aparecen {sobran}). Esas columnas se quedarian sin "
+            "auditar y eso no se distingue de que no haya fuga: haga que el "
+            "constructor emita siempre el mismo conjunto de nombres, sin que dependa "
+            "de los datos que le lleguen."
         )
     fechas = referencia.X.index.intersection(alterada.X.index)
     fechas = fechas[fechas <= corte]
@@ -713,15 +816,39 @@ def comprobar_ausencia_de_fuga(
        unica que la delataria, desaparece al eliminar los NaN) y en cambio
        reacciona de inmediato a que el futuro cambie.
 
+    Los dos experimentos se aplican a ``precios`` y a **todos** los argumentos
+    de ``kwargs`` que sean Series o DataFrame, no solo al que se llame
+    ``exogenas``: un argumento que llegue igual a las tres llamadas produce por
+    construccion las mismas columnas en las tres matrices, y entonces la
+    comparacion no puede ver nada. Si alguno de esos argumentos no se puede
+    truncar ni reescribir (indice incomparable con el de ``precios``, valores no
+    numericos) se lanza :class:`~icm.comun.ErrorDatos` en lugar de dar un visto
+    bueno que no significaria nada.
+
     Solo se audita ``X``. La variable objetivo mira al futuro por definicion:
     si no lo hiciera, no habria nada que predecir.
+
+    Alcance
+    -------
+    La auditoria cubre lo que el constructor hace con los datos que recibe, y
+    solo eso. Cualquier relleno, interpolacion o reindexacion aplicada **antes**
+    de la llamada queda fuera: si se audita
+    ``comprobar_ausencia_de_fuga(constructor, precios.interpolate(), ...)``, la
+    fuga viaja ya cocinada dentro de ``precios`` y no hay eleccion de cortes que
+    la encuentre, porque lo que se contrasta es el constructor y no su entrada.
+    Interpole despues de auditar, o mejor, dentro del constructor, donde si se
+    ve. Tampoco se altera el **indice** del futuro, asi que una variable que lea
+    el calendario posterior (cuantos dias faltan para el siguiente dato, si
+    maniana hay cotizacion) pasa sin dejar rastro.
 
     Parametros
     ----------
     fechas:
-        Cortes a probar. Por omision, tres repartidos por la segunda mitad de
-        la muestra, que es donde hay calentamiento suficiente para que la
-        matriz truncada tenga filas.
+        Cortes a probar. Por omision se barre la segunda mitad de la muestra
+        (hasta :data:`_MAX_CORTES_POR_OMISION` cortes repartidos, que es donde
+        hay calentamiento suficiente para que la matriz truncada tenga filas) y
+        se aniade un corte en cada fecha ausente de ``precios`` y en la
+        anterior, porque una fuga por relleno hacia atras solo se delata ahi.
 
     Lanza
     -----
@@ -731,6 +858,10 @@ def comprobar_ausencia_de_fuga(
     """
     marco = _como_marco(precios, "precios", base="precio")
     _validar_indice_temporal(marco.index, "precios")
+    datos_extra = _datos_de_kwargs(kwargs)
+    for nombre, valor in datos_extra.items():
+        _exigir_auditable(valor, nombre, marco.index)
+
     referencia = constructor(marco, objetivo, **kwargs)
     if not isinstance(referencia, MatrizDatos):
         raise ErrorDatos(
@@ -738,13 +869,12 @@ def comprobar_ausencia_de_fuga(
             f"nombres_grupo; ha devuelto {type(referencia).__name__}."
         )
 
-    exogenas = kwargs.get("exogenas")
-    for corte in _fechas_de_corte(marco.index, fechas):
+    for corte in _fechas_de_corte(marco.index, fechas, marco):
         mascara = np.asarray(marco.index <= corte)
 
         truncados = {**kwargs}
-        if isinstance(exogenas, (pd.Series, pd.DataFrame)):
-            truncados["exogenas"] = exogenas.loc[np.asarray(exogenas.index <= corte)]
+        for nombre, valor in datos_extra.items():
+            truncados[nombre] = valor.loc[np.asarray(valor.index <= corte)]
         try:
             alterada = constructor(marco.loc[mascara], objetivo, **truncados)
         except ErrorDatos as exc:
@@ -755,9 +885,7 @@ def comprobar_ausencia_de_fuga(
         _comparar(referencia, alterada, corte, experimento="al truncar la serie en")
 
         perturbados = {**kwargs}
-        if isinstance(exogenas, (pd.Series, pd.DataFrame)):
-            perturbados["exogenas"] = _perturbar_futuro(
-                _como_marco(exogenas, "exogenas", base="exogena"), corte, semilla=1
-            )
+        for nombre, valor in datos_extra.items():
+            perturbados[nombre] = _perturbar_datos(valor, nombre, corte, semilla=1)
         alterada = constructor(_perturbar_futuro(marco, corte), objetivo, **perturbados)
         _comparar(referencia, alterada, corte, experimento="al reescribir lo posterior a")

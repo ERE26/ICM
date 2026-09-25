@@ -214,13 +214,19 @@ def test_la_cadena_encadena_los_dos_rolls_con_tres_contratos(cadena_contango):
     assert ajustada["ajuste"].iloc[0] == pytest.approx(112.0 / 100.0)
 
 
-def test_la_serie_ajustada_reproduce_el_rendimiento_verdadero_en_todas_las_fechas():
+@pytest.mark.parametrize("metodo", ["ratio", "diferencia"])
+def test_la_serie_ajustada_reproduce_el_rendimiento_verdadero_en_todas_las_fechas(metodo):
     """Propiedad general: cada dia se gana lo que gana el contrato que se tiene.
 
     Con precios aleatorios (semilla fija) y dos rolls, el rendimiento de la
     serie continua debe coincidir, fecha a fecha, con el del contrato activo
     ese dia medido contra su propio precio de la vispera. Es la definicion de
     lo que gana la posicion, y no hay ningun dia en que no se cumpla.
+
+    Se lee de ``descomponer_rendimiento`` y no de ``pct_change`` porque el
+    ajuste aditivo desplaza el nivel de la serie a proposito: el rendimiento
+    porcentual de la posicion no es el del nivel desplazado, y con el ajuste
+    multiplicativo las dos vias dan lo mismo.
     """
     generador = np.random.default_rng(20240301)
     fechas = pd.date_range("2023-06-01", periods=180, freq="D")
@@ -230,13 +236,13 @@ def test_la_serie_ajustada_reproduce_el_rendimiento_verdadero_en_todas_las_fecha
     contratos = pd.DataFrame(valores, index=fechas, columns=["C1", "C2", "C3"])
     vencimientos = {"C1": "2023-08-15", "C2": "2023-09-15", "C3": "2023-11-30"}
 
-    ajustada = serie_continua(contratos, vencimientos, metodo="ratio", dias_antes=4)
+    ajustada = serie_continua(contratos, vencimientos, metodo=metodo, dias_antes=4)
     columna = np.array([contratos.columns.get_loc(c) for c in ajustada["contrato"]])
     crudos = contratos.to_numpy()
     filas = np.arange(len(fechas))
     esperado = crudos[filas[1:], columna[1:]] / crudos[filas[:-1], columna[1:]] - 1.0
 
-    obtenido = ajustada["precio"].pct_change().to_numpy()[1:]
+    obtenido = descomponer_rendimiento(ajustada, metodo)["rendimiento_total"].to_numpy()
     assert np.allclose(obtenido, esperado)
     # Y el escalon sin ajustar era grande de verdad: la prueba no es vacia.
     sin_ajustar = serie_continua(contratos, vencimientos, metodo="ninguno", dias_antes=4)
@@ -310,6 +316,22 @@ def test_las_fechas_repetidas_dan_error(contratos):
 def test_dos_contratos_con_el_mismo_vencimiento_dan_error(contratos):
     with pytest.raises(ErrorDatos, match="misma fecha"):
         serie_continua(contratos, {"F1": "2024-02-15", "F2": "2024-02-15"})
+
+
+def test_un_calendario_obsoleto_no_construye_la_serie_con_un_contrato_vencido(contratos):
+    """Si faltan los contratos nuevos, el ultimo de la cadena no puede aguantar.
+
+    dias_a_vencimiento ya dice que ahi no hay calendario; serie_continua devolvia
+    la serie entera construida sobre un contrato muerto, sin una queja.
+    """
+    caducos = {"F1": "2023-01-01", "F2": "2023-02-01"}
+    assert dias_a_vencimiento(contratos.index, caducos).isna().all()
+    with pytest.raises(ErrorDatos, match="ya habia vencido"):
+        serie_continua(contratos, caducos)
+
+    # Un calendario que llega justo al final del indice si vale.
+    al_dia = {"F1": "2024-02-15", "F2": "2024-02-20"}
+    assert len(serie_continua(contratos, al_dia, dias_antes=5)) == len(contratos)
 
 
 def test_una_entrada_que_no_es_un_marco_de_contratos_da_error():
@@ -398,6 +420,21 @@ def test_el_signo_del_carry_coincide_con_el_estado_de_la_curva(cadena_contango):
     invertido = estado_curva(lejano, cercano)
     assert (invertido == "backwardation").all()
     assert (rendimiento_roll(lejano, cercano, 29) > 0).all()
+
+
+def test_el_carry_sigue_de_acuerdo_con_el_estado_de_la_curva_con_precios_negativos():
+    """En electricidad los dos contratos pueden cotizar en negativo.
+
+    Con el lejano con signo en el denominador las dos funciones decian lo
+    contrario sobre los mismos datos.
+    """
+    cercano, lejano = _par(-2.0, -8.0)
+    assert estado_curva(cercano, lejano).iloc[0] == "backwardation"
+    # A mano: (-2+8)/|-8| = 0,75 en 30 dias, o sea 0,75 * 365,25/30 = 9,13125.
+    assert rendimiento_roll(cercano, lejano, 30).iloc[0] == pytest.approx(9.13125)
+
+    assert estado_curva(lejano, cercano).iloc[0] == "contango"
+    assert rendimiento_roll(lejano, cercano, 30).iloc[0] < 0.0
 
 
 # --- pendiente de la curva -----------------------------------------------------
@@ -542,6 +579,66 @@ def test_el_rendimiento_total_es_la_suma_del_precio_y_del_roll(cadena_contango, 
         partes["rendimiento_total"],
         partes["rendimiento_precio"] + partes["rendimiento_roll"],
     )
+
+
+@pytest.mark.parametrize("metodo", ["ratio", "diferencia"])
+def test_los_rendimientos_pasados_no_cambian_al_llegar_dato_futuro(cadena_contango, metodo):
+    """Un backtest reprocesado hoy tiene que ver lo que se veia en su momento.
+
+    El ajuste de cada tramo acumula todos los escalones posteriores, asi que
+    recortar el futuro cambia el nivel del pasado. Eso es inocuo por
+    construccion; lo que no puede cambiar es el rendimiento, o la serie de
+    rendimientos lleva dentro informacion del futuro.
+    """
+    completa = descomponer_rendimiento(
+        serie_continua(cadena_contango, VENCIMIENTOS_CADENA, metodo, 5), metodo
+    )
+    # El corte cae antes del segundo roll, asi que el pasado comun se calcula
+    # con un escalon futuro de menos.
+    truncada = descomponer_rendimiento(
+        serie_continua(cadena_contango.loc[:"2024-02-10"], VENCIMIENTOS_CADENA, metodo, 5), metodo
+    )
+    assert len(truncada) < len(completa)
+    for columna in ("rendimiento_total", "rendimiento_precio", "rendimiento_roll"):
+        assert np.allclose(completa.loc[truncada.index, columna], truncada[columna], atol=1e-12)
+
+
+@pytest.mark.parametrize("metodo", ["ratio", "diferencia"])
+def test_el_rendimiento_acumulado_no_inventa_rentabilidad(cadena_contango, metodo):
+    """Los tres contratos pierden un 0,1 % diario: no hay otro acumulado posible."""
+    partes = descomponer_rendimiento(
+        serie_continua(cadena_contango, VENCIMIENTOS_CADENA, metodo, 5), metodo
+    )
+    acumulado = float((1.0 + partes["rendimiento_total"]).prod())
+    assert acumulado == pytest.approx(DECAIMIENTO**90)
+
+
+def test_una_serie_que_cruza_el_cero_no_tiene_rendimiento_porcentual():
+    """Un spread que sube todos los dias no puede rendir en negativo.
+
+    Es el caso para el que existe metodo='diferencia', y dividir por un nivel
+    negativo invierte el signo sin avisar. Mejor negarse que devolverlo.
+    """
+    fechas = pd.date_range("2024-02-01", periods=20, freq="D")
+    niveles = np.linspace(-6.0, 2.0, len(fechas))
+    spread = pd.DataFrame({"F1": niveles, "F2": niveles + 4.0}, index=fechas)
+    serie = serie_continua(spread, VENCIMIENTOS, metodo="diferencia")
+    assert (serie["precio"].diff().dropna() > 0.0).all()
+    with pytest.raises(ErrorDatos, match="cruza el cero"):
+        descomponer_rendimiento(serie)
+
+
+def test_el_ratio_rechaza_precios_negativos_tambien_lejos_del_empalme():
+    """Validar el ancla no basta: el factor reescala la serie entera."""
+    fechas = pd.date_range("2024-02-01", periods=20, freq="D")
+    niveles = 2.0 * np.arange(len(fechas)) - 5.0
+    curva = pd.DataFrame({"F1": niveles, "F2": niveles + 1.0}, index=fechas)
+    # El dia del empalme los dos contratos ya son positivos, asi que el control
+    # de _ajustes_hacia_atras no salta.
+    ancla = FECHA_ROLL - pd.Timedelta(days=1)
+    assert curva.loc[ancla].min() > 0.0
+    with pytest.raises(ErrorDatos, match="diferencia"):
+        serie_continua(curva, VENCIMIENTOS, metodo="ratio")
 
 
 def test_una_materia_prima_puede_subir_de_precio_y_hacer_perder_dinero(cadena_contango):

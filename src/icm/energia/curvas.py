@@ -232,10 +232,13 @@ def serie_continua(
         solo se exige precio en las fechas en que el contrato esta activo.
     vencimientos:
         Fecha de vencimiento de cada contrato. Deben estar **todos** los que
-        aparecen como columna.
+        aparecen como columna, y el ultimo tiene que llegar al final del indice:
+        un calendario sin los contratos nuevos dejaria activo uno ya vencido.
     metodo:
         ``"ratio"`` aplica un ajuste multiplicativo (el estandar del sector:
-        conserva los rendimientos porcentuales, que es lo que se modeliza);
+        conserva los rendimientos porcentuales, que es lo que se modeliza, y
+        exige precios positivos en toda la serie activa, no solo en los
+        empalmes);
         ``"diferencia"`` aplica uno aditivo, obligatorio cuando la serie puede
         cruzar el cero, como un spark spread o un precio electrico negativo;
         ``"ninguno"`` encadena sin corregir, util para ver el tamanio real del
@@ -299,6 +302,22 @@ def serie_continua(
     # ser el orden de las columnas del DataFrame.
     columna_de_tramo = np.array([marco.columns.get_loc(c) for c in orden])
     activo = np.asarray(orden, dtype=object)[posicion]
+
+    # El ultimo contrato de la cadena no tiene sucesor, asi que la cadena lo
+    # mantendria activo indefinidamente aunque el calendario se haya quedado
+    # corto. Cotizar un contrato ya vencido no es un dato: es el ultimo precio
+    # arrastrado por el proveedor, y la serie entera saldria de ahi sin aviso.
+    vencimiento_activo = pd.DatetimeIndex(venc.to_numpy()).as_unit("ns")[posicion]
+    caducado = marco.index > vencimiento_activo
+    if caducado.any():
+        fecha = marco.index[caducado][0]
+        raise ErrorDatos(
+            f"El {fecha.date()} el contrato activo '{activo[caducado][0]}' ya habia "
+            f"vencido (el {vencimiento_activo[caducado][0].date()}) y la cadena no "
+            "tiene sucesor. Anada a 'vencimientos' los contratos posteriores o "
+            "recorte el indice a las fechas que cubre el calendario."
+        )
+
     crudo = marco.to_numpy()[np.arange(len(marco)), columna_de_tramo[posicion]]
     sin_precio = ~np.isfinite(crudo)
     if sin_precio.any():
@@ -308,6 +327,20 @@ def serie_continua(
             f"{fecha.date()}. Rellene el hueco o recorte el indice "
             "(por ejemplo con contratos.dropna(how='all'))."
         )
+
+    # _ajustes_hacia_atras solo puede comprobar el signo en las fechas de empalme,
+    # pero el ajuste multiplicativo escala la serie entera: un precio negativo en
+    # medio de un tramo llega igualmente al divisor de cualquier rendimiento.
+    if metodo == "ratio":
+        no_positivo = crudo <= 0.0
+        if no_positivo.any():
+            fecha = marco.index[no_positivo][0]
+            raise ErrorDatos(
+                f"El contrato activo '{activo[no_positivo][0]}' cotiza a "
+                f"{crudo[no_positivo][0]} el {fecha.date()} y el ajuste por ratio "
+                "reescala precios. Use metodo='diferencia' para series que pueden "
+                "ser negativas o cruzar el cero."
+            )
 
     ajuste_por_tramo = _ajustes_hacia_atras(marco, orden, posicion, metodo)
     ajuste = np.array([ajuste_por_tramo[p] for p in posicion])
@@ -369,7 +402,7 @@ def _ajustes_hacia_atras(
 
 
 def rendimiento_roll(cercano, lejano, dias_entre_vencimientos: float = 30.0) -> pd.Series:
-    """Carry anualizado de mantener la posicion: ``(cercano - lejano) / lejano``.
+    """Carry anualizado de mantener la posicion: ``(cercano - lejano) / |lejano|``.
 
     Mide lo que gana o pierde la posicion solo por el paso del tiempo, sin que
     el precio se mueva: al acercarse el vencimiento, el contrato que se tiene
@@ -392,9 +425,14 @@ def rendimiento_roll(cercano, lejano, dias_entre_vencimientos: float = 30.0) -> 
 
     Notas
     -----
-    La razon relativa pierde sentido si el contrato lejano cotiza en negativo
-    (electricidad en horas de exceso solar): ahi conviene mirar el diferencial
-    absoluto ``cercano - lejano``.
+    El denominador es el **valor absoluto** del contrato lejano, igual que en
+    :func:`estado_curva`. Con electricidad en horas de exceso solar los dos
+    contratos pueden cotizar en negativo, y dividir por un lejano con signo
+    invertiria el resultado: una curva en backwardation daria carry negativo,
+    justo lo contrario de lo que este signo significa. Con el valor absoluto el
+    signo del carry es siempre el signo del diferencial ``cercano - lejano``; la
+    magnitud, en cambio, se vuelve poco informativa cerca del cero, asi que ahi
+    conviene mirar directamente el diferencial absoluto.
     """
     precio_cercano, precio_lejano = _par_de_series(cercano, lejano)
     dias = float(dias_entre_vencimientos)
@@ -408,7 +446,7 @@ def rendimiento_roll(cercano, lejano, dias_entre_vencimientos: float = 30.0) -> 
             "Hay precios nulos en el contrato lejano y el carry relativo se divide "
             "por ellos: elimine esas fechas o use el diferencial absoluto."
         )
-    serie = (precio_cercano - precio_lejano) / precio_lejano * (DIAS_ANIO_NATURAL / dias)
+    serie = (precio_cercano - precio_lejano) / precio_lejano.abs() * (DIAS_ANIO_NATURAL / dias)
     serie.name = "rendimiento_roll"
     return serie
 
@@ -613,6 +651,20 @@ def descomponer_rendimiento(
     * ``rendimiento_total``: lo que realmente gana la posicion, y que cumple por
       construccion ``total = precio + roll``.
 
+    Las tres partes se dividen por el precio **sin ajustar** que tenia la vispera
+    el contrato que hoy esta activo, no por el nivel ajustado de la serie. Con el
+    ajuste multiplicativo da lo mismo, porque el factor se cancela en el cociente;
+    con el aditivo no, y dividir por el nivel ajustado meteria en el denominador
+    la suma de todos los rolls posteriores: el rendimiento de una fecha pasada
+    cambiaria cada vez que llegase un dato nuevo, que es fuga de informacion del
+    futuro, y la magnitud quedaria sesgada.
+
+    Un rendimiento relativo exige que ese precio de partida sea positivo. En una
+    serie que cruza el cero (un spark spread, un precio electrico negativo) no
+    existe el rendimiento porcentual, asi que la funcion devuelve ``ErrorDatos``
+    en lugar de una cifra con el signo invertido: ahi hay que trabajar con la
+    variacion absoluta de la columna ``"precio"``.
+
     Parametros
     ----------
     serie_continua:
@@ -645,27 +697,45 @@ def descomponer_rendimiento(
 
     precio = marco["precio"].astype(float)
     ajuste = marco["ajuste"].astype(float)
-    anterior = precio.shift(1)
-    if (anterior.iloc[1:] == 0.0).any():
-        raise ErrorDatos(
-            "Hay precios nulos en la serie continua: no se pueden calcular rendimientos "
-            "relativos sobre ellos."
-        )
 
-    # Precio de hoy valorado con el ajuste de ayer: reproduce lo que veria quien
-    # encadena cotizaciones sin corregir el salto del roll.
+    anterior = precio.shift(1)
+
+    # 'ingenuo' es el precio de hoy valorado con el ajuste de ayer: reproduce lo
+    # que veria quien encadena cotizaciones sin corregir el salto del roll.
+    # 'base' es el divisor comun de las tres partes, y tiene que ser el precio
+    # CRUDO que tenia ayer el contrato que hoy esta activo. Con el ajuste
+    # multiplicativo el factor es comun al numerador y al denominador y se
+    # cancela, asi que el nivel ajustado de ayer ya sirve de divisor. Con el
+    # aditivo NO se cancela: el sumando sobrevive en el denominador, y como
+    # _ajustes_hacia_atras acumula todos los escalones posteriores, el
+    # rendimiento de una fecha pasada cambiaria al llegar dato futuro. El crudo
+    # se reconstruye restando el ajuste de HOY al nivel de ayer, porque el ajuste
+    # de hoy es el del contrato que hoy se tiene.
     if metodo == "ratio":
         if (ajuste <= 0.0).any():
             raise ErrorDatos(
                 "El ajuste multiplicativo debe ser positivo: la serie no procede de "
                 "serie_continua con metodo='ratio'."
             )
+        base = anterior
         ingenuo = precio * ajuste.shift(1) / ajuste
     else:
+        base = anterior - ajuste
         ingenuo = precio - ajuste + ajuste.shift(1)
 
-    total = (precio - anterior) / anterior
-    parte_precio = (ingenuo - anterior) / anterior
+    divisor = base.iloc[1:]
+    if not bool((divisor > 0.0).all()):
+        flojas = divisor.index[~(divisor > 0.0)]
+        raise ErrorDatos(
+            f"El precio del que se parte no es positivo el {flojas[0].date()} "
+            f"({divisor.loc[flojas[0]]}), y un rendimiento relativo sobre un nivel "
+            "nulo o negativo sale con el signo invertido. Una serie que cruza el "
+            "cero no tiene rendimiento porcentual: mida la variacion absoluta con "
+            "la columna 'precio' y .diff()."
+        )
+
+    total = (precio - anterior) / base
+    parte_precio = (ingenuo - anterior) / base
     salida = pd.DataFrame(
         {
             "rendimiento_total": total,

@@ -13,7 +13,7 @@ una red.
 Que hace este modulo distinto de un tutorial
 --------------------------------------------
 Casi todos los ejemplos de redes recurrentes aplicados a mercados contienen al
-menos una de estas tres fugas de informacion del futuro, y las tres estan
+menos una de estas cuatro fugas de informacion del futuro, y las cuatro estan
 cerradas aqui a proposito:
 
 1. **Ventanas centradas.** La muestra de la fecha ``t`` usa exclusivamente
@@ -29,6 +29,11 @@ cerradas aqui a proposito:
    aleatoria. Barajar una serie temporal para elegir la validacion es la misma
    trampa que la validacion cruzada al azar que :mod:`icm.ml.validacion` existe
    para impedir, solo que cometida un nivel mas abajo.
+4. **Tabla en orden descendente.** Las ventanas se construyen por *posicion*,
+   asi que con la tabla de mas reciente a mas antigua -el orden en que la sirven
+   casi todos los proveedores de datos- el "hacia atras" en posicion es hacia
+   delante en el calendario. Se exige indice creciente y sin fechas repetidas,
+   igual que :mod:`icm.ml.validacion` y :mod:`icm.ml.caracteristicas`.
 
 La interfaz es ``ajustar`` / ``predecir``, la del repositorio, de modo que
 :func:`icm.ml.validacion.validacion_walk_forward` acepta una red sin
@@ -41,6 +46,8 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import math
+import warnings
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
@@ -59,6 +66,13 @@ NUCLEO_TCN = 3
 
 #: Como instalar PyTorch sin las bibliotecas de CUDA, que aqui no se usan.
 COMANDO_INSTALACION = "pip install torch --index-url https://download.pytorch.org/whl/cpu"
+
+#: Muestras de entrenamiento por debajo de las cuales el ajuste se rechaza. Con
+#: una sola muestra la red memoriza su unico ejemplo, la desviacion del objetivo
+#: es nula y :func:`_escala` la sustituye por 1, de modo que la escala de ``y``
+#: se queda sin estimar; el resultado es un ajuste degenerado que no se
+#: distingue por fuera de uno bueno.
+MINIMO_ENTRENAMIENTO = 2
 
 #: Clases de ``torch.nn`` definidas en la primera llamada que las necesita.
 #: Viven en un diccionario y no en el espacio del modulo porque heredan de
@@ -198,6 +212,25 @@ class ConfiguracionRed:
             raise ErrorDatos(
                 "'proporcion_validacion' debe estar en [0, 1); se ha recibido "
                 f"{self.proporcion_validacion}. Con 1 no quedarian datos de entrenamiento."
+            )
+        # Es un aviso y no un ErrorDatos porque la configuracion no es invalida:
+        # la red se ajusta y predice, solo que con menos memoria de la que el
+        # usuario cree haber pedido. Rechazarla dejaria sin construir
+        # ConfiguracionRed(arquitectura='tcn') con los valores por defecto, que
+        # es la forma en que el repositorio y sus pruebas la piden hoy.
+        if self.arquitectura == "tcn" and self.alcance_tcn < self.ventana:
+            capas_necesarias = math.ceil(math.log2(1 + (self.ventana - 1) / (NUCLEO_TCN - 1)))
+            descartadas = self.ventana - self.alcance_tcn
+            warnings.warn(
+                f"La TCN configurada solo alcanza a ver {self.alcance_tcn} de las "
+                f"{self.ventana} fechas de la ventana: {descartadas} de cada "
+                f"{self.ventana}, las mas antiguas de cada muestra, no pueden influir en "
+                f"la prediccion, y sin embargo cuestan las {self.ventana - 1} filas de "
+                "arranque que 'predecir' devuelve como NaN. Suba 'capas' a "
+                f"{capas_necesarias} para cubrir la ventana, o baje 'ventana' a "
+                f"{self.alcance_tcn} para pagar solo por lo que la red mira.",
+                UserWarning,
+                stacklevel=3,
             )
 
     @property
@@ -380,6 +413,41 @@ def _crear_red(configuracion: ConfiguracionRed, n_variables: int):
 # --- utilidades de datos -------------------------------------------------------
 
 
+def _validar_indice_temporal(indice: pd.Index, nombre: str) -> None:
+    """Exige un indice creciente y sin fechas repetidas.
+
+    Es la cuarta fuga de la cabecera, y la unica que ninguna de las otras tres
+    defensas puede cerrar: :func:`_ventanas` recorta por **posicion**, asi que
+    con la tabla ordenada de mas reciente a mas antigua la ventana "hacia atras"
+    es hacia delante en el calendario y la fecha ``t`` se predice con ``t+1 ..
+    t+ventana-1``. Con fechas repetidas no hay forma de saber cual de las filas
+    iguales es el pasado de cual.
+
+    Ordenar por dentro y en silencio seria peor: ``predecir`` devuelve un vector
+    alineado por posicion con la tabla que recibe, asi que el llamante volveria
+    a pegar esas predicciones sobre su propio orden, que ya no seria el mismo.
+
+    Una entrada sin indice (un ``ndarray``) recibe el ``RangeIndex`` que le pone
+    :func:`_como_marco`, que siempre pasa las dos comprobaciones: ahi el orden
+    de las filas es la unica nocion de tiempo disponible y se toma como valida,
+    igual que en :func:`icm.ml.validacion._indice_temporal`.
+    """
+    if indice.has_duplicates:
+        repetidas = [str(f) for f in indice[indice.duplicated()].unique()[:3]]
+        raise ErrorDatos(
+            f"El indice de '{nombre}' tiene fechas repetidas ({', '.join(repetidas)}...): "
+            "agregue o elimine los duplicados antes de ajustar, porque la ventana se "
+            "construye por posicion y no hay forma de saber cual de las filas repetidas "
+            "es el pasado de cual."
+        )
+    if not indice.is_monotonic_increasing:
+        raise ErrorDatos(
+            f"El indice de '{nombre}' no esta ordenado de menor a mayor. Ordenelo con "
+            ".sort_index(): la ventana se construye por posicion, asi que sobre filas "
+            "desordenadas la muestra de una fecha trae valores posteriores en el tiempo."
+        )
+
+
 def _como_marco(X: Any, nombre: str = "X") -> pd.DataFrame:
     """Convierte la entrada en un ``DataFrame`` de float sin tocar las filas.
 
@@ -387,6 +455,11 @@ def _como_marco(X: Any, nombre: str = "X") -> pd.DataFrame:
     ausentes: borrar filas desalinearia las ventanas y, peor, desalinearia las
     predicciones respecto al indice que el llamante espera recibir. Los
     ausentes se denuncian para que se decida fuera que hacer con ellos.
+
+    El indice se valida aqui y no en cada llamante porque ``ajustar`` y
+    ``predecir`` sufren la fuga del orden de las filas por separado: una red
+    entrenada con la tabla bien ordenada sigue prediciendo el futuro si despues
+    le dan la tabla al reves.
     """
     if isinstance(X, pd.DataFrame):
         marco = X.astype(float)
@@ -404,6 +477,7 @@ def _como_marco(X: Any, nombre: str = "X") -> pd.DataFrame:
         marco = pd.DataFrame(valores)
     if marco.shape[1] == 0:
         raise ErrorDatos(f"'{nombre}' no tiene ninguna columna: no hay nada con lo que predecir.")
+    _validar_indice_temporal(marco.index, nombre)
     if not np.isfinite(marco.to_numpy(dtype=float)).all():
         raise ErrorDatos(
             f"'{nombre}' contiene valores ausentes o infinitos. Elimine esas fechas con un "
@@ -524,6 +598,9 @@ class RedSecuencial:
         """Valida y alinea las entradas del ajuste."""
         marco = _como_marco(X, "X")
         if isinstance(y, pd.Series):
+            # Con X sin indice (un ndarray) esta es la unica fecha disponible, y
+            # un 'y' descendente invierte igualmente el emparejamiento.
+            _validar_indice_temporal(y.index, "y")
             objetivo = y.to_numpy(dtype=float)
         else:
             objetivo = np.asarray(y, dtype=float).reshape(-1)
@@ -602,11 +679,25 @@ class RedSecuencial:
         if n_muestras < 2:
             raise ErrorDatos(
                 f"Con una ventana de {ventana} y {len(marco)} filas solo se pueden formar "
-                f"{max(n_muestras, 0)} muestras. Hacen falta al menos {ventana + 1} filas, o "
-                "reduzca 'ventana'."
+                f"{max(n_muestras, 0)} muestras. Hacen falta al menos {ventana + 1} filas "
+                "para formar dos muestras, y unas cuantas mas para que quede tramo de "
+                "entrenamiento despues de reservar la validacion y el embargo; o reduzca "
+                "'ventana'."
             )
 
         n_entrenamiento, n_validacion = self._tramos(n_muestras)
+        # El control anterior mira el total; despues de restar la validacion y el
+        # embargo puede quedar una sola muestra, y ese ajuste es degenerado (vease
+        # MINIMO_ENTRENAMIENTO) sin que nada por fuera lo delate.
+        if n_entrenamiento < MINIMO_ENTRENAMIENTO:
+            embargadas = n_muestras - n_validacion - n_entrenamiento
+            raise ErrorDatos(
+                f"Con una ventana de {ventana} y {len(marco)} filas quedan {n_muestras} "
+                f"muestras, y de ellas solo {n_entrenamiento} para entrenar: "
+                f"{n_validacion} van al tramo de validacion y {embargadas} las descarta el "
+                f"embargo. Hacen falta al menos {MINIMO_ENTRENAMIENTO}: alargue la serie, "
+                "reduzca 'ventana' o baje 'proporcion_validacion'."
+            )
         # Las ventanas de entrenamiento abarcan las filas [0, filas_entrenamiento)
         # de la tabla, y sus objetivos son los de [ventana - 1, filas_entrenamiento):
         # las primeras ventana - 1 fechas aportan historia pero nunca son
@@ -638,7 +729,13 @@ class RedSecuencial:
 
         historial: list[dict[str, float]] = []
         mejor_perdida = float("inf")
-        mejores_pesos = copy.deepcopy(red.state_dict())
+        # Arranca en None y no con los pesos de la red recien creada: si ninguna
+        # epoca llega a mejorar -lo que ocurre cuando la perdida sale inf o NaN
+        # en todas, porque ni 'inf < inf' ni 'nan < inf' son ciertos-, restaurar
+        # esa copia devolveria la inicializacion ALEATORIA como si fuera el
+        # resultado del entrenamiento, con 'ajustada' a True y predicciones de
+        # aspecto normal.
+        mejores_pesos: dict[str, Any] | None = None
         epocas_sin_mejora = 0
 
         for epoca in range(1, configuracion.epocas + 1):
@@ -682,6 +779,16 @@ class RedSecuencial:
                 epocas_sin_mejora += 1
                 if epocas_sin_mejora >= configuracion.paciencia:
                     break
+
+        if mejores_pesos is None:
+            raise ErrorDatos(
+                f"La perdida de validacion no fue finita en ninguna de las {len(historial)} "
+                "epocas, asi que no hay ninguna 'mejor epoca' que restaurar y devolver la "
+                "red con los pesos de su inicializacion aleatoria seria peor que fallar. "
+                "La causa habitual es un valor extremo en 'y' que desborda al elevarse al "
+                "cuadrado sobre la escala del entrenamiento (con validacion interna, en su "
+                "ultimo tramo): recortelo, pase a logaritmos o baje 'tasa_aprendizaje'."
+            )
 
         # Los pesos que se conservan son los de la mejor epoca. Quedarse con
         # los ultimos haria inutil la parada temprana: son justamente los que

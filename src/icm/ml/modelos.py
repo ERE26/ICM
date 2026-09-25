@@ -33,6 +33,7 @@ por ``test_``.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
@@ -143,6 +144,34 @@ def _validar_nombre(nombre: Any) -> str:
     return nombre
 
 
+def _forma(datos: Any) -> tuple[int, ...]:
+    """Forma de la entrada, sea pandas, numpy o una lista."""
+    forma = getattr(datos, "shape", None)
+    if forma is not None:
+        return tuple(int(medida) for medida in forma)
+    return tuple(int(medida) for medida in np.asarray(datos).shape)
+
+
+def _exigir_objetivo_unidimensional(y: Any, sufijo: str = "") -> None:
+    """Rechaza un objetivo que no sea una sola columna de numeros.
+
+    ``df[["rend_futuro_1"]]`` en lugar de ``df["rend_futuro_1"]`` es el descuido
+    mas frecuente de todos, y el mas silencioso: scikit-learn acepta la matriz de
+    una columna aplanandola, asi que el modelo se ajusta y devuelve predicciones
+    de aspecto impecable. Se exige aqui lo mismo que en
+    :func:`icm.ml.validacion.validacion_walk_forward`, para que las dos puertas
+    de entrada del repositorio pidan el objetivo en la misma forma.
+    """
+    forma = _forma(y)
+    if len(forma) == 1:
+        return
+    raise ErrorDatos(
+        f"'y{sufijo}' debe ser unidimensional; tiene forma {forma}. Seleccione una "
+        f"columna antes de ajustar: y{sufijo}['rend_futuro_1'], no "
+        f"y{sufijo}[['rend_futuro_1']]."
+    )
+
+
 def _alinear(X: Any, y: Any, sufijo: str = "") -> pd.Index:
     """Indice comun de ``X`` e ``y``, comprobando que de verdad lo sea.
 
@@ -150,6 +179,12 @@ def _alinear(X: Any, y: Any, sufijo: str = "") -> pd.Index:
     de la misma longitud pero de periodos distintos no fallarian: simplemente
     compararian la variable de una fecha con el objetivo de otra y darian un
     resultado sin sentido pero de aspecto impecable.
+
+    La comparacion de indices cubre tambien un ``y`` que llegue como
+    ``DataFrame``. Mirar solo las ``Series`` dejaba el guardian desactivado justo
+    en el caso en que el usuario ya esta manejando columnas, que es cuando se
+    equivoca: con un objetivo de otro periodo en un ``DataFrame`` de una columna
+    el ajuste salia adelante sin un solo aviso y con la relacion real borrada.
     """
     indice_X = _indice(X, f"X{sufijo}")
     indice_y = _indice(y, f"y{sufijo}")
@@ -161,13 +196,14 @@ def _alinear(X: Any, y: Any, sufijo: str = "") -> pd.Index:
             f"{len(indice_y)}: alinee ambos con un unico 'dropna' conjunto antes "
             "de ajustar."
         )
-    if isinstance(X, (pd.DataFrame, pd.Series)) and isinstance(y, pd.Series):
+    if isinstance(X, (pd.DataFrame, pd.Series)) and isinstance(y, (pd.Series, pd.DataFrame)):
         if not indice_X.equals(indice_y):
             raise ErrorDatos(
                 f"'X{sufijo}' e 'y{sufijo}' tienen la misma longitud pero indices "
                 "distintos: reindexelos al indice comun antes de ajustar, porque el "
                 "emparejamiento es posicional y cruzaria fechas."
             )
+    _exigir_objetivo_unidimensional(y, sufijo)
     return indice_X
 
 
@@ -542,6 +578,7 @@ def importancia_variables(
     y: pd.Series,
     n_repeticiones: int = 10,
     semilla: int = SEMILLA,
+    dentro_de_muestra: bool = False,
 ) -> pd.Series:
     """Importancia por permutacion: cuanto empeora el modelo al romper cada variable.
 
@@ -579,23 +616,42 @@ def importancia_variables(
     Parametros
     ----------
     modelo:
-        Si ya esta ajustado, se usa tal cual, y entonces ``X`` e ``y`` deberian
-        ser un tramo que el modelo **no** haya visto: esa es la importancia
-        honesta, la que dice de que se fia el modelo cuando acierta de verdad.
-        Si no lo esta, se ajusta aqui mismo sobre ``(X, y)`` (y queda ajustado,
-        por el convenio de scikit-learn) y la cifra pasa a medir en que se apoya
-        el modelo dentro de muestra, que no es lo mismo: un arbol sobreajustado
-        puede apoyarse mucho en una variable que fuera de muestra no vale nada.
+        Tiene que llegar **ya ajustado**, y con ``(X, y)`` un tramo que el modelo
+        no haya visto: esa es la importancia honesta, la que dice de que se fia
+        el modelo cuando acierta de verdad. El encadenamiento previsto es
+        :func:`ajustar_y_predecir` con el pasado y despues esta funcion con el
+        tramo de prueba.
     n_repeticiones:
         Permutaciones por variable. La importancia es una media sobre
         barajados; con pocas repeticiones el ranking baila de una semilla a
         otra.
+    dentro_de_muestra:
+        Permite ajustar aqui mismo un modelo que llegue sin entrenar y permutar
+        sobre ese mismo ``(X, y)``. Hay que pedirlo expresamente porque la cifra
+        que sale entonces no es importancia predictiva, es cuanto memorizo el
+        modelo: con ``X`` e ``y`` independientes, un arbol potenciado atribuye
+        cerca de 0,3 de R cuadrado a **cada** variable cuando la respuesta
+        correcta es ruido alrededor de cero. Es legitimo como diagnostico de
+        sobreajuste, nunca como respuesta a "que mira el modelo". El resultado
+        vuelve marcado y con un aviso.
 
     Devuelve
     --------
     Series indexada por nombre de variable y ordenada de mayor a menor. Los
     valores negativos no son un error: significan que el modelo predice mejor
     con esa columna barajada, es decir, que la estaba usando como ruido.
+
+    ``attrs['dentro_de_muestra']`` dice si la cifra se midio sobre el mismo
+    tramo con el que esta funcion ajusto el modelo. Vale ``False`` cuando el
+    modelo llego ajustado, y entonces que la medida sea fuera de muestra depende
+    de que quien llama haya pasado un tramo no visto: eso no se puede comprobar
+    desde aqui, porque un estimador de scikit-learn no guarda las fechas con las
+    que se ajusto.
+
+    Lanza
+    -----
+    ErrorDatos
+        Si el modelo llega sin ajustar y no se ha pedido ``dentro_de_muestra``.
     """
     if not isinstance(X, pd.DataFrame):
         raise ErrorDatos(
@@ -615,14 +671,36 @@ def importancia_variables(
 
     try:
         check_is_fitted(modelo)
-        ajustado = modelo
+        ajustado_aqui = False
     except NotFittedError:
-        ajustado = modelo.fit(X, y)
+        ajustado_aqui = True
     except TypeError as exc:
         raise ErrorDatos(
             f"El objeto {type(modelo).__name__} no es un estimador de scikit-learn: "
             f"{exc}. Creelo con crear_modelo()."
         ) from exc
+
+    if ajustado_aqui and not dentro_de_muestra:
+        raise ErrorDatos(
+            f"El modelo {type(modelo).__name__} llega sin ajustar: ajustarlo con "
+            "(X, y) y permutar sobre ese mismo tramo no mide de que se fia el modelo, "
+            "mide cuanto ha memorizado, y sobre variables sin ninguna relacion con el "
+            "objetivo devuelve importancias grandes. Ajustelo con el pasado "
+            "(ajustar_y_predecir) y pase aqui un tramo posterior, o pase "
+            "dentro_de_muestra=True si lo que quiere es el diagnostico dentro de "
+            "muestra."
+        )
+    ajustado = modelo
+    if ajustado_aqui:
+        ajustado = modelo.fit(X, y)
+        warnings.warn(
+            "importancia_variables ha ajustado el modelo con (X, y) y permuta sobre "
+            "ese mismo tramo: la cifra es importancia DENTRO de muestra y no dice "
+            "que mira el modelo fuera de ella. Queda marcada en "
+            "attrs['dentro_de_muestra'].",
+            UserWarning,
+            stacklevel=2,
+        )
 
     resultado = permutation_importance(
         ajustado,
@@ -637,7 +715,9 @@ def importancia_variables(
         index=X.columns,
         name="importancia",
     )
-    return importancias.sort_values(ascending=False)
+    importancias = importancias.sort_values(ascending=False)
+    importancias.attrs["dentro_de_muestra"] = ajustado_aqui
+    return importancias
 
 
 # --- busqueda de hiperparametros -----------------------------------------------
@@ -680,6 +760,63 @@ class ParticionSklearn:
         return int(self.particion.n_divisiones(X))
 
 
+def _recortar(datos: Any, n: int) -> Any:
+    """Primeras ``n`` filas de la entrada, sea pandas o numpy."""
+    if isinstance(datos, (pd.DataFrame, pd.Series)):
+        return datos.iloc[:n]
+    return np.asarray(datos)[:n]
+
+
+def _tramo_de_seleccion(
+    particion: ParticionWalkForward, X: Any
+) -> tuple[int, ParticionWalkForward]:
+    """Filas utilizables para elegir hiperparametros, y con que particion.
+
+    Devuelve cuantas filas iniciales puede ver la busqueda (las del
+    entrenamiento de la **primera** particion de evaluacion, que ya excluyen el
+    embargo) y una particion interna que quepa en ellas.
+
+    La particion interna hereda ``embargo`` y ``expansiva`` de la de evaluacion,
+    porque el criterio con el que se elige debe parecerse al criterio con el que
+    luego se juzga, y reescala el entrenamiento minimo en la misma proporcion en
+    que se ha recortado la muestra: el minimo de la particion de evaluacion esta
+    pensado para la serie entera y dejaria sin sitio a los tramos internos.
+
+    Del numero de particiones se toma el de la de evaluacion, pero bajando hasta
+    el mayor que quepa en el tramo de seleccion. Reducir tramos no compromete
+    nada (todos siguen midiendo hacia delante y ninguno toca las fechas del
+    informe); quedarse sin ninguno si. Solo cuando no cabe ni una se lanza
+    ``ErrorDatos``, porque entonces no hay forma honesta de elegir.
+    """
+    tramos = list(particion.dividir(X))
+    fin_seleccion = int(tramos[0][0][-1]) + 1
+    n = _n_filas(X)
+    X_seleccion = _recortar(X, fin_seleccion)
+    minimo = max(1, round(particion.tamano_entrenamiento_minimo * fin_seleccion / n))
+    motivo: ErrorDatos | None = None
+    for n_particiones in range(particion.n_particiones, 0, -1):
+        interna = ParticionWalkForward(
+            n_particiones=n_particiones,
+            tamano_prueba=None,
+            embargo=particion.embargo,
+            expansiva=particion.expansiva,
+            tamano_entrenamiento_minimo=minimo,
+        )
+        try:
+            interna.n_divisiones(X_seleccion)
+        except ErrorDatos as exc:
+            motivo = exc
+            continue
+        return fin_seleccion, interna
+    raise ErrorDatos(
+        f"La busqueda solo puede mirar las {fin_seleccion} primeras observaciones de "
+        f"{n}, las anteriores al primer tramo de prueba de 'particion', y ahi no cabe "
+        f"ni una sola particion interna: {motivo} Alargue la serie, o reduzca "
+        "'tamano_prueba' o 'embargo' en la particion de evaluacion para que quede mas "
+        "historia antes de su primer tramo de prueba."
+    ) from motivo
+
+
 def buscar_hiperparametros(
     nombre: str,
     X: pd.DataFrame,
@@ -693,6 +830,25 @@ def buscar_hiperparametros(
     *walk forward* del repositorio; vease ahi por que nunca se usa un ``KFold``
     aleatorio ni el atajo ``cv=5``.
 
+    Que tramo ve la busqueda
+    ------------------------
+    Solo las fechas **anteriores** al primer tramo de prueba de ``particion``, y
+    sobre ellas una particion interna hacia delante. La razon es que
+    ``ParticionWalkForward`` pega sus tramos de prueba al final de la muestra, o
+    sea exactamente las fechas que :func:`comparar_modelos` y
+    :func:`icm.ml.validacion.validacion_walk_forward` presentan despues como
+    resultado fuera de muestra. Buscar sobre la particion completa elegiria la
+    combinacion que minimiza el error **en** el tramo que luego se reporta, que
+    es la forma clasica de elegir mirando el conjunto de prueba: alterando
+    ``y`` solo en el ultimo tramo de prueba, con el entrenamiento intacto, la
+    eleccion de ``alpha`` saltaba de 1e-06 a 1e+06.
+
+    Es un problema distinto del de ``refit``, y por eso no bastaba con avisar de
+    aquel: ``refit`` afecta al ajuste final, mientras que aqui se contaminaba la
+    **seleccion**. Con el recorte, el encadenamiento de mas abajo es legitimo:
+    los hiperparametros se han elegido sin ver ninguna de las fechas sobre las
+    que se va a informar.
+
     Se puntua con el error cuadratico medio negativo y no con el R cuadrado, que
     es lo que usaria scikit-learn por omision. El R cuadrado de cada tramo se
     calcula contra la media de **ese mismo tramo**, que en la fecha de la
@@ -702,8 +858,9 @@ def buscar_hiperparametros(
 
     No se reajusta el modelo al final (``refit=False``): lo que se pide aqui son
     los hiperparametros, y quien los recibe decide con que tramo ajustar. Un
-    reajuste automatico sobre la muestra completa incluiria el ultimo tramo de
-    prueba y convertiria en silencio un resultado fuera de muestra en uno dentro.
+    modelo devuelto ya ajustado, ademas, estaria ajustado solo con el tramo de
+    seleccion, que es una parte de la muestra elegida por esta funcion y no por
+    quien la llama.
 
     Parametros
     ----------
@@ -711,17 +868,32 @@ def buscar_hiperparametros(
         ``{nombre_de_hiperparametro: valores}`` **sin** el prefijo del paso del
         Pipeline: ``{"alpha": [0.1, 1.0]}``, no ``{"modelo__alpha": ...}``. Si se
         omite se usa la de :data:`REJILLAS`.
+    particion:
+        La particion con la que se va a **evaluar** despues. No se usa tal cual:
+        de ella se toma el inicio de su primer tramo de prueba como frontera de
+        lo que la busqueda puede mirar, y su forma para construir la particion
+        interna. Pasar aqui la misma que se pasa a :func:`comparar_modelos` es
+        lo correcto y lo previsto.
 
     Devuelve
     --------
     Diccionario de hiperparametros, con los nombres tal como los acepta
-    :func:`crear_modelo`, de modo que se puede encadenar directamente:
+    :func:`crear_modelo`, de modo que se puede encadenar con la particion de
+    evaluacion sin quemarla:
 
-    >>> mejores = buscar_hiperparametros("ridge", X, y)   # doctest: +SKIP
-    >>> modelo = crear_modelo("ridge", **mejores)         # doctest: +SKIP
+    >>> particion = ParticionWalkForward(n_particiones=5, embargo=1)  # doctest: +SKIP
+    >>> mejores = buscar_hiperparametros("ridge", X, y, particion=particion)  # doctest: +SKIP
+    >>> modelo = crear_modelo("ridge", **mejores)                     # doctest: +SKIP
+    >>> resultado = validacion_walk_forward(modelo, X, y, particion)  # doctest: +SKIP
 
     Para ``"media_cero"`` devuelve un diccionario vacio: no hay nada que elegir,
     y eso es precisamente su virtud como referencia.
+
+    Lanza
+    -----
+    ErrorDatos
+        Si antes del primer tramo de prueba de ``particion`` no queda historia
+        suficiente para una particion interna.
     """
     nombre = _validar_nombre(nombre)
     _alinear(X, y)
@@ -758,14 +930,16 @@ def buscar_hiperparametros(
             raise ErrorDatos(f"La rejilla de '{clave}' esta vacia: indique al menos un valor.")
         rejilla_pipeline[f"{prefijo}{clave}"] = list(valores)
 
+    particion = particion if particion is not None else ParticionWalkForward()
+    fin_seleccion, interna = _tramo_de_seleccion(particion, X)
     busqueda = GridSearchCV(
         modelo,
         rejilla_pipeline,
         scoring="neg_mean_squared_error",
-        cv=ParticionSklearn(particion),
+        cv=ParticionSklearn(interna),
         refit=False,
     )
-    busqueda.fit(X, y)
+    busqueda.fit(_recortar(X, fin_seleccion), _recortar(y, fin_seleccion))
     return {
         clave.removeprefix(prefijo): valor for clave, valor in busqueda.best_params_.items()
     }

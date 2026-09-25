@@ -419,6 +419,80 @@ def constructor_con_ventana_centrada(precios, objetivo, horizonte=1, **_):
     return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "fuga")
 
 
+def constructor_con_fuga_por_otro_kwarg(precios, objetivo, demanda=None, horizonte=1, **_):
+    """Constructor tramposo: la fuga entra por un kwarg que no se llama 'exogenas'.
+
+    El mismo ``shift(-1)`` es fuga se llame el argumento ``demanda``, ``volumen``
+    o ``exogena`` en singular por un error de tecleo. Si la auditoria se fia del
+    nombre del parametro, el veredicto depende de como se haya bautizado la
+    firma del constructor y no de lo que el constructor hace.
+    """
+    serie = precios[objetivo]
+    X = pd.DataFrame(
+        {
+            "rend_ret1": np.log(serie).diff().shift(1),
+            "demanda_manana": demanda.reindex(serie.index).shift(-1),
+        }
+    )
+    return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "fuga")
+
+
+def constructor_con_fuga_en_la_exogena(precios, objetivo, exogenas=None, horizonte=1, **_):
+    """Constructor tramposo: usa la exogena adelantada un dia, tal como la recibe.
+
+    Al llamar a :func:`retardos` con la exogena sin convertir, el nombre de la
+    columna depende de si llego una Series o un DataFrame: es el caso que se
+    escapaba cuando los dos experimentos no entregaban el mismo tipo.
+    """
+    serie = precios[objetivo]
+    exo = retardos(exogenas.shift(-1), (0,), prefijo="exo")
+    X = pd.concat(
+        [pd.DataFrame({"rend_ret1": np.log(serie).diff().shift(1)}), exo.reindex(serie.index)],
+        axis=1,
+    )
+    return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "fuga")
+
+
+def constructor_sin_exogenas(precios, objetivo, horizonte=1, **_):
+    """Constructor limpio que ignora cualquier argumento de mas."""
+    serie = precios[objetivo]
+    X = pd.DataFrame({"rend_ret1": np.log(serie).diff().shift(1)})
+    return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "retardos")
+
+
+def constructor_con_columnas_cambiantes(precios, objetivo, horizonte=1, **_):
+    """Constructor cuyo conjunto de columnas depende de los datos que recibe."""
+    serie = precios[objetivo]
+    X = pd.DataFrame(
+        {
+            "rend_ret1": np.log(serie).diff().shift(1),
+            f"rend_mm{len(serie)}": np.log(serie).diff().rolling(5).mean().shift(1),
+        }
+    )
+    return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "fuga")
+
+
+def constructor_con_relleno_hacia_atras(precios, objetivo, horizonte=1, **_):
+    """Constructor tramposo: rellena los huecos con el PRIMER dato posterior.
+
+    La fuga solo existe en las fechas con hueco, asi que solo se ve si algun
+    corte cae pegado a una de ellas.
+    """
+    serie = precios[objetivo].bfill()
+    X = pd.DataFrame({"rend_ret0": np.log(serie).diff()})
+    return _matriz_desde(X, objetivo_rendimiento_futuro(serie, horizonte), "fuga")
+
+
+@pytest.fixture(scope="module")
+def precios_con_huecos(precios_cortos) -> pd.DataFrame:
+    """Los mismos precios con cuatro sesiones sin dato, como un puente de festivos."""
+    con_huecos = precios_cortos.copy()
+    columna = con_huecos.columns.get_loc("ALFA")
+    for posicion in (120, 121, 200, 300):
+        con_huecos.iloc[posicion, columna] = np.nan
+    return con_huecos
+
+
 def test_la_auditoria_acepta_la_matriz_del_modulo(precios_cortos):
     comprobar_ausencia_de_fuga(construir_matriz, precios_cortos, "ALFA")
 
@@ -492,6 +566,106 @@ def test_la_auditoria_rechaza_una_fecha_de_corte_fuera_del_tramo(precios_cortos)
         comprobar_ausencia_de_fuga(
             construir_matriz, precios_cortos, "ALFA", fechas=["2099-01-01"]
         )
+
+
+def test_la_auditoria_detecta_la_fuga_aunque_el_kwarg_no_se_llame_exogenas(
+    precios_cortos, exogena
+):
+    """El veredicto no puede depender de como se llame el parametro.
+
+    Antes solo se truncaba y se perturbaba ``kwargs['exogenas']``: cualquier
+    otro argumento de datos llegaba identico a las tres llamadas, asi que las
+    columnas que salian de el coincidian por construccion y la comparacion no
+    veia nada.
+    """
+    with pytest.raises(ErrorDatos, match="demanda_manana"):
+        comprobar_ausencia_de_fuga(
+            constructor_con_fuga_por_otro_kwarg, precios_cortos, "ALFA", demanda=exogena
+        )
+
+
+def test_la_auditoria_detecta_la_fuga_de_una_exogena_dada_como_serie(precios_cortos, exogena):
+    """Los dos experimentos tienen que entregar el mismo tipo que la referencia.
+
+    Con la exogena convertida a DataFrame solo en el experimento de
+    perturbacion, un constructor que bautice sus columnas segun el tipo devolvia
+    'exo_ret0' en la referencia y 'exo_temperatura_ret0' en la perturbada, y
+    ninguna columna de la exogena entraba en la comparacion.
+    """
+    with pytest.raises(ErrorDatos, match="exo_ret0"):
+        comprobar_ausencia_de_fuga(
+            constructor_con_fuga_en_la_exogena, precios_cortos, "ALFA", exogenas=exogena
+        )
+
+
+def test_la_auditoria_detecta_la_misma_fuga_con_la_exogena_como_marco(precios_cortos, exogena):
+    with pytest.raises(ErrorDatos, match="exo_temperatura_ret0"):
+        comprobar_ausencia_de_fuga(
+            constructor_con_fuga_en_la_exogena,
+            precios_cortos,
+            "ALFA",
+            exogenas=exogena.to_frame(),
+        )
+
+
+def test_la_auditoria_aborta_si_el_constructor_no_devuelve_siempre_las_mismas_columnas(
+    precios_cortos,
+):
+    """Intersecar los nombres en silencio haria pasar por 'no hay fuga' un desajuste."""
+    with pytest.raises(ErrorDatos, match="columnas distintas"):
+        comprobar_ausencia_de_fuga(
+            constructor_con_columnas_cambiantes, precios_cortos, "ALFA"
+        )
+
+
+@pytest.mark.parametrize(
+    ("extra", "motivo"),
+    [
+        (pd.Series(np.arange(10.0)), "no se puede comparar"),
+        (
+            pd.Series(["a", "b", "c"], index=pd.bdate_range("2015-01-01", periods=3)),
+            "no sabe reescribir",
+        ),
+    ],
+)
+def test_la_auditoria_rechaza_un_argumento_de_datos_que_no_sabe_alterar(
+    precios_cortos, extra, motivo
+):
+    """Un 'pasa' que no significa nada es peor que un error.
+
+    Si un argumento de datos no se puede truncar ni perturbar, sus columnas
+    salen iguales en las tres matrices y la auditoria no esta comprobando nada
+    sobre ellas: hay que decirlo, no dar el visto bueno.
+    """
+    with pytest.raises(ErrorDatos) as excepcion:
+        comprobar_ausencia_de_fuga(
+            constructor_sin_exogenas, precios_cortos, "ALFA", demanda=extra
+        )
+
+    mensaje = str(excepcion.value)
+    assert "no puede garantizar nada" in mensaje
+    assert "'demanda'" in mensaje
+    assert motivo in mensaje
+
+
+def test_la_auditoria_detecta_un_relleno_hacia_atras_en_un_hueco(precios_con_huecos):
+    """Los cortes por omision tienen que caer tambien junto a los ausentes.
+
+    Con solo tres cortes al 50, 70 y 85 % de la muestra, un relleno hacia atras
+    pasaba desapercibido salvo que un hueco cayese pegado a uno de ellos, y es
+    el fallo que el propio mensaje de error dice buscar.
+    """
+    with pytest.raises(ErrorDatos, match="rend_ret0"):
+        comprobar_ausencia_de_fuga(
+            constructor_con_relleno_hacia_atras, precios_con_huecos, "ALFA"
+        )
+
+
+def test_la_auditoria_sigue_aceptando_la_matriz_del_modulo_con_huecos(precios_con_huecos):
+    """Los cortes nuevos no pueden convertirse en falsas alarmas."""
+    comprobar_ausencia_de_fuga(
+        construir_matriz, precios_con_huecos, "ALFA", incluir=("retardos", "momento")
+    )
 
 
 def test_la_auditoria_exige_que_el_constructor_devuelva_una_matriz_de_datos(precios_cortos):

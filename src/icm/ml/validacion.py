@@ -51,6 +51,12 @@ def _indice_temporal(datos: Any, nombre: str) -> pd.Index:
     Una entrada sin indice (un ``ndarray``) recibe posiciones 0..n-1: ahi el
     orden de las filas es la unica nocion de tiempo disponible y se toma como
     valida.
+
+    Un ``MultiIndex`` de panel se rechaza porque burla la comprobacion de
+    duplicados sin dejar de romper lo que esa comprobacion protege: los pares
+    ``(fecha, activo)`` son unicos aunque cada fecha se repita una vez por
+    activo, de modo que un corte por posicion parte una fecha por la mitad y el
+    embargo, contado en filas, compra ``embargo / n_activos`` dias de hueco.
     """
     if isinstance(datos, (pd.DataFrame, pd.Series)):
         indice = datos.index
@@ -62,6 +68,14 @@ def _indice_temporal(datos: Any, nombre: str) -> pd.Index:
 
     if len(indice) == 0:
         raise ErrorDatos(f"'{nombre}' no contiene ninguna observacion.")
+    if isinstance(indice, pd.MultiIndex):
+        raise ErrorDatos(
+            f"El indice de '{nombre}' es un MultiIndex y esta particion no sabe de paneles: "
+            "corta por posicion, asi que la misma fecha caeria en entrenamiento y en prueba, "
+            "y el embargo se contaria en filas y no en fechas. Parta el panel por fecha "
+            "(valide un activo a la vez, o reduzcalo a una fila por fecha con "
+            ".unstack() o .groupby(level=0))."
+        )
     if indice.has_duplicates:
         repetidas = [str(f) for f in indice[indice.duplicated()].unique()[:3]]
         raise ErrorDatos(
@@ -108,6 +122,63 @@ def _metodos_del_modelo(modelo: Any) -> tuple[str, str]:
     )
 
 
+def _estado(modelo: Any) -> dict[str, Any] | None:
+    """Atributos de instancia del objeto, o ``None`` si no se pueden leer.
+
+    Un objeto con ``__slots__`` no tiene ``__dict__`` y no hay forma portable de
+    enumerar su estado; ahi se prefiere no opinar a opinar mal.
+    """
+    try:
+        return dict(vars(modelo))
+    except TypeError:
+        return None
+
+
+def _parece_ajustado(modelo: Any) -> bool:
+    """Si el objeto recibido ya ha sido entrenado.
+
+    No hay una respuesta universal para un convenio tan abierto como el de este
+    modulo, asi que se acumulan tres indicios y basta uno: lo que dice
+    ``check_is_fitted``, el guion bajo final de scikit-learn, y los atributos
+    que el objeto no tenia recien construido. Se prefiere el falso negativo al
+    falso positivo: dejar pasar un modelo ajustado que no se ha reconocido es el
+    fallo que ya existia, mientras rechazar uno limpio dejaria de poder validar
+    codigo correcto. Por eso un constructor que no se puede llamar sin
+    argumentos se resuelve como "no ajustado" en vez de como error.
+    """
+    from sklearn.utils.validation import check_is_fitted
+
+    try:
+        check_is_fitted(modelo)
+        return True
+    except Exception:
+        # Que diga que no lo esta no cierra el asunto: solo mira el convenio de
+        # scikit-learn, y un modelo del convenio de este repositorio guarda su
+        # ajuste en atributos con nombre corriente.
+        pass
+
+    estado = _estado(modelo)
+    if estado is None:
+        return False
+    # Convenio de scikit-learn: el estado ajustado va en atributos que terminan
+    # en guion bajo y no empiezan por el.
+    if any(nombre.endswith("_") and not nombre.startswith("_") for nombre in estado):
+        return True
+
+    try:
+        recien_construido = _estado(type(modelo)())
+    except Exception:
+        return False
+    if recien_construido is None:
+        return False
+    for nombre, valor in estado.items():
+        if nombre not in recien_construido:
+            return True
+        if recien_construido[nombre] is None and valor is not None:
+            return True
+    return False
+
+
 def _clonar(modelo: Any) -> Any:
     """Copia sin ajustar del modelo, para empezar cada particion desde cero.
 
@@ -118,14 +189,30 @@ def _clonar(modelo: Any) -> Any:
 
     ``sklearn.base.clone`` es la via preferida porque copia los hiperparametros
     y **no** el estado ajustado; para lo que no es un estimador de scikit-learn
-    (una red de PyTorch, una clase propia) se recurre a ``copy.deepcopy``.
+    (una red de PyTorch, una clase propia) se recurre a ``copy.deepcopy``, que
+    copia el objeto entero, estado ajustado incluido. Por eso esa via exige que
+    el modelo llegue sin entrenar: un modelo preajustado con toda la serie (lo
+    mas natural del mundo: entrenar y despues "validar") arrancaria cada
+    particion desde unos pesos que ya han visto las fechas de prueba, y si su
+    ajuste es de arranque caliente esa informacion sobrevive al reajuste y
+    fabrica senal de la nada sin que nada avise.
     """
     from sklearn.base import clone
 
     try:
         return clone(modelo)
     except TypeError:
-        return copy.deepcopy(modelo)
+        pass
+
+    if _parece_ajustado(modelo):
+        raise ErrorDatos(
+            f"El modelo {type(modelo).__name__} llega ya ajustado y no expone 'get_params', "
+            "asi que la copia de cada particion no puede borrar su entrenamiento: las "
+            "predicciones 'fuera de muestra' arrancarian desde unos pesos que ya han visto "
+            "las fechas de prueba. Pase un modelo recien construido, "
+            f"'{type(modelo).__name__}(...)', y deje que la validacion lo ajuste."
+        )
+    return copy.deepcopy(modelo)
 
 
 def _correlacion(reales: np.ndarray, predicciones: np.ndarray) -> float:
@@ -146,14 +233,34 @@ def _correlacion(reales: np.ndarray, predicciones: np.ndarray) -> float:
     return float(centrado.mean() / (desviacion_real * desviacion_prediccion))
 
 
+def _pares_utiles(reales: np.ndarray, predicciones: np.ndarray) -> np.ndarray:
+    """Mascara de las fechas en las que hay una direccion que acertar.
+
+    Se excluyen las de rendimiento real nulo (no hay direccion) y las que les
+    falta el real o la prediccion. Lo segundo no es cosmetico: ``np.sign(nan)``
+    es ``nan`` y ``nan == sign(real)`` es ``False``, asi que cada hueco entraria
+    en el denominador contado como fallo.
+    """
+    return (reales != 0.0) & np.isfinite(reales) & np.isfinite(predicciones)
+
+
 def _acierto_direccional(reales: np.ndarray, predicciones: np.ndarray) -> float:
     """Proporcion de fechas en las que se acierta el signo del rendimiento.
 
     En trading el signo decide la posicion, asi que esta cifra se acerca mas al
-    dinero que el error cuadratico. Las fechas de rendimiento real nulo se
-    excluyen: no hay direccion que acertar.
+    dinero que el error cuadratico.
+
+    Las fechas sin prediccion se excluyen en vez de contarse como fallos, que es
+    lo que hacia esta funcion y la convertia en la unica metrica que no avisaba
+    de un hueco: ``rmse``, ``mae``, ``sesgo``, ``correlacion`` y
+    ``r2_fuera_muestra`` se vuelven NaN y gritan que falta algo, mientras el
+    acierto devolvia una cifra de aspecto normal, la verdadera multiplicada por
+    la fraccion de filas validas. No es un caso hipotetico: es lo que produce
+    :class:`icm.ml.redes.RedSecuencial`, que devuelve NaN en las ``ventana - 1``
+    primeras filas de cada tramo. Cuantas fechas quedan se publica aparte, en
+    ``n_validas``.
     """
-    utiles = reales != 0.0
+    utiles = _pares_utiles(reales, predicciones)
     if not utiles.any():
         return float("nan")
     return float(np.mean(np.sign(predicciones[utiles]) == np.sign(reales[utiles])))
@@ -172,11 +279,17 @@ def _metricas(
     pregunta que importa: si el modelo aporta algo sobre no haber modelado nada.
     Usar la media del tramo de prueba, como hace el R cuadrado habitual, seria
     otra fuga de informacion del futuro, pequenia pero de la misma familia.
+
+    ``n_validas`` cuenta las fechas con direccion que acertar, es decir las que
+    entran en ``acierto_direccional``. Se publica porque es la unica metrica que
+    sobrevive a un hueco, y comparada con ``n_prueba`` deja el hueco a la vista
+    en vez de disolverlo en el denominador.
     """
     error = predicciones - reales
     suma_cuadrados_error = float(np.sum(error**2))
     suma_cuadrados_total = float(np.sum((reales - referencia) ** 2))
     return {
+        "n_validas": float(np.count_nonzero(_pares_utiles(reales, predicciones))),
         "rmse": float(np.sqrt(np.mean(error**2))),
         "mae": float(np.mean(np.abs(error))),
         "sesgo": float(np.mean(error)),
@@ -399,6 +512,10 @@ class ResultadoValidacion:
         propio entrenamiento, y esas referencias no son la misma cifra, asi que
         agregarlas en un solo numero seria inventarselo. Esta por particion en
         ``por_particion``.
+
+        ``n_validas`` menor que ``observaciones`` significa que hay fechas sin
+        prediccion o sin real: ahi ``acierto_direccional`` se calcula solo con
+        las validas y el resto de las metricas sale NaN.
         """
         reales = self.reales.to_numpy(dtype=float)
         predicciones = self.predicciones.to_numpy(dtype=float)
@@ -407,6 +524,7 @@ class ResultadoValidacion:
             {
                 "n_particiones": float(len(self.modelos)),
                 "observaciones": float(len(reales)),
+                "n_validas": float(np.count_nonzero(_pares_utiles(reales, predicciones))),
                 "rmse": float(np.sqrt(np.mean(error**2))),
                 "mae": float(np.mean(np.abs(error))),
                 "sesgo": float(np.mean(error)),
@@ -436,6 +554,70 @@ def _alinear(X: Any, y: Any) -> pd.Index:
     return indice
 
 
+def _prediccion_alineada(
+    crudas: Any,
+    fechas: pd.Index,
+    numero: int,
+    nombre_prediccion: str,
+    etiquetas_comparables: bool,
+) -> np.ndarray:
+    """Predicciones del tramo como vector, respetando sus etiquetas si las trae.
+
+    Convertir con ``np.asarray`` una prediccion que viene con indice tira la
+    unica informacion que permite comprobar el emparejamiento, y al volver a
+    etiquetarla por posicion cada prediccion puede quedar pegada a la fecha de
+    otra: basta que el modelo haya hecho por dentro un ``groupby``, un
+    ``sort_values`` o un ``reindex``. El tamanio cuadra, no salta nada y el
+    resultado sigue pareciendo razonable (medido: una correlacion de +1,00 pasa
+    a +0,06 y un Sharpe de +22,7 a +0,7 con el mismo conjunto de valores).
+    Cuando el modelo trae el indice se usa para reindexar, que es lo que
+    convierte la desalineacion silenciosa en un error.
+
+    Las etiquetas se comparan como etiquetas y no por el valor reindexado,
+    porque un NaN en la prediccion es legitimo (una red devuelve NaN donde no
+    tiene historia suficiente) y no debe confundirse con una fecha ausente.
+
+    ``etiquetas_comparables`` es falso cuando ``X`` llego sin indice: las fechas
+    del tramo son entonces posiciones que ha inventado este modulo, asi que
+    exigir que el modelo las reproduzca seria exigirle que adivine. Ahi solo se
+    comprueba el numero de filas, que es lo unico que significa algo.
+    """
+    if isinstance(crudas, (pd.Series, pd.DataFrame)):
+        if len(crudas) != len(fechas):
+            raise ErrorDatos(
+                f"En la particion {numero} el modelo ha devuelto {len(crudas)} filas de "
+                f"predicciones para {len(fechas)} fechas del tramo de prueba. "
+                f"'{nombre_prediccion}' debe devolver una prediccion por fila."
+            )
+        if etiquetas_comparables:
+            if crudas.index.has_duplicates:
+                raise ErrorDatos(
+                    f"En la particion {numero} el modelo ha devuelto predicciones con fechas "
+                    "repetidas en el indice, asi que no se pueden emparejar con las "
+                    f"{len(fechas)} fechas del tramo de prueba. '{nombre_prediccion}' debe "
+                    "devolver una prediccion por fila, con el indice de la tabla que ha "
+                    "recibido."
+                )
+            ausentes = fechas[~fechas.isin(crudas.index)]
+            if len(ausentes):
+                raise ErrorDatos(
+                    f"En la particion {numero} el indice de las predicciones no coincide con "
+                    f"las {len(fechas)} fechas del tramo de prueba: faltan {len(ausentes)}, "
+                    f"la primera {ausentes[0]}. '{nombre_prediccion}' debe devolver una "
+                    "prediccion por fila conservando el indice de la tabla que ha recibido."
+                )
+            crudas = crudas.reindex(fechas)
+
+    valores = np.asarray(crudas, dtype=float).reshape(-1)
+    if valores.size != len(fechas):
+        raise ErrorDatos(
+            f"En la particion {numero} el modelo ha devuelto {valores.size} predicciones "
+            f"para {len(fechas)} fechas. '{nombre_prediccion}' debe devolver una "
+            "prediccion por fila."
+        )
+    return valores
+
+
 def validacion_walk_forward(
     modelo: Any,
     X: pd.DataFrame | np.ndarray,
@@ -450,7 +632,10 @@ def validacion_walk_forward(
         Cualquier objeto con ``fit``/``predict`` (estilo scikit-learn) o con
         ``ajustar``/``predecir`` (estilo de este repositorio). No se toca: en
         cada particion se valida una copia sin ajustar, de modo que al terminar
-        el objeto recibido sigue tal como llego.
+        el objeto recibido sigue tal como llego. Debe llegar **sin entrenar**:
+        para lo que no es un estimador de scikit-learn la copia es un
+        ``deepcopy``, que arrastraria el ajuste (ver :func:`_clonar`), asi que
+        un modelo ya ajustado se rechaza en vez de validarse con fuga.
     particion:
         Esquema de division. Por omision, :class:`ParticionWalkForward` con sus
         valores por defecto.
@@ -494,16 +679,15 @@ def validacion_walk_forward(
             else copia
         )
 
-        crudas = getattr(ajustado, nombre_prediccion)(_subconjunto(X, pos_pru))
-        crudas = np.asarray(crudas, dtype=float).reshape(-1)
-        if crudas.size != pos_pru.size:
-            raise ErrorDatos(
-                f"En la particion {numero} el modelo ha devuelto {crudas.size} predicciones "
-                f"para {pos_pru.size} fechas. '{nombre_prediccion}' debe devolver una "
-                "prediccion por fila."
-            )
-
         fechas = indice[pos_pru]
+        crudas = _prediccion_alineada(
+            getattr(ajustado, nombre_prediccion)(_subconjunto(X, pos_pru)),
+            fechas,
+            numero,
+            nombre_prediccion,
+            isinstance(X, (pd.DataFrame, pd.Series)),
+        )
+
         observados = valores_y[pos_pru]
         predicciones.append(pd.Series(crudas, index=fechas))
         reales.append(pd.Series(observados, index=fechas))

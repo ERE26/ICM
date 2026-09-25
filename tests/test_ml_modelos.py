@@ -294,7 +294,10 @@ def test_con_ruido_puro_los_arboles_quedan_por_detras_de_la_referencia(particion
 @pytest.mark.parametrize("nombre", ["ridge", "arbol_potenciado"])
 def test_la_importancia_senala_la_unica_variable_relevante(nombre, datos_una_variable):
     X, y = datos_una_variable
-    importancia = importancia_variables(crear_modelo(nombre), X, y, n_repeticiones=5)
+    with pytest.warns(UserWarning, match="DENTRO de muestra"):
+        importancia = importancia_variables(
+            crear_modelo(nombre), X, y, n_repeticiones=5, dentro_de_muestra=True
+        )
 
     assert list(importancia.index) == sorted(importancia.index, key=lambda c: -importancia[c])
     assert importancia.index[0] == "v2"
@@ -307,11 +310,65 @@ def test_la_importancia_senala_la_unica_variable_relevante(nombre, datos_una_var
 def test_la_importancia_de_la_referencia_es_nula(datos_una_variable):
     """Quien predice siempre cero no usa ninguna variable, y se nota."""
     X, y = datos_una_variable
-    importancia = importancia_variables(
-        crear_modelo(NOMBRE_REFERENCIA), X, y, n_repeticiones=3
-    )
+    with pytest.warns(UserWarning, match="DENTRO de muestra"):
+        importancia = importancia_variables(
+            crear_modelo(NOMBRE_REFERENCIA), X, y, n_repeticiones=3, dentro_de_muestra=True
+        )
 
     assert (importancia.abs() < 1e-12).all()
+
+
+def test_la_importancia_exige_un_modelo_ya_ajustado(datos_una_variable):
+    """Ajustar aqui y permutar aqui mide memoria, no capacidad predictiva.
+
+    Era la via silenciosa, y la que usaba el notebook. Sigue disponible, pero hay
+    que pedirla por su nombre; cuanto se infla esta medido en
+    :func:`test_sobre_ruido_puro_la_importancia_dentro_de_muestra_se_infla`.
+    """
+    X, y = datos_una_variable
+    with pytest.raises(ErrorDatos, match="sin ajustar"):
+        importancia_variables(crear_modelo("arbol_potenciado"), X, y, n_repeticiones=2)
+
+
+def test_la_importancia_dentro_de_muestra_va_marcada_en_attrs(datos_una_variable):
+    """La marca viaja con la cifra: un grafico no puede confundir las dos medidas."""
+    X, y = datos_una_variable
+    with pytest.warns(UserWarning, match="DENTRO de muestra"):
+        dentro = importancia_variables(
+            crear_modelo("ridge"), X, y, n_repeticiones=2, dentro_de_muestra=True
+        )
+
+    assert dentro.attrs["dentro_de_muestra"] is True
+
+    modelo = crear_modelo("ridge")
+    ajustar_y_predecir(modelo, X.iloc[:200], y.iloc[:200], X.iloc[200:])
+    fuera = importancia_variables(modelo, X.iloc[200:], y.iloc[200:], n_repeticiones=2)
+
+    assert fuera.attrs["dentro_de_muestra"] is False
+
+
+def test_sobre_ruido_puro_la_importancia_dentro_de_muestra_se_infla():
+    """El numero que justifica el arreglo, con la respuesta correcta conocida.
+
+    Con ``X`` e ``y`` independientes la importancia verdadera de cada variable
+    es cero. Medida dentro de muestra, la variable **menos** importante del
+    arbol potenciado supera a la mas importante medida como se debe: la cifra
+    que se publicaba como "que mira el modelo" no ordenaba variables, ordenaba
+    memoria.
+    """
+    X, y = datos_ruido(0, n_variables=4)
+    with pytest.warns(UserWarning, match="DENTRO de muestra"):
+        dentro = importancia_variables(
+            crear_modelo("arbol_potenciado"), X, y, n_repeticiones=3, dentro_de_muestra=True
+        )
+
+    modelo = crear_modelo("arbol_potenciado")
+    ajustar_y_predecir(modelo, X.iloc[:CORTE], y.iloc[:CORTE], X.iloc[CORTE:])
+    fuera = importancia_variables(modelo, X.iloc[CORTE:], y.iloc[CORTE:], n_repeticiones=3)
+
+    assert dentro.min() > 0.2
+    assert fuera.max() < 0.2
+    assert dentro.min() > fuera.max()
 
 
 def test_la_importancia_admite_un_modelo_ya_ajustado(datos_una_variable):
@@ -360,6 +417,36 @@ def test_columnas_en_otro_orden_lanza_error_datos(datos_lineales):
             X.iloc[:CORTE],
             y.iloc[:CORTE],
             X.iloc[CORTE:, ::-1],
+        )
+
+
+def test_el_objetivo_en_un_dataframe_no_desactiva_el_guardian(datos_lineales):
+    """``df[["col"]]`` en lugar de ``df["col"]`` desarmaba la comprobacion.
+
+    El guardian solo miraba los indices cuando 'y' era una ``Series``, asi que el
+    descuido mas comun de todos (una columna seleccionada con doble corchete)
+    permitia ajustar con el objetivo de otro periodo sin un solo aviso y con la
+    relacion real borrada de los coeficientes.
+    """
+    X, y = datos_lineales
+    X_corto = X.iloc[:CORTE]
+    y_otro_periodo = y.iloc[50 : 50 + CORTE]
+
+    with pytest.raises(ErrorDatos, match="indices distintos"):
+        ajustar_y_predecir(
+            crear_modelo("ridge"), X_corto, y_otro_periodo.to_frame(), X.iloc[CORTE:]
+        )
+
+
+def test_el_objetivo_debe_ser_unidimensional(datos_lineales):
+    """Aun bien alineado, un objetivo de dos dimensiones no es un objetivo."""
+    X, y = datos_lineales
+    with pytest.raises(ErrorDatos, match="unidimensional"):
+        ajustar_y_predecir(
+            crear_modelo("ridge"),
+            X.iloc[:CORTE],
+            y.iloc[:CORTE].to_frame(),
+            X.iloc[CORTE:],
         )
 
 
@@ -418,6 +505,77 @@ def test_la_busqueda_elige_el_alpha_con_sentido(datos_lineales, particion):
     # El diccionario esta en los nombres que acepta crear_modelo, sin el prefijo
     # del paso del Pipeline: encadenar las dos llamadas es el uso previsto.
     assert crear_modelo("ridge", **mejores)[PASO_MODELO].alpha == 1e-6
+
+
+def test_la_busqueda_no_puntua_sobre_los_tramos_de_prueba(datos_lineales, particion):
+    """El fallo clasico: elegir hiperparametros mirando el conjunto de prueba.
+
+    Se altera 'y' **solo** en las posiciones que ningun tramo de entrenamiento
+    de la particion usa, es decir en lo que despues se reporta como fuera de
+    muestra. Si la eleccion cambia, la busqueda estaba puntuando ahi. Con el
+    codigo anterior el ``alpha`` elegido saltaba de 1e-06 a 1e+06.
+    """
+    X, y = datos_lineales
+    tramos = list(particion.dividir(X))
+    posiciones_entrenamiento = np.unique(np.concatenate([ent for ent, _ in tramos]))
+    solo_prueba = np.setdiff1d(
+        np.concatenate([pru for _, pru in tramos]), posiciones_entrenamiento
+    )
+    assert solo_prueba.size > 0
+
+    y_alterado = y.copy()
+    y_alterado.iloc[solo_prueba] = -3.0 * y.iloc[solo_prueba]
+    # El tramo con el que se entrena es identico: lo unico que ha cambiado es el
+    # dato sobre el que se informa.
+    assert np.allclose(
+        y_alterado.to_numpy()[posiciones_entrenamiento],
+        y.to_numpy()[posiciones_entrenamiento],
+    )
+
+    rejilla = {"alpha": [1e-6, 1e6]}
+    base = buscar_hiperparametros("ridge", X, y, rejilla=rejilla, particion=particion)
+    alterada = buscar_hiperparametros(
+        "ridge", X, y_alterado, rejilla=rejilla, particion=particion
+    )
+
+    assert alterada == base == {"alpha": 1e-6}
+
+
+def test_la_busqueda_solo_mira_las_fechas_previas_al_primer_tramo_de_prueba(
+    datos_lineales, particion
+):
+    """Version fuerte de lo mismo: nada a partir del primer corte puede influir."""
+    X, y = datos_lineales
+    fin_entrenamiento_inicial = int(list(particion.dividir(X))[0][0][-1]) + 1
+
+    y_alterado = y.copy()
+    y_alterado.iloc[fin_entrenamiento_inicial:] = 0.0
+    rejilla = {"alpha": [1e-6, 1e6]}
+
+    assert buscar_hiperparametros(
+        "ridge", X, y_alterado, rejilla=rejilla, particion=particion
+    ) == buscar_hiperparametros("ridge", X, y, rejilla=rejilla, particion=particion)
+
+
+def test_la_busqueda_avisa_si_no_queda_historia_antes_del_primer_tramo(datos_lineales):
+    """Sin tramo de seleccion no hay eleccion honesta posible, y hay que decirlo.
+
+    Un embargo de 250 observaciones deja 100 filas antes del primer tramo de
+    prueba, y dentro de esas 100 el mismo embargo no permite ni una particion
+    interna. Antes la busqueda seguia adelante puntuando sobre el tramo que
+    despues se reporta.
+    """
+    X, y = datos_lineales
+    apretada = ParticionWalkForward(
+        n_particiones=1,
+        tamano_prueba=50,
+        tamano_entrenamiento_minimo=100,
+        embargo=250,
+    )
+    with pytest.raises(ErrorDatos, match="ni una sola particion interna"):
+        buscar_hiperparametros(
+            "ridge", X, y, rejilla={"alpha": [1e-6, 1e6]}, particion=apretada
+        )
 
 
 def test_la_busqueda_de_la_referencia_no_tiene_nada_que_elegir(datos_lineales, particion):
