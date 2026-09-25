@@ -307,7 +307,7 @@ def _metricas(
 
 
 def _exigir_entero(valor: Any, nombre: str) -> int:
-    """Exige que el parametro sea un numero entero de observaciones.
+    """Exige que el parametro de la particion sea un numero entero.
 
     Un valor fraccionario no falla al construir: se arrastra por la aritmetica
     de la disposicion, ``np.arange`` devuelve posiciones en coma flotante y el
@@ -327,7 +327,7 @@ def _exigir_entero(valor: Any, nombre: str) -> int:
     """
     if isinstance(valor, bool) or not isinstance(valor, (int, np.integer)):
         raise ErrorDatos(
-            f"'{nombre}' debe ser un numero entero de observaciones; se ha recibido "
+            f"'{nombre}' debe ser un numero entero; se ha recibido "
             f"{valor!r} ({type(valor).__name__}). Redondee al construir la particion, "
             f"con {nombre}=int(...) o round(...), para que la particion sea la que "
             "usted ha pedido: un valor fraccionario se arrastra hasta el indexado y "
