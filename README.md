@@ -1,18 +1,21 @@
-# ICM — Análisis de carteras y modelos de riesgo
+# ICM — Carteras, riesgo de mercado y trading de energía
 
-Librería en Python para construir carteras y medir su riesgo de mercado, con los
-datos de Yahoo Finance.
-
-El paquete se organiza en tres capas independientes: de dónde vienen los datos,
-qué se hace con ellos y cuánto se puede perder.
+Librería en Python para tres cosas: construir carteras, medir su riesgo de
+mercado y aplicar aprendizaje automático al trading de energía.
 
 ```
 src/icm/
-├── datos/      proveedores, caché en disco, simulador y transformaciones
+├── datos/      proveedores (Yahoo, tus ficheros), caché y simulador
 ├── cartera/    métricas, optimización y frontera eficiente
 ├── riesgo/     VaR, ES, volatilidad condicional, simulación, cópulas y backtesting
+├── energia/    spreads de generación, curvas de futuros y estacionalidad
+├── ml/         variables, validación temporal, modelos, redes y estrategias
 └── graficos.py gráficos para los notebooks (opcional, requiere matplotlib)
 ```
+
+Cada capa habla con la anterior a través de una interfaz estable, así que se
+pueden usar por separado: el VaR no necesita PyTorch y la estrategia de trading
+reutiliza tal cual las medidas de riesgo.
 
 ## Instalación
 
@@ -161,6 +164,87 @@ from icm.riesgo import comparar_metodos_var
 comparar_metodos_var(cartera, nivel=0.99, ventana=250)
 ```
 
+### `icm.energia` — el mercado que no se comporta como una bolsa
+
+La energía tiene tres rasgos que ninguna acción tiene: revierte a una media que
+se mueve con las estaciones, da saltos bruscos al alza cuando el sistema se
+tensiona, y depende de variables físicas observables.
+
+**`spreads`** — Lo que de verdad se negocia. Una central de ciclo combinado no
+gana con el precio de la luz ni con el del gas, sino con la diferencia:
+
+```python
+from icm.energia import PLANTAS, spark_spread_limpio, valor_opcionalidad
+
+planta = PLANTAS["ciclo_combinado"]
+margen = spark_spread_limpio(precio_luz, precio_gas, precio_co2,
+                             planta.eficiencia, planta.factor_emision)
+valor_opcionalidad(margen)   # la planta puede parar: eso es una opción
+```
+
+Para producir 1 MWh eléctrico hacen falta `1/eficiencia` MWh térmicos, así que se
+**divide** por la eficiencia. Multiplicar es el error clásico. Y valorar la planta
+como si produjese siempre la infravalora: por Jensen, el derecho a parar cuando
+el margen es negativo vale dinero.
+
+**`curvas`** — El rolado de futuros, que casi siempre se ignora. Al vencer un
+contrato y pasar al siguiente, el salto de precio **no es un rendimiento**, es un
+artefacto. Medido en los tests: con un escalón del 10 % entre contratos,
+encadenar sin ajustar inventa un rendimiento del 11,1 % el día del roll cuando la
+posición rindió un 0,2 %.
+
+```python
+from icm.energia import serie_continua, rendimiento_roll, descomponer_rendimiento
+
+continua = serie_continua(contratos, vencimientos, metodo="ratio", dias_antes=5)
+descomponer_rendimiento(continua)   # separa el precio del carry
+```
+
+**`simulacion`** y **`estacionalidad`** — Escenarios sintéticos con señal
+predecible real, para trabajar sin acceso a los mercados, y descomposición
+estacional con contraste de Kruskal-Wallis.
+
+### `icm.ml` — aprendizaje automático aplicado al trading
+
+```python
+from icm.ml import (construir_matriz, comprobar_ausencia_de_fuga,
+                    ParticionWalkForward, comparar_modelos,
+                    ejecutar_estrategia, coste_de_equilibrio)
+
+datos = construir_matriz(precios, "TTF", horizonte=1, exogenas=exogenas)
+comprobar_ausencia_de_fuga(construir_matriz, precios, "TTF", exogenas=exogenas)
+
+tabla, predicciones = comparar_modelos(datos.X, datos.y,
+                                       ["media_cero", "ridge", "arbol_potenciado"],
+                                       ParticionWalkForward(n_particiones=5, embargo=1))
+estrategia = ejecutar_estrategia(predicciones["ridge"], datos.y, coste_bps=2.0)
+coste_de_equilibrio(predicciones["ridge"], datos.y)   # cuánta fricción aguanta
+```
+
+Cuatro decisiones de diseño que son el motivo de que el módulo exista:
+
+**La garantía de no mirar al futuro es comprobable.**
+`comprobar_ausencia_de_fuga` reconstruye la matriz alterando los datos
+posteriores a una fecha y verifica que ninguna variable de esa fecha cambia. No
+es un comentario prometiendo cuidado, es un contraste que falla si hay fuga.
+
+**Las particiones van hacia delante, con embargo.** La validación cruzada al azar
+entrena con el futuro. Con un objetivo a *h* días, las últimas *h* observaciones
+del entrenamiento se solapan con la prueba, y descartarlas cuesta muy poco.
+
+**Toda medida está anclada a una referencia.** `media_cero` predice siempre cero y
+es un estimador más, para que entre en la misma validación. El MASE dice si un
+modelo la bate, y el contraste de Diebold-Mariano, si esa diferencia es real o
+ruido muestral.
+
+**La convención de fechas viaja con los datos.** `objetivo_rendimiento_futuro`
+devuelve una serie adelantada y lo marca en `attrs`; `ejecutar_estrategia` lo lee
+y se niega a desplazarla dos veces. Medido: el doble desplazamiento convertía un
+Sharpe de +2,6 en −0,5 sin dar ningún aviso.
+
+Las redes (`icm.ml.redes`: LSTM, GRU y convolucional temporal) importan PyTorch
+de forma diferida, así que el resto funciona sin instalarlo.
+
 ### `icm.graficos` — los gráficos (opcional)
 
 Módulo aparte que sólo se usa desde los notebooks; el resto de la librería no lo
@@ -186,16 +270,22 @@ crítico) están reservados y nunca se usan como una serie más.
 | Notebook | Contenido |
 |---|---|
 | `notebooks/01_analisis_carteras.ipynb` | métricas, optimización, frontera eficiente y contribuciones al riesgo |
+| `notebooks/03_trading_energia_ml.ipynb` | spark spread, señal predecible, validación temporal, modelos y redes, y el paso del error al dinero |
 | `notebooks/02_modelos_riesgo.ipynb` | VaR y ES comparados, GARCH, Monte Carlo, cópulas y backtesting |
 
-Ambos intentan descargar datos reales y, si no hay salida a internet, **pasan
-automáticamente a datos simulados avisando de ello por pantalla**. Así se pueden
-ejecutar en cualquier entorno, pero las conclusiones sólo valen con datos reales.
+Los dos primeros intentan descargar datos reales y, si no hay salida a internet,
+**pasan automáticamente a datos simulados avisando de ello por pantalla**. El
+tercero trabaja siempre sobre el escenario simulado de `icm.energia`, porque los
+precios que necesita (TTF, MIBGAS, OMIE) no tienen feed gratuito.
 
 > Los notebooks se guardaron ejecutados **con datos simulados**, porque el entorno
 > donde se generaron no tenía acceso a Yahoo Finance. Las cifras que se ven sirven
 > para seguir el razonamiento; vuelve a ejecutarlos con conexión para obtener las
 > tuyas.
+
+Y una advertencia que vale la pena repetir sobre el tercero: **el simulador tiene
+la señal que se le puso**. Que un modelo la encuentre demuestra que el pipeline
+funciona, no que el método gane dinero en el mercado.
 
 ```bash
 jupyter lab notebooks/
@@ -257,6 +347,44 @@ rompen sin aviso, así que la librería no los usa. Si interesan sus gráficos, 
 razonable es su widget embebido o la librería `lightweight-charts`, alimentados con
 los datos que produce este paquete.
 
+**Mercados de energía europeos.** Ni TTF, ni MIBGAS, ni el pool eléctrico de OMIE
+tienen feed gratuito en Yahoo. `icm.energia.activos_sin_yahoo()` los enumera. Se
+descargan del propio MIBGAS, de ESIOS (el portal del operador del sistema
+español) o de ENTSO-E, y se cargan con `cargar_precios_fichero`. Lo que sí está en
+Yahoo son los futuros de crudo (`CL=F`, `BZ=F`), el gas Henry Hub (`NG=F`) y los
+ETF sectoriales.
+
+## Dos resultados que salieron de este proyecto
+
+No son opiniones: están medidos, y los reproduce el tercer notebook.
+
+**1. En energía, la señal está en las previsiones publicadas, no en el historial
+de precios.** Las variables físicas afectan al precio de forma contemporánea, así
+que el frío de hoy no anticipa el rendimiento de mañana:
+
+| Relación | r |
+|---|---|
+| Cambio de temperatura de hoy vs rendimiento de hoy | +0,25 |
+| Nivel de temperatura de hoy vs rendimiento de mañana | −0,03 (p=0,23) |
+| **Cambio previsto para mañana** vs rendimiento de mañana | **+0,20** |
+
+Y usar esa previsión no es mirar al futuro: el operador del sistema la publica
+antes de que cierre el mercado diario. Es la diferencia estructural con la renta
+variable, donde no existe un boletín oficial de lo que va a pasar mañana.
+
+**2. El error de predicción y el dinero ordenan los modelos de forma opuesta.**
+
+| Modelo | MASE (error) | Sharpe (dinero) | Coste de equilibrio |
+|---|---|---|---|
+| árbol potenciado | **1,06** (el mejor) | **−0,13** | 0 pb |
+| ridge | 1,24 | +2,63 | 64 pb |
+| lasso | 1,26 (el peor) | **+2,99** | 69 pb |
+
+La razón es algebraica, no anecdótica. Como
+`MSE(pred) = MSE(0) − 2·cov(pred, y) + var(pred)`, minimizar el error premia la
+prudencia en la magnitud; y una posición no cobra por la magnitud, cobra por el
+signo. Elegir modelo por el RMSE es elegir el que pierde dinero.
+
 ## Limitaciones conocidas
 
 - **Cornish-Fisher tiene un dominio de validez estrecho.** Es una expansión
@@ -268,6 +396,18 @@ los datos que produce este paquete.
 - El escalado de un VaR diario a horizontes largos usa la raíz del tiempo, que
   supone independencia entre días. Con volatilidad agrupada infravalora el riesgo
   más allá de unas dos semanas.
+- **El simulador de energía tiene la señal que se le puso.** Que un modelo la
+  encuentre valida el pipeline, no el método. Con datos reales los números serán
+  peores, y ese es el punto de partida honesto.
+- `valor_opcionalidad` modela el derecho a parar periodo a periodo, sin mínimos
+  técnicos, rampas ni tiempos mínimos de arranque. Es una cota superior del valor
+  real de una central; un modelo de despacho intertemporal es otra cosa.
+- El backtest de estrategias supone que se puede operar al precio de cierre y que
+  el tamaño de la posición no mueve el mercado. En un mercado de energía estrecho
+  ninguna de las dos cosas es cierta, y de ahí que `coste_de_equilibrio` sea la
+  cifra que conviene mirar antes que el Sharpe.
+- Las series de futuros necesitan rolado (`icm.energia.curvas`). Encadenar
+  contratos sin ajustar inventa rendimientos en cada vencimiento.
 - Las rentabilidades esperadas históricas son un estimador muy ruidoso. Por eso
   `minima_varianza`, que no las usa, suele comportarse mejor fuera de muestra que
   `maximo_sharpe`.
