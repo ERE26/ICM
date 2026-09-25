@@ -1,0 +1,138 @@
+{
+ "descargado": "2026-09-25",
+ "base": "https://raw.githubusercontent.com",
+ "ficheros": [
+  {
+   "fichero": "brent_diario.csv",
+   "descripcion": "Brent, contado diario, USD/barril",
+   "repo": "datasets/oil-prices",
+   "ruta_origen": "data/brent-daily.csv",
+   "columna_fecha": "Date",
+   "filas": 9092,
+   "desde": "1987-05-20",
+   "hasta": "2026-09-22",
+   "sha256_12": "3093708746e1"
+  },
+  {
+   "fichero": "wti_diario.csv",
+   "descripcion": "WTI, contado diario, USD/barril",
+   "repo": "datasets/oil-prices",
+   "ruta_origen": "data/wti-daily.csv",
+   "columna_fecha": "Date",
+   "filas": 9507,
+   "desde": "1986-01-02",
+   "hasta": "2026-09-22",
+   "sha256_12": "59c1fd18925d"
+  },
+  {
+   "fichero": "henryhub_diario.csv",
+   "descripcion": "Henry Hub, contado diario, USD/MMBtu",
+   "repo": "datasets/natural-gas",
+   "ruta_origen": "data/daily.csv",
+   "columna_fecha": "Date",
+   "filas": 5693,
+   "desde": "1997-01-07",
+   "hasta": "2026-09-22",
+   "sha256_12": "d847ae2f4ffe"
+  },
+  {
+   "fichero": "brent_mensual.csv",
+   "descripcion": "Brent, media mensual",
+   "repo": "datasets/oil-prices",
+   "ruta_origen": "data/brent-monthly.csv",
+   "columna_fecha": "Date",
+   "filas": 472,
+   "desde": "1987-05-15",
+   "hasta": "2026-08-15",
+   "sha256_12": "8c9b6f978333"
+  },
+  {
+   "fichero": "wti_mensual.csv",
+   "descripcion": "WTI, media mensual",
+   "repo": "datasets/oil-prices",
+   "ruta_origen": "data/wti-monthly.csv",
+   "columna_fecha": "Date",
+   "filas": 488,
+   "desde": "1986-01-15",
+   "hasta": "2026-08-15",
+   "sha256_12": "3fd154f0c6cb"
+  },
+  {
+   "fichero": "henryhub_mensual.csv",
+   "descripcion": "Henry Hub, media mensual",
+   "repo": "datasets/natural-gas",
+   "ruta_origen": "data/monthly.csv",
+   "columna_fecha": "Month",
+   "filas": 356,
+   "desde": "1997-01-01",
+   "hasta": "2026-08-01",
+   "sha256_12": "7a8b165c1788"
+  },
+  {
+   "fichero": "vix_diario.csv",
+   "descripcion": "VIX, OHLC diario",
+   "repo": "datasets/finance-vix",
+   "ruta_origen": "data/vix-daily.csv",
+   "columna_fecha": "DATE",
+   "filas": 9278,
+   "desde": "1990-01-02",
+   "hasta": "2026-09-22",
+   "sha256_12": "570e05630c9a"
+  },
+  {
+   "fichero": "sp500_mensual.csv",
+   "descripcion": "S&P 500 mensual con dividendos, BPA, IPC y PER10 (Shiller)",
+   "repo": "datasets/s-and-p-500",
+   "ruta_origen": "data/data.csv",
+   "columna_fecha": "Date",
+   "filas": 1868,
+   "desde": "1871-01-01",
+   "hasta": "2026-08-01",
+   "sha256_12": "ed6a0faf1864"
+  },
+  {
+   "fichero": "oro_mensual.csv",
+   "descripcion": "Oro, USD/onza, mensual",
+   "repo": "datasets/gold-prices",
+   "ruta_origen": "data/monthly.csv",
+   "columna_fecha": "Date",
+   "filas": 2324,
+   "desde": "1833-01-01",
+   "hasta": "2026-08-01",
+   "sha256_12": "6821c07f866d"
+  },
+  {
+   "fichero": "bono10a_mensual.csv",
+   "descripcion": "Bono EEUU 10 anios, rendimiento mensual",
+   "repo": "datasets/bond-yields-us-10y",
+   "ruta_origen": "data/monthly.csv",
+   "columna_fecha": "Date",
+   "filas": 880,
+   "desde": "1953-04-01",
+   "hasta": "2026-07-01",
+   "sha256_12": "2ce54ee17802"
+  },
+  {
+   "fichero": "eurusd_diario.csv",
+   "descripcion": "USD por EUR, diario (filtrado de daily.csv)",
+   "repo": "datasets/exchange-rates",
+   "ruta_origen": "data/daily.csv",
+   "columna_fecha": "Date",
+   "filas": 7230,
+   "desde": "1999-01-04",
+   "hasta": "2026-09-18",
+   "sha256_12": "9e280433df76"
+  },
+  {
+   "fichero": "tiempo_diario.csv",
+   "descripcion": "Tiempo diario Seattle y Nueva York: temp_max, temp_min, viento",
+   "repo": "vega/vega-datasets",
+   "ruta_origen": "data/weather.csv",
+   "columna_fecha": "date",
+   "filas": 2922,
+   "desde": "2012-01-01",
+   "hasta": "2015-12-31",
+   "sha256_12": "27219f1ca8db"
+  }
+ ]
+}
