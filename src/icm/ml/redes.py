@@ -441,7 +441,23 @@ def _validar_indice_temporal(indice: pd.Index, nombre: str) -> None:
     :func:`_como_marco`, que siempre pasa las dos comprobaciones: ahi el orden
     de las filas es la unica nocion de tiempo disponible y se toma como valida,
     igual que en :func:`icm.ml.validacion._indice_temporal`.
+
+    Un ``MultiIndex`` de panel se rechaza aparte, porque burla las dos
+    comprobaciones sin dejar de romper lo que protegen: los pares
+    ``(fecha, activo)`` son unicos y crecientes aunque cada fecha se repita una
+    vez por activo. Una ventana por posicion sobre esa tabla no recorre la
+    historia de un activo, sino filas alternas de todos: con tres activos, una
+    ventana de 5 mezcla dos fechas de cada uno. :mod:`icm.ml.validacion` ya
+    rechazaba este caso, y que un modulo lo aceptara y el otro no era la
+    incoherencia mas facil de aprovechar por descuido.
     """
+    if isinstance(indice, pd.MultiIndex):
+        raise ErrorDatos(
+            f"El indice de '{nombre}' es un MultiIndex y esta red no sabe de paneles: "
+            "construye la ventana por posicion, asi que cada muestra mezclaria filas de "
+            "activos distintos como si fuesen la historia de uno solo. Ajuste una red por "
+            "activo, o aplane el panel a una sola serie por fecha."
+        )
     if indice.has_duplicates:
         repetidas = [str(f) for f in indice[indice.duplicated()].unique()[:3]]
         raise ErrorDatos(

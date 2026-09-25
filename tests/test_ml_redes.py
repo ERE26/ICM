@@ -729,3 +729,49 @@ def test_una_tcn_que_no_cubre_la_ventana_avisa_del_alcance_efectivo() -> None:
         warnings.simplefilter("error")
         ConfiguracionRed(arquitectura="tcn", ventana=30, capas=5)
         ConfiguracionRed(arquitectura="lstm", ventana=30, capas=1)
+
+
+def test_un_panel_con_multiindex_se_rechaza_igual_que_en_la_validacion() -> None:
+    """La misma coherencia que ya exige `icm.ml.validacion`.
+
+    Un MultiIndex de panel burla las dos comprobaciones del indice: los pares
+    (fecha, activo) son unicos y crecientes aunque cada fecha se repita una vez
+    por activo. Pero la ventana se construye por posicion, asi que no recorre
+    la historia de un activo sino filas alternas de todos. Con tres activos,
+    una ventana de cinco mezcla dos fechas de cada uno.
+
+    Que un modulo del paquete lo rechazase y el otro lo aceptase era la
+    incoherencia mas facil de aprovechar por descuido.
+    """
+    generador = np.random.default_rng(0)
+    fechas = pd.bdate_range("2019-01-01", periods=60)
+    indice = pd.MultiIndex.from_product([fechas, ["A", "B", "C"]],
+                                        names=["fecha", "activo"])
+    X = pd.DataFrame(generador.standard_normal((len(indice), 2)), index=indice)
+    y = pd.Series(generador.standard_normal(len(indice)), index=indice)
+
+    # Burla las dos comprobaciones existentes, que es el motivo de que haga
+    # falta una tercera.
+    assert indice.is_monotonic_increasing and not indice.has_duplicates
+
+    red = RedSecuencial(ConfiguracionRed(ventana=5, unidades=8, epocas=2, semilla=1))
+    with pytest.raises(ErrorDatos, match="MultiIndex"):
+        red.ajustar(X, y)
+
+
+def test_predecir_tambien_rechaza_el_panel() -> None:
+    """`predecir` sufre lo mismo por su cuenta, aunque el ajuste fuese limpio."""
+    generador = np.random.default_rng(1)
+    X, y = _datos_suma_ventana(n=120, ventana=4)
+    red = RedSecuencial(
+        ConfiguracionRed(ventana=4, unidades=8, epocas=2, paciencia=2, semilla=1)
+    ).ajustar(X, y)
+
+    fechas = pd.bdate_range("2021-01-01", periods=40)
+    indice = pd.MultiIndex.from_product([fechas, ["A", "B"]], names=["fecha", "activo"])
+    panel = pd.DataFrame(
+        generador.standard_normal((len(indice), X.shape[1])),
+        index=indice, columns=X.columns,
+    )
+    with pytest.raises(ErrorDatos, match="MultiIndex"):
+        red.predecir(panel)
