@@ -295,3 +295,98 @@ def test_el_diagnostico_del_es_falla_sin_excepciones(serie_larga):
     enorme = serie_var_movil(serie_larga, 0.99, 250, "historico") * 100
     with pytest.raises(ErrorDatos, match="ninguna excepcion"):
         diagnostico_es(serie_larga, enorme, es_estimado=enorme)
+
+
+# --- lo que la segunda revision adversarial encontro ---------------------------
+
+
+def test_los_p_valores_no_colapsan_a_cero():
+    # '1 - chi2.cdf' agota la precision del flotante y devuelve 0,0 exacto a
+    # partir de un estadistico de unos 75. Un p-valor de cero exacto no es un
+    # p-valor, y ademas impide distinguir un rechazo claro de uno aplastante.
+    fallos = np.zeros(400, dtype=int)
+    fallos[100:140] = 1  # racha larga: los dos contrastes se van muy arriba
+    serie = pd.Series(fallos, index=pd.bdate_range("2024-01-01", periods=400))
+
+    for resultado in (
+        contraste_kupiec(serie, 0.99),
+        contraste_christoffersen_independencia(serie),
+        contraste_christoffersen_condicional(serie, 0.99),
+    ):
+        assert resultado["estadistico_lr"] > 75.0
+        assert resultado["p_valor"] > 0.0
+        assert resultado["p_valor"] < 1e-15
+        assert resultado["rechaza_al_5pct"]
+
+
+def test_la_independencia_exige_orden_cronologico():
+    # El contraste cuenta transiciones de un dia al siguiente sobre la
+    # secuencia que recibe, asi que el orden ES el dato: con las mismas 12
+    # excepciones agrupadas, barajar el indice llevaba el estadistico de 76,38
+    # (rechaza) a 0,37 (no rechaza).
+    fallos = np.zeros(250, dtype=int)
+    fallos[100:112] = 1
+    serie = pd.Series(fallos, index=pd.bdate_range("2024-01-01", periods=250))
+
+    ordenado = contraste_christoffersen_independencia(serie)
+    assert ordenado["estadistico_lr"] > 70.0
+    assert ordenado["rechaza_al_5pct"]
+
+    with pytest.raises(ErrorDatos, match="no esta ordenada"):
+        contraste_christoffersen_independencia(serie.sample(frac=1.0, random_state=3))
+
+
+def test_kupiec_no_acepta_una_serie_que_no_sea_de_excepciones():
+    # 'asarray(dtype=int)' truncaba hacia cero, asi que una serie de
+    # rendimientos pasada por error se convertia en ceros y colaba como
+    # "ninguna excepcion", con su Kupiec y todo.
+    with pytest.raises(ErrorDatos, match="solo pueden valer 0 o 1"):
+        contraste_kupiec(pd.Series([0.01, -0.02, 0.005]), 0.99)
+    # A Kupiec el orden le da igual porque solo cuenta.
+    fallos = pd.Series([0, 1, 0, 0, 1], index=pd.bdate_range("2024-01-01", periods=5))
+    assert contraste_kupiec(fallos.sample(frac=1.0, random_state=1), 0.99)["excepciones"] == 2.0
+
+
+def test_el_recargo_de_basilea_solo_se_da_en_su_ventana_de_250_dias():
+    # La zona la calcula la binomial y vale para cualquier ventana, pero el
+    # recargo es la tabla del Comite para 250 sesiones. Antes se leia esa
+    # tabla pasase lo que pasase, con un get(..., 0.85) que devolvia el tope
+    # para cualquier recuento no tabulado: con 500 observaciones y 12
+    # excepciones daba 0,85 con aspecto de cifra regulatoria.
+    normativa = zona_basilea(9, 250, 0.99)
+    assert normativa["zona"] == "amarilla"
+    assert normativa["recargo_multiplicador"] == pytest.approx(0.85)
+    assert normativa["recargo_aplicable"]
+
+    fuera = zona_basilea(12, 500, 0.99)
+    assert fuera["zona"] == "amarilla"  # la binomial sigue diciendo amarilla
+    assert np.isnan(fuera["recargo_multiplicador"])
+    assert not fuera["recargo_aplicable"]
+
+    # Verde y roja si tienen recargo definido para cualquier ventana.
+    assert zona_basilea(5, 1000, 0.99)["recargo_aplicable"]
+    assert zona_basilea(40, 500, 0.99)["recargo_multiplicador"] == pytest.approx(1.00)
+
+
+def test_basilea_rechaza_recuentos_imposibles():
+    with pytest.raises(ErrorDatos, match="No puede haber"):
+        zona_basilea(300, 250, 0.99)
+    with pytest.raises(ErrorDatos, match="imposibles"):
+        zona_basilea(-1, 250, 0.99)
+
+
+def test_cornish_fisher_ya_no_avisa_en_la_mitad_de_las_ventanas():
+    # Con el criterio global, cualquier serie -- incluida una normal -- salia
+    # fuera de dominio en mas de la mitad de las ventanas, porque basta una
+    # curtosis de exceso negativa por minima que sea.
+    import warnings as _warnings
+
+    serie = pd.Series(
+        np.random.default_rng(4).standard_normal(700) * 0.01,
+        index=pd.bdate_range("2022-01-03", periods=700),
+    )
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", UserWarning)
+        var_movil = serie_var_movil(serie, 0.99, 250, "cornish_fisher")
+    assert len(var_movil) == 450
+    assert (var_movil > 0).all()

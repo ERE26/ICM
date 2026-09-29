@@ -438,3 +438,173 @@ referencia con `mode="wrap"` y comparaba con `<=`, así que la cumplían por
 igual la implementación circular y la que no lo es: el conjunto envolvente
 contiene al otro. Ahora separa las ventanas que cruzan el final y **exige que
 salgan**, que es justo lo que el muestreo no circular no puede producir.
+
+---
+
+## Estado: VaR y backtesting, cerrados
+
+Septiembre de 2026. `riesgo/var.py` y `backtesting.py`. Como en el bloque
+anterior, cada cifra está reproducida con un script y las pruebas nuevas se
+pasaron antes contra el código viejo: **24 de las 28 fallan**.
+
+### El hallazgo que el revisor no vio, y que era el más grave
+
+**El criterio de dominio de Cornish-Fisher rechazaba el 57 % de las muestras
+normales.** El revisor había anotado que
+`test_no_se_avisa_con_datos_normales` «pasa por suerte de la semilla; con 4 de
+las 8 primeras fallaría». Es cierto, pero la conclusión no era que la prueba
+fuese débil: era que **el código estaba mal**.
+
+`dominio_valido_cornish_fisher` aplicaba el criterio de Maillard en su versión
+global —que la derivada del polinomio sea positiva en *toda* la recta—, y esa
+condición exige `a = k/8 − s²/6 ≥ 0`. Con asimetría cercana a cero eso se
+reduce a exigir **curtosis de exceso no negativa**, y la mitad de las muestras
+normales tienen curtosis muestral negativa. Medido sobre 2 000 muestras:
+
+| Tamaño de la muestra | Muestras normales rechazadas |
+|---|---:|
+| 250 | **57,2 %** |
+| 1 000 | 53,3 % |
+| 2 000 | 54,2 % |
+
+Y las rechazaba por nada. Con `s = 0` y `k = −0,02`, la monotonía se rompe en
+`|z| = 20`; el VaR al 99,99 % vive en `z = −3,72` y el punto más extremo que
+toca el ES integrado con 1 000 tramos está en `z = −4,42`. El aviso decía
+literalmente «la expansión deja de ser monótona» de una expansión que era
+monótona en todo el rango utilizable.
+
+Ahora el criterio se evalúa **en el tramo que cada función usa**:
+`var_cornish_fisher` comprueba de la mediana al cuantil de su nivel,
+`es_cornish_fisher` hasta el extremo de la cola que integra, y
+`_var_movil_cornish_fisher` lo mismo que el VaR. El criterio global sigue
+disponible sin argumentos de rango, documentado como la pregunta matemática
+que es. La tasa de falsas alarmas sobre muestras normales pasa de **57 % a
+0,0 %**, y lo que hay que rechazar se sigue rechazando: `(−1,2, 29,0)` es
+inválido, y `k = −0,5` también lo es dentro del rango del ES, porque ahí la
+monotonía se rompe de verdad en `z = −4,1`.
+
+### El VaR histórico: el revisor tenía razón, y también le faltaba una mitad
+
+Confirmado de forma independiente. `np.quantile` interpola por omisión
+(`linear`) y **siempre cae del lado menos extremo**: con 250 observaciones al
+99 % el índice es `0,01 × 249 = 2,49`, un punto entre el tercer y el cuarto
+peor día en lugar del tercero. Sobre 30 000 normales iid con ventana móvil de
+250:
+
+| Definición del cuantil | Excepciones | Tasa | Kupiec p | VaR medio |
+|---|---:|---:|---:|---:|
+| `linear` (la que había) | 401 | 1,348 % | 1,0e−08 | 0,022809 |
+| `inverted_cdf` (la empírica) | 348 | 1,170 % | 0,0042 | 0,023488 |
+| `higher` | 482 | 1,620 % | 5,9e−23 | 0,022102 |
+
+El VaR salía un **2,9 %** por debajo (el revisor dijo 3,1 %, con otra
+muestra). Corregido a `inverted_cdf`, que es la definición de la función de
+cuantiles empírica: `Q(p) = inf{x : F(x) ≥ p}`.
+
+**Pero el 0,0042 sigue rechazando, y eso ya no es un defecto del código.** Con
+250 observaciones el cuantil al 99 % *es* el tercer peor día, cuya
+probabilidad de ser superado es `3/251 = 1,1952 %`. La tasa medida es 1,170 %:
+coincide. Ese exceso es una propiedad de la ventana, no del estimador, y se
+quita alargando la ventana o bajando el nivel. El hallazgo del revisor
+concluía «el usuario concluye que su modelo está roto cuando lo roto es el
+estimador»; la mitad que faltaba es que, arreglado el estimador, **una parte
+del rechazo se queda**, y confundir las dos cosas llevaría a seguir buscando
+un fallo que no existe. Está escrito en el docstring.
+
+### El resto, por orden de daño
+
+| | Antes | Ahora |
+|---|---|---|
+| VaR anual por raíz del tiempo con deriva del 0,05 % diario | 0,3614 (**+48,5 %**) | 0,2433 |
+| `es_parametrico(..., "t")` con t de 0,8 grados | ES = **−3,0654** con VaR = +0,6194 | `ErrorDatos` |
+| p-valor con LR = 75 | **0,0 exacto** | 4,7e−18 |
+| Christoffersen con el índice barajado | LR 76,38 → **0,37**, p 0,0000 → 0,5422 | `ErrorDatos` |
+| Kupiec con una serie de rendimientos | «ninguna excepción» | `ErrorDatos` |
+| Recargo de Basilea con 500 obs. y 12 excepciones | **0,85**, con aspecto regulatorio | `NaN` + `recargo_aplicable=False` |
+| `_momentos` con 2 observaciones | asimetría 0,0 y curtosis −2,0 *siempre* | `ErrorDatos` |
+| ES de Cornish-Fisher, 1 000 tramos | −0,043 % (integral por la derecha) | −0,003 % (punto medio) |
+
+**La raíz del tiempo sobre la media.** Un VaR es `−(μ + σz)`. A T días la media
+se acumula linealmente y la desviación típica con la raíz, así que el VaR
+correcto es `−(Tμ + √T σz)`, no `√T` veces el diario. `escalar_horizonte`
+acepta ahora `media_diaria`, aplica `√T (VaR₁ + μ) − Tμ` —que con `μ = 0` se
+reduce a la regla de siempre— y `var_anualizado` le pasa la media de la
+muestra. El error era del +4,99 % a 10 días y del +48,53 % a un año. El
+docstring advertía del error contrario.
+
+**El ES de la t sin grados de libertad.** La fórmula cerrada divide entre
+`gl − 1` sin comprobarlo. Con una muestra de una t de 0,8 grados el ajuste da
+0,832 y el ES sale **negativo** con un VaR positivo: un ES menor que el VaR es
+imposible por definición, porque es una media de pérdidas que ya superan el
+VaR. Por debajo de un grado de libertad la t no tiene media y el ES
+simplemente no existe, así que ahora es un error; por debajo de dos no tiene
+varianza, y eso es un aviso.
+
+**Los p-valores.** `1 − chi2.cdf` agota la precisión del flotante y devuelve
+0,0 exacto a partir de LR ≈ 75. Con `chi2.sf`, LR = 75 da 4,7e−18 y LR = 200
+da 2,1e−45. Un cero exacto no es un p-valor, y además impide distinguir un
+rechazo claro de uno aplastante.
+
+**El orden en Christoffersen.** La corrección anterior puso `excepciones` a
+devolver en orden cronológico, pero nada impedía llamar al contraste
+directamente con un marco sin ordenar: el contraste cuenta transiciones de un
+día al siguiente sobre la secuencia que recibe, así que **el orden es el
+dato**. Con las mismas 12 excepciones agrupadas en una racha, barajar el
+índice llevaba el estadístico de 76,38 (rechaza) a 0,37 (no rechaza). Ahora se
+exige índice monótono, y de paso se comprueba que los valores sean 0 o 1:
+`asarray(dtype=int)` truncaba hacia cero, así que una serie de rendimientos
+pasada por error se convertía en un vector de ceros y colaba como «ninguna
+excepción», con su Kupiec y todo.
+
+### Donde el revisor volvió a equivocarse
+
+**El ES histórico no tenía el problema del cuantil.** El hallazgo era sobre
+`var.py:33`, pero merecía comprobar si arrastraba a `es_historico`. No: con
+30 000 observaciones al 99 %, `linear` e `inverted_cdf` dan umbrales distintos
+(−0,023611 y −0,023660) pero **la misma cola de 300 observaciones y el mismo
+ES hasta el sexto decimal**, porque el umbral cae entre dos observaciones y el
+corte `<= umbral` no cambia de lado. Se ha corregido de todas formas por
+coherencia, pero no era un hallazgo.
+
+**`var_incremental` tampoco lo era.** Renormaliza los pesos restantes, lo que
+en principio podría hacer que quitar un activo pequeño *subiera* el VaR por
+reapalancamiento. Medido con `{A: 0,90, B: 0,05, C: 0,05}` sobre 1 000
+sesiones, no pasa: quitar B da −0,00054, es decir baja el VaR. La
+renormalización es la convención habitual —comparar dos carteras invertidas al
+100 %— y lo que hacía falta era decirlo en el docstring y apuntar a
+`contribuciones_riesgo` para quien quiera la descomposición de Euler.
+
+### Comprobado con datos reales
+
+`comparar_metodos_var` sobre las 2 500 últimas sesiones de MIBGAS y de Brent,
+ventana de 250 al 99 % (esperadas 22,5 excepciones):
+
+| Serie | Método | Excepciones | Kupiec p | Independencia p | Zona |
+|---|---|---:|---:|---:|---|
+| MIBGAS | histórico | 30 | **0,1305** | 2,8e−05 | verde |
+| MIBGAS | paramétrico normal | 46 | 1,3e−05 | 2,1e−06 | roja |
+| MIBGAS | Cornish-Fisher | 25 | **0,6028** | 1,0e−04 | verde |
+| MIBGAS | EWMA | 42 | 2,3e−04 | 0,8117 | roja |
+| Brent | histórico | 34 | 0,0235 | 0,0144 | amarilla |
+| Brent | paramétrico normal | 58 | 3,4e−10 | 0,0189 | roja |
+| Brent | Cornish-Fisher | 31 | 0,0885 | 0,0082 | amarilla |
+| Brent | EWMA | 47 | 5,9e−06 | 0,3552 | roja |
+
+Tres cosas que se leen bien ahí, y ninguna se podía leer antes:
+
+- El **paramétrico normal está en zona roja en las dos series**, con más del
+  doble de excepciones de las esperadas. Es el resultado correcto: suponer
+  normalidad en materias primas energéticas no se sostiene.
+- El **histórico y Cornish-Fisher aprueban Kupiec pero suspenden
+  independencia**, y el EWMA justo al contrario (p = 0,8117 en MIBGAS). Es el
+  reparto de papeles del manual: los estimadores de ventana aciertan el número
+  de excepciones y no reaccionan al régimen; el EWMA reacciona y por eso las
+  reparte bien, pero calibra bajo. Con el criterio de dominio viejo,
+  Cornish-Fisher habría avisado en más de la mitad de las 2 250 ventanas y
+  esta comparación no habría sido legible; ahora avisa en el 12-13 %, y son
+  episodios de colas gruesas de verdad.
+- El VaR anual de MIBGAS sale **312,82 %** con la media escalada linealmente
+  frente a 328,56 % con la raíz del tiempo ingenua. Los dos números son
+  disparatados, y eso no es un fallo: son rendimientos logarítmicos y la regla
+  de la raíz del tiempo a un año no vale, como dice el docstring. La
+  diferencia entre ambos es exactamente la deriva.

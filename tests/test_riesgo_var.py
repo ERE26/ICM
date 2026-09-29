@@ -162,12 +162,23 @@ def test_se_avisa_al_salirse_del_dominio():
         es_cornish_fisher(serie, 0.99)
 
 
-def test_no_se_avisa_con_datos_normales(normal_estandar):
+@pytest.mark.parametrize("semilla", range(12))
+def test_no_se_avisa_con_datos_normales(semilla):
+    # Esta prueba pasaba con una sola semilla y por casualidad. El criterio de
+    # dominio era el global (monotonia en TODA la recta), y ese se rompe en
+    # cuanto la curtosis de exceso es negativa por poco que sea: con s = 0 y
+    # k = -0,02 la monotonia falla en |z| = 20, cuando el VaR al 99,99 % vive
+    # en z = -3,72. Como la mitad de las muestras normales tienen curtosis
+    # muestral negativa, el aviso salia en el 57 % de 2 000 muestras de 250
+    # observaciones. De ahi las doce semillas: con el criterio viejo fallarian
+    # unas seis.
     import warnings as _warnings
 
+    serie = pd.Series(np.random.default_rng(semilla).standard_normal(500) * 0.01)
     with _warnings.catch_warnings():
         _warnings.simplefilter("error", UserWarning)
-        var_cornish_fisher(normal_estandar, 0.99)
+        var_cornish_fisher(serie, 0.99)
+        es_cornish_fisher(serie, 0.99)
 
 
 def test_distribucion_parametrica_desconocida(serie):
@@ -279,3 +290,129 @@ def test_el_ulcer_index_es_positivo_si_hay_caidas(serie):
 
 def test_el_ulcer_index_es_nulo_sin_caidas():
     assert ulcer_index(pd.Series([0.01] * 20), tipo="simple") == pytest.approx(0.0)
+
+
+# --- lo que la segunda revision adversarial encontro ---------------------------
+
+
+def test_el_var_historico_es_el_cuantil_empirico_y_no_una_interpolacion():
+    # La funcion de cuantiles empirica es Q(p) = inf{x : F(x) >= p}, o sea el
+    # orden estadistico ceil(n*p). El valor por omision de numpy interpola
+    # entre dos ordenes y cae del lado menos extremo: con 250 observaciones al
+    # 99 % el indice es 0,01 * 249 = 2,49, un punto entre el tercer y el
+    # cuarto peor dia en lugar del tercero.
+    serie = pd.Series(np.arange(-249.0, 1.0))  # 250 valores, los tres peores -249, -248, -247
+    assert var_historico(serie, 0.99) == pytest.approx(247.0)
+    interpolado = float(-np.quantile(serie.to_numpy(), 0.01))
+    assert interpolado == pytest.approx(246.51)
+    assert var_historico(serie, 0.99) > interpolado
+
+
+def test_el_var_historico_corregido_reduce_las_excepciones():
+    # 20.000 normales iid, ventana movil de 250. Con la interpolacion el VaR
+    # sale por debajo y el modelo suspende Kupiec con holgura; con el cuantil
+    # empirico la tasa baja a 3/251 = 1,20 %, que es lo que de verdad da una
+    # ventana de 250 al 99 % y ya no se puede mejorar cambiando el estimador.
+    from icm.riesgo.var import METODO_CUANTIL
+
+    valores = np.random.default_rng(11).standard_normal(20_000) * 0.01
+    ventana = 250
+    tasas = {}
+    for metodo in ("linear", METODO_CUANTIL):
+        var_movil = np.array(
+            [-np.quantile(valores[i - ventana : i], 0.01, method=metodo)
+             for i in range(ventana, len(valores))]
+        )
+        reales = valores[ventana:]
+        tasas[metodo] = float((reales < -var_movil).mean())
+
+    assert tasas["linear"] > tasas[METODO_CUANTIL]
+    assert tasas[METODO_CUANTIL] == pytest.approx(3.0 / 251.0, abs=0.002)
+
+
+def test_el_dominio_de_cornish_fisher_se_juzga_donde_se_evalua():
+    # El criterio global se rompe con cualquier curtosis de exceso negativa,
+    # y por eso rechazaba mas de la mitad de las muestras normales. En el tramo
+    # que de verdad se usa la expansion es perfectamente monotona.
+    assert not dominio_valido_cornish_fisher(0.0, -0.02)
+    assert dominio_valido_cornish_fisher(0.0, -0.02, -2.33, 0.0)
+    # Y sigue rechazando lo que hay que rechazar.
+    assert not dominio_valido_cornish_fisher(-1.2, 29.0, -2.33, 0.0)
+    # Una curtosis muy negativa si rompe la monotonia dentro del rango del ES.
+    assert not dominio_valido_cornish_fisher(0.0, -0.5, -4.42, 0.0)
+
+
+def test_el_es_de_cornish_fisher_integra_por_el_punto_medio(normal_estandar):
+    from icm.riesgo.var import _cuantil_cornish_fisher, _momentos
+
+    media, desviacion, s, k = _momentos(normal_estandar)
+    alfa, n = 0.01, 1_000
+    referencia = float(
+        -(media + desviacion
+          * _cuantil_cornish_fisher((np.arange(500_000) + 0.5) / 500_000 * alfa, s, k).mean())
+    )
+    con_regla_antigua = float(
+        -(media + desviacion
+          * _cuantil_cornish_fisher(np.linspace(alfa / n, alfa, n), s, k).mean())
+    )
+    obtenido = es_cornish_fisher(normal_estandar, 0.99, n_tramos=n)
+
+    assert abs(obtenido - referencia) < abs(con_regla_antigua - referencia) / 3.0
+    assert con_regla_antigua < referencia  # el sesgo iba al lado inseguro
+
+
+def test_el_es_de_cornish_fisher_necesita_al_menos_dos_tramos(normal_estandar):
+    with pytest.raises(ErrorDatos, match="dos tramos"):
+        es_cornish_fisher(normal_estandar, 0.99, n_tramos=1)
+
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_cornish_fisher_no_inventa_momentos_con_series_cortisimas(n):
+    # Con dos observaciones, los estimadores insesgados devuelven asimetria
+    # 0,0 y curtosis -2,0 SIEMPRE, sean cuales sean los datos, y encima se
+    # construia un VaR.
+    corta = pd.Series(np.arange(float(n)) * 0.01)
+    with pytest.raises(ErrorDatos, match="asimetria y curtosis"):
+        var_cornish_fisher(corta, 0.99)
+
+
+def test_la_raiz_del_tiempo_no_se_aplica_a_la_media():
+    # Un VaR es -(mu + sigma z). A T dias la media se acumula linealmente y la
+    # desviacion con la raiz, asi que escalar el VaR entero por sqrt(T) escala
+    # tambien la media y con deriva positiva infla el resultado.
+    mu, sigma, z = 0.0005, 0.01, float(stats.norm.ppf(0.01))
+    var_diario = -(mu + sigma * z)
+
+    for dias, holgura in ((10, 0.04), (252, 0.40)):
+        correcto = -(dias * mu + np.sqrt(dias) * sigma * z)
+        ingenuo = escalar_horizonte(var_diario, dias)
+        conmedia = escalar_horizonte(var_diario, dias, media_diaria=mu)
+        assert conmedia == pytest.approx(correcto)
+        assert ingenuo > correcto * (1.0 + holgura)
+
+    # Con media nula las dos rutas coinciden: es el caso en que sqrt(T) vale.
+    var_sin_media = -(sigma * z)
+    assert escalar_horizonte(var_sin_media, 10, media_diaria=0.0) == pytest.approx(
+        escalar_horizonte(var_sin_media, 10)
+    )
+
+
+def test_el_var_anualizado_escala_la_media_linealmente():
+    serie = pd.Series(np.random.default_rng(7).normal(0.0005, 0.01, 4000))
+    from icm.riesgo.var import var_anualizado
+
+    anual = var_anualizado(serie, 0.99)
+    diario = var_historico(serie, 0.99)
+    assert anual < diario * np.sqrt(252)  # la deriva positiva resta
+
+
+def test_el_es_parametrico_t_no_devuelve_un_es_menor_que_el_var():
+    # Con una t de menos de un grado de libertad no hay media, asi que el ES
+    # no existe. La formula cerrada divide entre gl - 1 y devolvia -3,0654
+    # frente a un VaR de +0,6194: un ES menor que el VaR es imposible.
+    muestra = pd.Series(stats.t.rvs(0.8, size=3000, random_state=5) * 0.01)
+    with pytest.warns(UserWarning, match="varianza finita"):
+        var_parametrico(muestra, 0.99, "t")
+    with pytest.raises(ErrorDatos, match="no tiene media"):
+        with pytest.warns(UserWarning):
+            es_parametrico(muestra, 0.99, "t")

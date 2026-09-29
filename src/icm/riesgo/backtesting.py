@@ -8,6 +8,13 @@ semana, el modelo no reacciona a los cambios de regimen.
 
 Los dos contrastes clasicos cubren esas dos preguntas: Kupiec mira cuantas
 excepciones hay, Christoffersen mira si estan agrupadas.
+
+Los p-valores se calculan con ``chi2.sf`` y no con ``1 - chi2.cdf``. Con la
+resta, la precision del flotante se agota y el resultado **colapsa a 0,0
+exacto** a partir de un estadistico de unos 75: con LR = 75 la resta da 0,0 y
+la funcion de supervivencia da 4,7e-18, y con LR = 200, 2,1e-45. Un p-valor de
+cero exacto no es un p-valor, y ademas impide distinguir un rechazo claro de
+uno aplastante, que es informacion util cuando se compara un modelo con otro.
 """
 
 from __future__ import annotations
@@ -148,13 +155,18 @@ def _var_movil_cornish_fisher(serie: pd.Series, nivel: float, ventana: int) -> p
 
     valores = serie.to_numpy(float)
     alfa = 1.0 - nivel
+    # El mismo tramo que comprueba 'var_cornish_fisher': de la mediana al
+    # cuantil pedido. Con el criterio global se avisaba en mas de la mitad de
+    # las ventanas de cualquier serie, incluida una normal, porque basta una
+    # curtosis de exceso negativa por minima que sea.
+    z_nivel = float(stats.norm.ppf(alfa))
     estimaciones: dict = {}
     fuera_de_dominio = 0
 
     for posicion in range(ventana, len(serie)):
         tramo = pd.Series(valores[posicion - ventana : posicion])
         media, desviacion, s, k = _momentos(tramo)
-        if not dominio_valido_cornish_fisher(s, k):
+        if not dominio_valido_cornish_fisher(s, k, z_nivel, 0.0):
             fuera_de_dominio += 1
         estimaciones[serie.index[posicion]] = -(
             media + desviacion * _cuantil_cornish_fisher(alfa, s, k)
@@ -265,6 +277,46 @@ def excepciones(rendimientos, var_estimado) -> pd.Series:
     return fallos
 
 
+def _excepciones_en_orden(excepciones_serie) -> np.ndarray:
+    """Convierte a vector de 0/1 comprobando que venga en orden cronologico.
+
+    Este contraste cuenta transiciones de un dia al siguiente sobre la
+    secuencia que recibe, asi que el orden **es** el dato. ``excepciones`` ya
+    devuelve ordenado, pero nada impedia llamar aqui directamente con un marco
+    sin ordenar: con las mismas 12 excepciones agrupadas en una racha, el
+    estadistico pasaba de 76,38 (p = 0,0000, rechaza) a 0,37 (p = 0,5422, no
+    rechaza) solo por barajar el indice. Un modelo con las excepciones
+    perfectamente agrupadas aprobaba el contraste de independencia.
+    """
+    if isinstance(excepciones_serie, pd.Series):
+        indice = excepciones_serie.index
+        if indice.has_duplicates:
+            raise ErrorDatos(
+                "La serie de excepciones tiene fechas repetidas: no hay una secuencia "
+                "de dias consecutivos bien definida."
+            )
+        if not indice.is_monotonic_increasing:
+            raise ErrorDatos(
+                "La serie de excepciones no esta ordenada por fecha. Este contraste "
+                "cuenta transiciones de un dia al siguiente, asi que el orden decide "
+                "el resultado: una racha barajada parece independiente. Ordene con "
+                "sort_index() antes de llamar."
+            )
+    # Se comprueba en float y despues se convierte: 'asarray(dtype=int)' trunca
+    # hacia cero, asi que una serie de rendimientos pasada por error se
+    # convertia en un vector de ceros y colaba como "ninguna excepcion".
+    valores = np.asarray(excepciones_serie, dtype=float)
+    if valores.ndim != 1:
+        raise ErrorDatos("Las excepciones tienen que venir como una secuencia de 0 y 1.")
+    if not np.isfinite(valores).all() or not np.isin(valores, (0.0, 1.0)).all():
+        distintos = np.unique(valores)[:5]
+        raise ErrorDatos(
+            f"Las excepciones solo pueden valer 0 o 1; se han recibido {distintos}. "
+            f"Genere la serie con 'excepciones(rendimientos, var_estimado)'."
+        )
+    return valores.astype(int)
+
+
 def contraste_kupiec(excepciones_serie, nivel: float = 0.99) -> dict[str, float]:
     """Contraste de cobertura incondicional (Kupiec, 1995).
 
@@ -272,7 +324,14 @@ def contraste_kupiec(excepciones_serie, nivel: float = 0.99) -> dict[str, float]
     El estadistico es una razon de verosimilitudes que sigue una chi-cuadrado
     con un grado de libertad.
     """
-    fallos = np.asarray(excepciones_serie, dtype=float)
+    # A Kupiec el orden le da igual -- solo cuenta -- pero los valores no: una
+    # serie de rendimientos pasada por error en lugar de la de excepciones
+    # daria una "proporcion" sin sentido en vez de un error.
+    fallos = _excepciones_en_orden(
+        excepciones_serie.sort_index()
+        if isinstance(excepciones_serie, pd.Series) and not excepciones_serie.index.has_duplicates
+        else excepciones_serie
+    ).astype(float)
     nivel = validar_nivel(nivel)
     n = len(fallos)
     if n == 0:
@@ -290,7 +349,7 @@ def contraste_kupiec(excepciones_serie, nivel: float = 0.99) -> dict[str, float]
         log_alternativa = x * np.log(proporcion) + (n - x) * np.log(1.0 - proporcion)
         estadistico = -2.0 * (log_nula - log_alternativa)
 
-    p_valor = float(1.0 - stats.chi2.cdf(estadistico, df=1))
+    p_valor = float(stats.chi2.sf(estadistico, df=1))
     return {
         "observaciones": float(n),
         "excepciones": x,
@@ -310,7 +369,7 @@ def contraste_christoffersen_independencia(excepciones_serie) -> dict[str, float
     rechaza cuando las excepciones se agrupan, senial tipica de un modelo que
     no actualiza la volatilidad.
     """
-    fallos = np.asarray(excepciones_serie, dtype=int)
+    fallos = _excepciones_en_orden(excepciones_serie)
     if len(fallos) < 2:
         raise ErrorDatos("Hacen falta al menos 2 observaciones para contrastar la independencia.")
 
@@ -333,7 +392,7 @@ def contraste_christoffersen_independencia(excepciones_serie) -> dict[str, float
         n00 * _log(1.0 - pi_01) + n01 * _log(pi_01) + n10 * _log(1.0 - pi_11) + n11 * _log(pi_11)
     )
     estadistico = -2.0 * (log_nula - log_alternativa)
-    p_valor = float(1.0 - stats.chi2.cdf(estadistico, df=1))
+    p_valor = float(stats.chi2.sf(estadistico, df=1))
 
     return {
         "n00": float(n00),
@@ -358,7 +417,7 @@ def contraste_christoffersen_condicional(excepciones_serie, nivel: float = 0.99)
     kupiec = contraste_kupiec(excepciones_serie, nivel)
     independencia = contraste_christoffersen_independencia(excepciones_serie)
     estadistico = kupiec["estadistico_lr"] + independencia["estadistico_lr"]
-    p_valor = float(1.0 - stats.chi2.cdf(estadistico, df=2))
+    p_valor = float(stats.chi2.sf(estadistico, df=2))
     return {
         "estadistico_lr": float(estadistico),
         "p_valor": p_valor,
@@ -366,6 +425,16 @@ def contraste_christoffersen_condicional(excepciones_serie, nivel: float = 0.99)
         "lr_cobertura": kupiec["estadistico_lr"],
         "lr_independencia": independencia["estadistico_lr"],
     }
+
+
+#: Ventana para la que la norma define el recargo. El semaforo se puede
+#: calcular para cualquier n -- la binomial no tiene nada de especial con 250
+#: -- pero la tabla de recargos es literalmente la del Comite para 250 dias.
+OBSERVACIONES_BASILEA = 250
+
+#: Recargo sobre el multiplicador del capital regulatorio dentro de la zona
+#: amarilla, tal y como lo publica el Comite para 250 dias al 99 %.
+RECARGO_AMARILLA = {5: 0.40, 6: 0.50, 7: 0.65, 8: 0.75, 9: 0.85}
 
 
 def zona_basilea(n_excepciones: int, n_observaciones: int = 250, nivel: float = 0.99) -> dict:
@@ -376,16 +445,38 @@ def zona_basilea(n_excepciones: int, n_observaciones: int = 250, nivel: float = 
     del 95 %, amarilla hasta el 99,99 % y roja por encima. Para la ventana
     estandar de 250 dias al 99 % esto reproduce los umbrales de 0-4, 5-9 y 10
     o mas excepciones, y el recargo sobre el capital regulatorio.
+
+    El recargo, solo a 250 dias
+    ---------------------------
+    La zona se calcula con la binomial y vale para cualquier ventana, pero
+    ``recargo_multiplicador`` es la tabla del Comite para 250 sesiones y no se
+    puede extrapolar. Antes se leia esa tabla pasase lo que pasase, con un
+    ``get(..., 0.85)`` que devolvia el tope para cualquier recuento no
+    tabulado: con 500 observaciones y 12 excepciones -- zona amarilla por la
+    binomial, pero un recuento que la tabla de 250 dias no contempla --
+    devolvia 0,85 con toda la apariencia de ser una cifra regulatoria. Ahora
+    en ese caso el recargo sale ``NaN`` y el diccionario lleva
+    ``recargo_aplicable`` a ``False``.
     """
     p = 1.0 - validar_nivel(nivel)
+    if n_excepciones < 0 or n_observaciones < 1:
+        raise ErrorDatos(
+            f"Recuentos imposibles: {n_excepciones} excepciones en {n_observaciones} "
+            f"observaciones."
+        )
+    if n_excepciones > n_observaciones:
+        raise ErrorDatos(
+            f"No puede haber {n_excepciones} excepciones en {n_observaciones} "
+            f"observaciones."
+        )
     acumulada = float(stats.binom.cdf(n_excepciones, n_observaciones, p))
+    normativa = int(n_observaciones) == OBSERVACIONES_BASILEA
 
     if acumulada < 0.95:
         zona, recargo = "verde", 0.00
     elif acumulada < 0.9999:
-        # El recargo crece con el numero de excepciones dentro de la zona.
-        escala = {5: 0.40, 6: 0.50, 7: 0.65, 8: 0.75, 9: 0.85}
-        zona, recargo = "amarilla", escala.get(int(n_excepciones), 0.85)
+        zona = "amarilla"
+        recargo = RECARGO_AMARILLA.get(int(n_excepciones), np.nan) if normativa else np.nan
     else:
         zona, recargo = "roja", 1.00
 
@@ -395,6 +486,7 @@ def zona_basilea(n_excepciones: int, n_observaciones: int = 250, nivel: float = 
         "probabilidad_acumulada": acumulada,
         "zona": zona,
         "recargo_multiplicador": recargo,
+        "recargo_aplicable": bool(zona != "amarilla" or (normativa and not np.isnan(recargo))),
     }
 
 
