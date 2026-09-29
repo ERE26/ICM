@@ -15,6 +15,7 @@ los modelos de riesgo de 2008.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -51,19 +52,111 @@ def correlacion_por_kendall(rendimientos) -> pd.DataFrame:
     return pd.DataFrame(rho, index=marco.columns, columns=marco.columns)
 
 
-def _proyectar_definida_positiva(matriz: np.ndarray, minimo: float = 1e-8) -> np.ndarray:
+def _alinear_uniformes(uniformes, correlacion: pd.DataFrame) -> np.ndarray:
+    """Ordena las columnas por NOMBRE antes de cruzarlas con la correlacion.
+
+    La verosimilitud tomaba ``uniformes.to_numpy()`` y lo cruzaba con la
+    matriz por POSICION, aunque los dos objetos llevan etiquetas. Bastaba que
+    el marco llegase con las columnas en otro orden -- un ``reindex``, un
+    ``groupby``, un ``merge`` -- para evaluar la verosimilitud de otro modelo:
+    medido sobre tres activos, la gaussiana daba +788,19 con el orden natural
+    y -3654,30 con el inverso, sobre exactamente los mismos datos. Eso cambia
+    el signo del AIC en ``comparar_copulas``.
+    """
+    if not isinstance(uniformes, pd.DataFrame):
+        return np.asarray(uniformes, dtype=float)
+    esperadas = [str(c) for c in correlacion.columns]
+    recibidas = {str(c): c for c in uniformes.columns}
+    faltan = [c for c in esperadas if c not in recibidas]
+    if faltan:
+        raise ErrorDatos(
+            f"Faltan columnas en las uniformes: {faltan}. La copula esta definida "
+            f"sobre {esperadas}."
+        )
+    return uniformes[[recibidas[c] for c in esperadas]].to_numpy(float)
+
+
+#: Por debajo de este autovalor la matriz ya no es una matriz de correlacion
+#: con ruido numerico encima, sino otra cosa. La traza de una correlacion vale
+#: d, asi que el autovalor medio es 1: -0,1 es una direccion del espacio con
+#: varianza francamente negativa, no un error de redondeo.
+AUTOVALOR_INADMISIBLE = -0.1
+
+
+def _proyectar_definida_positiva(
+    matriz: np.ndarray,
+    minimo: float = 1e-8,
+    nombre: str = "La matriz de correlacion",
+) -> np.ndarray:
     """Corrige autovalores negativos y vuelve a normalizar la diagonal a 1.
 
     La transformacion de Kendall se aplica entrada a entrada, asi que el
     resultado no tiene por que ser una matriz de correlacion valida.
+
+    La reparacion **no es gratis**: mueve las correlaciones que se le han dado
+    y todo lo que salga despues -- simulaciones, VaR, dependencia de cola --
+    describe la matriz reparada, no la que pidio quien llamo. Antes esto
+    ocurria en silencio, asi que una matriz inventada a mano y claramente
+    imposible producia numeros de riesgo con toda la apariencia de ser
+    correctos. Ahora una desviacion pequenia avisa y una grande se rechaza.
     """
     autovalores, autovectores = np.linalg.eigh(matriz)
-    if autovalores.min() >= minimo:
+    menor = float(autovalores.min())
+    if menor >= minimo:
         return matriz
-    autovalores = np.clip(autovalores, minimo, None)
-    reparada = autovectores @ np.diag(autovalores) @ autovectores.T
-    escala = np.sqrt(np.diag(reparada))
-    return reparada / np.outer(escala, escala)
+    if menor < AUTOVALOR_INADMISIBLE:
+        raise ErrorDatos(
+            f"{nombre} no es semidefinida positiva ni por aproximacion: su menor "
+            f"autovalor es {menor:.4f}. Esa combinacion de correlaciones no la "
+            f"puede tener ningun conjunto de activos; repararla daria cifras de "
+            f"riesgo de una matriz distinta de la pedida."
+        )
+    reparada = matriz
+    for _ in range(10):
+        autovalores, autovectores = np.linalg.eigh(reparada)
+        if autovalores.min() >= minimo:
+            break
+        autovalores = np.clip(autovalores, 2.0 * minimo, None)
+        reparada = autovectores @ np.diag(autovalores) @ autovectores.T
+        escala = np.sqrt(np.diag(reparada))
+        reparada = reparada / np.outer(escala, escala)
+        np.fill_diagonal(reparada, 1.0)
+    desvio = float(np.abs(reparada - matriz).max())
+    warnings.warn(
+        f"{nombre} tenia un autovalor {menor:.2e} y se ha proyectado sobre las "
+        f"definidas positivas; la correlacion que mas se mueve lo hace en "
+        f"{desvio:.2e}. Los resultados describen la matriz proyectada.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    return reparada
+
+
+def _correlacion_valida(correlacion, nombre: str = "La matriz de correlacion") -> pd.DataFrame:
+    """Comprueba forma, simetria y diagonal, y devuelve ya la version proyectada.
+
+    Se llama una sola vez, al construir la copula, para que la matriz que
+    guarda el objeto sea exactamente la que usan la simulacion, la
+    verosimilitud y la dependencia de cola. Cuando cada metodo proyectaba por
+    su cuenta y ``dependencia_cola`` no lo hacia, el objeto declaraba una
+    dependencia de cola de 0,5945 y simulaba otra de 0,164.
+    """
+    marco = correlacion if isinstance(correlacion, pd.DataFrame) else pd.DataFrame(correlacion)
+    if marco.shape[0] != marco.shape[1]:
+        raise ErrorDatos(f"{nombre} debe ser cuadrada, y es {marco.shape[0]}x{marco.shape[1]}.")
+    if marco.shape[0] < 2:
+        raise ErrorDatos(f"{nombre} necesita al menos dos activos.")
+    if list(marco.index) != list(marco.columns):
+        raise ErrorDatos(f"{nombre} debe llevar las mismas etiquetas en filas y columnas.")
+    valores = marco.to_numpy(float)
+    if not np.all(np.isfinite(valores)):
+        raise ErrorDatos(f"{nombre} contiene valores no finitos.")
+    if not np.allclose(valores, valores.T, atol=1e-8):
+        raise ErrorDatos(f"{nombre} no es simetrica.")
+    if not np.allclose(np.diag(valores), 1.0, atol=1e-8):
+        raise ErrorDatos(f"{nombre} debe tener unos en la diagonal.")
+    proyectada = _proyectar_definida_positiva(valores, nombre=nombre)
+    return pd.DataFrame(proyectada, index=marco.index, columns=marco.columns)
 
 
 @dataclass
@@ -72,13 +165,16 @@ class CopulaGaussiana:
 
     correlacion: pd.DataFrame
 
+    def __post_init__(self) -> None:
+        self.correlacion = _correlacion_valida(self.correlacion)
+
     @property
     def activos(self) -> list[str]:
         return [str(c) for c in self.correlacion.columns]
 
     def simular_uniformes(self, n: int, semilla: int | None = 42) -> pd.DataFrame:
         generador = np.random.default_rng(semilla)
-        factor = np.linalg.cholesky(_proyectar_definida_positiva(self.correlacion.to_numpy(float)))
+        factor = np.linalg.cholesky(self.correlacion.to_numpy(float))
         normales = generador.standard_normal((n, len(self.activos))) @ factor.T
         return pd.DataFrame(stats.norm.cdf(normales), columns=self.activos)
 
@@ -86,9 +182,9 @@ class CopulaGaussiana:
         """Siempre 0: es la limitacion esencial de esta copula."""
         return 0.0
 
-    def log_verosimilitud(self, uniformes: pd.DataFrame) -> float:
-        z = stats.norm.ppf(uniformes.to_numpy(float))
-        matriz = _proyectar_definida_positiva(self.correlacion.to_numpy(float))
+    def log_verosimilitud(self, uniformes) -> float:
+        z = stats.norm.ppf(_alinear_uniformes(uniformes, self.correlacion))
+        matriz = self.correlacion.to_numpy(float)
         inversa = np.linalg.inv(matriz)
         signo, log_det = np.linalg.slogdet(matriz)
         if signo <= 0:  # pragma: no cover - imposible tras la proyeccion
@@ -109,6 +205,16 @@ class CopulaT:
     correlacion: pd.DataFrame
     grados_libertad: float
 
+    def __post_init__(self) -> None:
+        self.correlacion = _correlacion_valida(self.correlacion)
+        self.grados_libertad = float(self.grados_libertad)
+        if not np.isfinite(self.grados_libertad) or self.grados_libertad <= 2.0:
+            raise ErrorDatos(
+                f"Los grados de libertad de la copula t deben ser mayores que 2 "
+                f"(recibido {self.grados_libertad}); por debajo la t no tiene "
+                f"varianza y la dependencia de cola deja de estar definida."
+            )
+
     @property
     def activos(self) -> list[str]:
         return [str(c) for c in self.correlacion.columns]
@@ -116,7 +222,7 @@ class CopulaT:
     def simular_uniformes(self, n: int, semilla: int | None = 42) -> pd.DataFrame:
         generador = np.random.default_rng(semilla)
         gl = self.grados_libertad
-        factor = np.linalg.cholesky(_proyectar_definida_positiva(self.correlacion.to_numpy(float)))
+        factor = np.linalg.cholesky(self.correlacion.to_numpy(float))
         normales = generador.standard_normal((n, len(self.activos))) @ factor.T
         mezcla = generador.chisquare(gl, size=(n, 1)) / gl
         t_multivariante = normales / np.sqrt(mezcla)
@@ -128,20 +234,30 @@ class CopulaT:
         Formula cerrada de la copula t bivariante. Si no se indica el par se
         usa la correlacion media fuera de la diagonal.
         """
+        valores = self.correlacion.to_numpy(float)
         if par is None:
-            valores = self.correlacion.to_numpy(float)
             fuera = valores[~np.eye(valores.shape[0], dtype=bool)]
             rho = float(np.mean(fuera))
         else:
-            rho = float(self.correlacion.loc[par[0], par[1]])
+            etiquetas = {str(c): i for i, c in enumerate(self.correlacion.columns)}
+            faltan = [str(c) for c in par if str(c) not in etiquetas]
+            if faltan:
+                raise ErrorDatos(
+                    f"Activos desconocidos para esta copula: {faltan}. Los que hay "
+                    f"son {self.activos}."
+                )
+            rho = float(valores[etiquetas[str(par[0])], etiquetas[str(par[1])]])
         gl = self.grados_libertad
+        # rho = -1 haria infinito el argumento; el limite es dependencia nula y
+        # es mejor devolverlo que dividir por cero.
+        rho = float(np.clip(rho, -1.0 + 1e-12, 1.0))
         argumento = -np.sqrt((gl + 1.0) * (1.0 - rho) / (1.0 + rho))
         return float(2.0 * stats.t.cdf(argumento, gl + 1.0))
 
-    def log_verosimilitud(self, uniformes: pd.DataFrame) -> float:
+    def log_verosimilitud(self, uniformes) -> float:
         return _log_verosimilitud_t(
-            uniformes.to_numpy(float),
-            _proyectar_definida_positiva(self.correlacion.to_numpy(float)),
+            _alinear_uniformes(uniformes, self.correlacion),
+            self.correlacion.to_numpy(float),
             self.grados_libertad,
         )
 
@@ -186,9 +302,11 @@ def ajustar_copula_t(
     verosimilitud, lo que reduce un problema multidimensional a uno escalar y
     bien condicionado.
     """
+    if gl_minimos <= 2.0:
+        raise ErrorDatos("El limite inferior de grados de libertad debe superar 2.")
     correlacion = correlacion_por_kendall(rendimientos)
-    uniformes = pseudo_observaciones(rendimientos).to_numpy(float)
-    matriz = _proyectar_definida_positiva(correlacion.to_numpy(float))
+    uniformes = _alinear_uniformes(pseudo_observaciones(rendimientos), correlacion)
+    matriz = correlacion.to_numpy(float)
 
     def objetivo(gl: float) -> float:
         return -_log_verosimilitud_t(uniformes, matriz, float(gl))
@@ -256,12 +374,27 @@ def simular_rendimientos_copula(
         else:
             raise ErrorDatos(f"Tipo de copula '{tipo}' desconocido: use 't' o 'gaussiana'.")
 
-    uniformes = copula.simular_uniformes(n_simulaciones, semilla)
-    simulados = {
-        activo: np.quantile(marco[activo].to_numpy(float), uniformes[activo].to_numpy(float))
-        for activo in marco.columns
-    }
-    return pd.DataFrame(simulados, columns=marco.columns)
+    esperados = [str(c) for c in marco.columns]
+    if copula.activos != esperados:
+        raise ErrorDatos(
+            f"La copula esta definida sobre {copula.activos} y los rendimientos "
+            f"traen {esperados}; alinee las columnas antes de simular."
+        )
+
+    # La copula devuelve las columnas con el nombre pasado por ``str``, asi que
+    # se cruzan por POSICION y se reetiquetan con las columnas originales. Con
+    # ``uniformes[activo]`` y un marco de columnas numericas -- una matriz de
+    # rendimientos sin nombrar, por ejemplo -- esto era un KeyError: 0.
+    uniformes = copula.simular_uniformes(n_simulaciones, semilla).to_numpy(float)
+    simulados = pd.DataFrame(
+        {
+            activo: np.quantile(marco[activo].to_numpy(float), uniformes[:, i])
+            for i, activo in enumerate(marco.columns)
+        },
+        columns=marco.columns,
+    )
+    simulados.attrs.update(marco.attrs)
+    return simulados
 
 
 def var_copula(
@@ -271,6 +404,7 @@ def var_copula(
     tipo: str = "t",
     n_simulaciones: int = 50_000,
     semilla: int | None = 42,
+    copula: CopulaGaussiana | CopulaT | None = None,
 ) -> dict[str, float]:
     """VaR y ES de la cartera bajo el modelo de copula.
 
@@ -278,8 +412,16 @@ def var_copula(
     cuanto riesgo se pasa por alto al ignorar la dependencia de cola.
     """
     marco = como_matriz(rendimientos, "rendimientos")
+    if marco.attrs.get("tipo_rendimiento") is None:
+        marco.attrs.update(getattr(rendimientos, "attrs", {}))
     vector_pesos = normalizar_pesos(pesos, marco.columns)
-    simulados = simular_rendimientos_copula(marco, None, n_simulaciones, tipo, semilla)
+    simulados = simular_rendimientos_copula(marco, copula, n_simulaciones, tipo, semilla)
+
+    # Un rendimiento logaritmico no se puede promediar entre activos: el de la
+    # cartera no es la media ponderada de los logaritmos sino el logaritmo de la
+    # media ponderada de los factores. Se pasa a simple, se pondera y se vuelve.
+    if str(marco.attrs.get("tipo_rendimiento", "")) == "log":
+        simulados = np.expm1(simulados)
     cartera = simulados.mul(vector_pesos, axis=1).sum(axis=1)
 
     from icm.riesgo.montecarlo import es_montecarlo, var_montecarlo
@@ -318,7 +460,7 @@ def comparar_copulas(
     ):
         log_ver = copula.log_verosimilitud(uniformes)
         k = n_parametros_corr + n_extra
-        riesgo = var_copula(marco, pesos, nivel, nombre, n_simulaciones, semilla)
+        riesgo = var_copula(marco, pesos, nivel, nombre, n_simulaciones, semilla, copula)
         filas[nombre] = {
             "log_verosimilitud": log_ver,
             "n_parametros": k,

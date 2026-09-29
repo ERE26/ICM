@@ -235,3 +235,78 @@ def test_la_escala_interna_no_afecta_al_resultado(serie_con_agrupamiento):
     ajuste_local = ajustar_garch(serie_con_agrupamiento)
     condicional = ajuste_local.volatilidad_condicional()
     assert 0.2 < condicional.mean() / serie_con_agrupamiento.std(ddof=1) < 5.0
+
+
+def test_la_volatilidad_movil_sin_desplazar_mira_el_dia_que_estima():
+    # No es un fallo: es la convencion de la volatilidad realizada, y hay que
+    # poder comprobarla para saber que la otra rama hace falta. Metiendo un
+    # rendimiento del 50 % en un solo dia, la ventana de 21 se multiplica por
+    # 11,2 en la fecha del propio choque.
+    generador = np.random.default_rng(3)
+    indice = pd.bdate_range("2024-01-01", periods=300)
+    limpia = pd.Series(generador.standard_normal(300) * 0.01, index=indice)
+    con_choque = limpia.copy()
+    con_choque.iloc[150] = 0.50
+
+    fecha = indice[150]
+    antes = volatilidad_movil(limpia, 21).loc[fecha]
+    despues = volatilidad_movil(con_choque, 21).loc[fecha]
+    assert despues > 10.0 * antes
+
+
+def test_la_volatilidad_movil_como_prevision_no_ve_el_dia_que_estima():
+    generador = np.random.default_rng(3)
+    indice = pd.bdate_range("2024-01-01", periods=300)
+    limpia = pd.Series(generador.standard_normal(300) * 0.01, index=indice)
+    con_choque = limpia.copy()
+    con_choque.iloc[150] = 0.50
+
+    fecha = indice[150]
+    antes = volatilidad_movil(limpia, 21, prevision=True).loc[fecha]
+    despues = volatilidad_movil(con_choque, 21, prevision=True).loc[fecha]
+    assert despues == pytest.approx(antes)
+    # Y en la fecha siguiente si tiene que haberlo incorporado.
+    assert volatilidad_movil(con_choque, 21, prevision=True).loc[indice[151]] > 10.0 * antes
+
+
+def test_la_volatilidad_movil_como_prevision_solo_desplaza():
+    serie = pd.Series(
+        np.random.default_rng(4).standard_normal(200) * 0.01,
+        index=pd.bdate_range("2024-01-01", periods=200),
+    )
+    directa = volatilidad_movil(serie, 21)
+    desplazada = volatilidad_movil(serie, 21, prevision=True)
+    pd.testing.assert_series_equal(
+        desplazada, directa.shift(1).dropna().rename("volatilidad_movil_21")
+    )
+
+
+def test_el_es_del_garch_integra_la_cola_por_el_punto_medio(serie_con_agrupamiento, ajuste):
+    # Con los extremos derechos de cada tramo la integral salia corta de forma
+    # sistematica, siempre hacia el lado inseguro. La prueba es que el
+    # resultado ya no dependa apenas del numero de tramos: con la regla del
+    # punto medio el error cae con el cuadrado del paso.
+    serie = serie_con_agrupamiento
+    referencia = es_garch(serie, 0.99, ajuste=ajuste, n_tramos=200_000)
+    obtenido = es_garch(serie, 0.99, ajuste=ajuste, n_tramos=1_000)
+
+    # La misma integral con la regla antigua, los extremos derechos de cada
+    # tramo, reproducida aqui para poder compararlas.
+    prevision = ajuste.resultado.forecast(horizon=1, reindex=False)
+    media = float(np.sum(prevision.mean.iloc[-1])) / ajuste.escala
+    desviacion = float(np.sqrt(np.sum(prevision.variance.iloc[-1]))) / ajuste.escala
+    derechos = np.linspace(0.01 / 1_000, 0.01, 1_000)
+    cuantiles = ajuste.cuantiles_estandarizados(derechos)
+    con_regla_antigua = -(media + desviacion * cuantiles.mean())
+
+    error_nuevo = abs(obtenido - referencia)
+    error_viejo = abs(con_regla_antigua - referencia)
+    assert error_nuevo < error_viejo / 3.0
+    # Y el sesgo iba siempre hacia el lado inseguro: el ES salia corto.
+    assert con_regla_antigua < referencia
+    assert es_garch(serie, 0.99, ajuste=ajuste) > var_garch(serie, 0.99, ajuste=ajuste)
+
+
+def test_el_es_del_garch_necesita_al_menos_dos_tramos(serie_con_agrupamiento, ajuste):
+    with pytest.raises(ErrorDatos, match="dos tramos"):
+        es_garch(serie_con_agrupamiento, 0.99, ajuste=ajuste, n_tramos=1)

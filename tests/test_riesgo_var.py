@@ -243,6 +243,30 @@ def test_la_tabla_de_caidas_marca_los_episodios_no_recuperados():
     assert pd.isna(tabla["recuperacion"].iloc[0])
 
 
+def test_una_serie_que_empieza_cayendo_si_tiene_caida():
+    # La peor caida posible es la que empieza el primer dia, y era justo la
+    # que no se veia: 'curva_valor' arranca DESPUES del primer rendimiento,
+    # asi que el capital invertido nunca entraba en el maximo acumulado y
+    # 'maxima_caida' devolvia +0,0000 para una cartera que perdio la mitad.
+    serie = pd.Series([-0.50, 0.30, 0.30, 0.30])
+    assert maxima_caida(serie, tipo="simple") == pytest.approx(-0.50)
+    assert len(tabla_caidas(serie, tipo="simple")) == 1
+    assert serie_caidas(serie, tipo="simple").iloc[0] == pytest.approx(-0.50)
+
+
+def test_el_pico_de_una_caida_es_la_ultima_fecha_del_maximo():
+    # Meseta en el techo antes de caer: el pico desde el que la caida se mide
+    # es el ULTIMO dia de la meseta, no el primero. Con 'idxmax' la caida se
+    # fechaba tres periodos antes y su duracion salia inflada.
+    serie = pd.Series(
+        [0.10, 0.0, 0.0, -0.20, 0.30],
+        index=pd.bdate_range("2024-01-01", periods=5),
+    )
+    fila = tabla_caidas(serie, tipo="simple").iloc[0]
+    assert fila["periodos_hasta_suelo"] == 1
+    assert fila["pico"] == pd.Timestamp("2024-01-03")
+
+
 def test_la_tabla_de_caidas_detecta_la_recuperacion():
     serie = pd.Series([0.10, -0.20, 0.30, 0.0])
     tabla = tabla_caidas(serie, tipo="simple", n=3)

@@ -2,8 +2,22 @@
 
 La volatilidad de los mercados no es constante: se agrupa en rachas. Suponerla
 fija, como hace el VaR parametrico clasico, infravalora el riesgo en periodos
-turbulentos y lo exagera en los tranquilos. Los modelos de este modulo estiman
-la volatilidad **del dia siguiente** condicionada a lo ocurrido hasta hoy.
+turbulentos y lo exagera en los tranquilos.
+
+Dos convenciones, y conviene no mezclarlas
+------------------------------------------
+``volatilidad_ewma`` y el GARCH estiman la volatilidad **del periodo
+siguiente** con informacion hasta hoy: el valor de la fecha ``t`` se puede
+usar para dimensionar una posicion en ``t``. ``volatilidad_movil``, en cambio,
+mide la volatilidad **realizada** de la ventana que termina hoy, ``r_t``
+incluido, que es otra cosa y no se puede usar igual.
+
+La diferencia no es sutil. Metiendo un rendimiento del 50 % en un unico dia de
+una serie por lo demas tranquila, la media movil de 21 dias pasa de 0,0098 a
+0,1095 **en la fecha del propio choque** (x11,2) mientras que la EWMA de esa
+fecha no se mueve. Quien dimensiona la posicion de hoy con la primera ya sabe
+lo que va a pasar hoy. Por eso ``volatilidad_movil`` acepta ``prevision=True``,
+que la desplaza un periodo y la deja alineada con las otras dos.
 """
 
 from __future__ import annotations
@@ -23,17 +37,40 @@ FACTOR_RISKMETRICS = 0.94
 ESCALA_ARCH = 100.0
 
 
-def volatilidad_movil(rendimientos, ventana: int = 21, anualizar: bool = False) -> pd.Series:
+def volatilidad_movil(
+    rendimientos,
+    ventana: int = 21,
+    anualizar: bool = False,
+    prevision: bool = False,
+) -> pd.Series:
     """Desviacion tipica en una ventana movil.
 
     Es el estimador mas simple y el mas facil de explicar, pero tiene un
     defecto conocido: cuando un dia extremo sale de la ventana, la volatilidad
     cae de golpe sin que haya pasado nada en el mercado.
+
+    Parametros
+    ----------
+    prevision:
+        Con ``False`` (lo que hay por omision) el valor de la fecha ``t`` es la
+        volatilidad **realizada** de la ventana que termina en ``t``, ``r_t``
+        incluido: sirve para describir lo que paso, no para decidir nada en
+        ``t``. Con ``True`` se desplaza un periodo, de modo que el valor de
+        ``t`` solo usa informacion hasta ``t-1`` y queda alineado con
+        :func:`volatilidad_ewma` y con el GARCH.
+
+        La distincion importa porque dimensionar la posicion de hoy con la
+        volatilidad que incluye el rendimiento de hoy es mirar el resultado
+        antes de apostar: la posicion se encoge sola justo en las sesiones
+        malas. Vease :func:`icm.ml.estrategia.objetivo_volatilidad`,
+        cuyo ejemplo apuntaba a la version sin desplazar.
     """
     serie = como_serie(rendimientos, "rendimientos")
     if ventana < 2:
         raise ErrorDatos("La ventana debe ser de al menos 2 periodos.")
     volatilidad = serie.rolling(ventana).std(ddof=1)
+    if prevision:
+        volatilidad = volatilidad.shift(1)
     if anualizar:
         volatilidad = volatilidad * np.sqrt(DIAS_HABILES_ANIO)
     volatilidad.name = f"volatilidad_movil_{ventana}"
@@ -172,12 +209,22 @@ class AjusteGarch:
 
     def cuantil_estandarizado(self, probabilidad: float) -> float:
         """Cuantil de la distribucion de las innovaciones, ya estandarizada."""
+        return float(np.asarray(self.cuantiles_estandarizados([probabilidad])).ravel()[0])
+
+    def cuantiles_estandarizados(self, probabilidades) -> np.ndarray:
+        """Varios cuantiles de una vez.
+
+        La version escalar en un bucle hacia inviable integrar la cola con
+        muchos tramos: ``es_garch`` con 200 000 tramos tardaba 74 segundos y
+        ahora tarda 0,19. La distribucion de ``arch`` acepta el vector entero.
+        """
         distribucion = self.resultado.model.distribution
         n_parametros = int(distribucion.num_params)
         parametros = (
             self.resultado.params.to_numpy()[-n_parametros:] if n_parametros else np.array([])
         )
-        return float(np.asarray(distribucion.ppf(probabilidad, parametros)).ravel()[0])
+        valores = np.asarray(probabilidades, dtype=float)
+        return np.asarray(distribucion.ppf(valores, parametros), dtype=float).reshape(valores.shape)
 
 
 def ajustar_garch(
@@ -301,8 +348,16 @@ def es_garch(
     """ES condicional, integrando el VaR del GARCH sobre la cola."""
     nivel = validar_nivel(nivel)
     ajuste = ajuste if ajuste is not None else ajustar_garch(rendimientos, **parametros_ajuste)
+    if n_tramos < 2:
+        raise ErrorDatos("Hacen falta al menos dos tramos para integrar la cola.")
     alfa = 1.0 - nivel
-    probabilidades = np.linspace(alfa / n_tramos, alfa, n_tramos)
+    # Regla del punto medio. Con los extremos derechos de cada tramo
+    # (`linspace(alfa/n, alfa, n)`) se tomaba siempre el cuantil menos extremo
+    # del tramo, y como el cuantil crece con la probabilidad la integral salia
+    # corta de forma sistematica: con una t de 3 grados al 99 % el ES daba
+    # 4,0176 frente al valor exacto 4,0432, un 0,63 % **de menos**. Poco, pero
+    # siempre en la direccion insegura. El punto medio deja el error en 0,17 %.
+    probabilidades = (np.arange(n_tramos) + 0.5) / n_tramos * alfa
 
     prevision = ajuste.resultado.forecast(horizon=horizonte, reindex=False)
     media = float(np.sum(np.asarray(prevision.mean.iloc[-1], dtype=float))) / ajuste.escala
@@ -310,8 +365,8 @@ def es_garch(
         np.sqrt(max(np.sum(np.asarray(prevision.variance.iloc[-1], dtype=float)), 0.0))
     ) / ajuste.escala
 
-    cuantiles = np.array([ajuste.cuantil_estandarizado(p) for p in probabilidades])
-    return float(-(media + desviacion * cuantiles.mean()))
+    cuantiles = ajuste.cuantiles_estandarizados(probabilidades)
+    return float(-(media + desviacion * float(cuantiles.mean())))
 
 
 def comparar_modelos_volatilidad(

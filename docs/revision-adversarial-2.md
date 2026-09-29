@@ -308,3 +308,133 @@ llevar el GARCH casi al límite IGARCH (α+β = 0,995), que es donde lo sitúa e
 ajuste sobre las series reales. La causa es que las componentes exógena,
 estacional y semanal no se agrupan, y ahora pesan más. Queda documentado en la
 cabecera del módulo en lugar de disimulado.
+
+---
+
+## Estado: volatilidad y dependencia, cerradas
+
+Septiembre de 2026. El bloque de `riesgo/volatilidad.py`, `caidas.py`,
+`montecarlo.py` y `copulas.py`. Las cifras de cada fila están reproducidas con
+un script; las pruebas nuevas se pasaron antes contra el código viejo para
+comprobar que fallaban.
+
+### Caídas
+
+| | Antes | Ahora |
+|---|---:|---:|
+| `maxima_caida` de `[−50 %, +30 %, +30 %, +30 %]` | +0,0000 | **−0,5000** |
+| Filas de `tabla_caidas` en esa serie | 0 | **1** |
+| `periodos_hasta_suelo` con una meseta antes de la caída | 3 | **1** |
+| `pico` en esa meseta | primer día | **último día** |
+
+`curva_valor` arrancaba *después* del primer rendimiento, así que el capital
+invertido nunca entraba en el máximo acumulado y la peor caída posible —la que
+empieza el primer día— salía como cero. Ahora la curva arranca en el capital.
+En los empates del máximo se toma **el último**, que es el pico desde el que
+la caída se mide de verdad.
+
+### Monte Carlo
+
+- **El bootstrap por bloques ya es circular.** Las observaciones de los
+  extremos entraban 10 veces menos que las del centro; medido sobre la
+  cobertura de cada índice, la razón entre la más y la menos muestreada pasa
+  de 10 a **1,0**. Como las series van en orden cronológico, el sesgo caía
+  sobre las sesiones recientes.
+- Un `tamano_bloque` mayor que la muestra ya da `ErrorDatos` en vez de
+  devolver trayectorias silenciosamente degeneradas.
+- Los rendimientos logarítmicos pasan por `expm1` **antes** de ponderarse: el
+  rendimiento de una cartera no es la media ponderada de los logaritmos.
+- Las etiquetas de nivel dejaron de colisionar: `99.5 %` y `99.9 %` se
+  redondeaban las dos a `100%` y la segunda pisaba a la primera. Las claves
+  son ahora `var_99%`, `var_99.5%`, `var_99.9%`.
+- `resumen_simulacion` con una sola simulación da error en lugar de una
+  desviación típica `NaN` presentada como resultado.
+
+### Cópulas
+
+| | Antes | Ahora |
+|---|---|---|
+| Log-verosimilitud con las columnas invertidas | **+788,19 / −3654,30** | idéntica, +788,19 |
+| Correlación declarada vs. la que se simula | 0,9200 / 0,8894 | 0,8898 / 0,8894 |
+| Matriz con autovalor −0,98 | se reparaba en silencio | `ErrorDatos` |
+| `simular_rendimientos_copula` con columnas numéricas | `KeyError: 0` | funciona |
+| `var_copula` con rendimientos logarítmicos | sumaba logaritmos | `expm1` primero |
+| `CopulaT(..., grados_libertad=1.5)` | se aceptaba | `ErrorDatos` |
+
+Las uniformes se cruzaban con la matriz de correlación **por posición** aunque
+los dos objetos llevan etiquetas: bastaba un `reindex`, un `merge` o un
+`groupby` para evaluar la verosimilitud de otro modelo. Medido sobre tres
+activos, la gaussiana daba +788,19 con las columnas en su orden y −3654,30
+con el inverso, sobre exactamente los mismos datos; la t, +786,98 y −2687,15.
+Eso cambia el signo del AIC en `comparar_copulas`, que es la tabla con la que
+se elige entre las dos. Ahora se alinean por nombre, y que falte una columna
+es un error en vez de un resultado.
+
+La proyección sobre las definidas positivas era la otra mitad del problema:
+`simular_uniformes` y `log_verosimilitud` proyectaban, `dependencia_cola` no,
+y el objeto **declaraba una dependencia de cola y generaba otra**. Con una
+matriz cuyo menor autovalor es −0,043, la cópula guardaba ρ(A,C) = 0,92,
+declaraba una dependencia de cola de 0,7040 y simulaba una muestra cuya
+correlación por rangos es 0,8894. Ahora la matriz se valida y se proyecta
+**una sola vez, al construir la cópula**, así que los tres métodos hablan de
+la misma: ρ = 0,8898 guardado, 0,8894 simulado, dependencia de cola 0,6544.
+(El revisor lo había medido sobre otra matriz, con 0,5945 declarado frente a
+0,164 simulado; esa matriz ahora se rechaza directamente.)
+
+Una desviación pequeña avisa con un `RuntimeWarning` —reparar mueve las
+correlaciones que se han pedido, y todo lo que salga después describe la
+matriz reparada— y una grande se rechaza.
+
+Comprobado de punta a punta sobre siete series reales (OMIE, MIBGAS, Brent,
+WTI, Henry Hub, VIX y EUR/USD, 2 118 días comunes): el menor autovalor de la
+matriz de Kendall es +0,162, así que no hay nada que reparar ni aviso que dar,
+y la t gana a la gaussiana por 451 puntos de AIC con 10,96 grados de libertad.
+Su ES al 99 % sale un 7 % por encima, que es exactamente el riesgo de cola que
+la gaussiana no ve.
+
+### Volatilidad
+
+Dos hallazgos propios, encontrados al repasar el módulo entero y no solo lo
+que el revisor había nombrado:
+
+- **`volatilidad_movil` mira el día que estima.** Su valor en `t` incluye
+  `r_t`, mientras que `volatilidad_ewma` y el GARCH están desplazados. Con un
+  rendimiento del 50 % metido en un solo día, la ventana de 21 pasa de 0,0098
+  a 0,1095 **en la fecha del propio choque** (×11,2) y la EWMA de esa fecha no
+  se mueve. No es un fallo en sí —es volatilidad realizada—, pero
+  `objetivo_volatilidad` la recomendaba en su docstring para dimensionar la
+  posición, que es la quinta fuga de futuro del proyecto. Medido con señal
+  constante y objetivo del 10 % anual:
+
+  | Serie | Volatilidad realizada | Peor día | Máxima caída |
+  |---|---:|---:|---:|
+  | MIBGAS, con fuga | 10,21 % | −2,53 % | −18,61 % |
+  | MIBGAS, sin fuga | 11,26 % | −5,37 % | −18,54 % |
+  | OMIE, con fuga | 10,19 % | −2,56 % | −6,74 % |
+  | OMIE, sin fuga | **19,85 %** | −5,12 % | −9,37 % |
+  | Brent, con fuga | 10,19 % | −2,49 % | −48,12 % |
+  | Brent, sin fuga | 11,12 % | −4,46 % | −49,39 % |
+  | WTI, con fuga | 10,12 % | −2,82 % | −34,78 % |
+  | WTI, sin fuga | 11,24 % | **−11,74 %** | **−45,03 %** |
+
+  La señal de que algo va mal es que la volatilidad realizada dé 10,1-10,2 %
+  en las cuatro series: el objetivo clavado al decimal, porque el tamaño de la
+  posición ya sabe cuánto se va a mover el mercado ese día. `volatilidad_movil`
+  acepta ahora `prevision=True`, que la desplaza y la deja alineada con las
+  otras dos.
+
+- **El ES del GARCH integraba la cola por la derecha.** Tomaba el extremo
+  derecho de cada tramo, que es el cuantil menos extremo, así que la integral
+  salía corta **siempre hacia el lado inseguro**: con una t de 3 grados al
+  99 %, 4,0176 frente al valor exacto 4,0432. Con la regla del punto medio el
+  error baja un orden de magnitud. De paso, los cuantiles se piden
+  vectorizados, que es lo que hace viable comprobarlo: integrar con 200 000
+  tramos pasa de **74 segundos a 0,19**.
+
+### Una prueba reescrita
+
+`test_el_bootstrap_por_bloques_toma_tramos_consecutivos` construía la
+referencia con `mode="wrap"` y comparaba con `<=`, así que la cumplían por
+igual la implementación circular y la que no lo es: el conjunto envolvente
+contiene al otro. Ahora separa las ventanas que cruzan el final y **exige que
+salgan**, que es justo lo que el muestreo no circular no puede producir.

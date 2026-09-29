@@ -26,15 +26,46 @@ def curva_valor(rendimientos, tipo: str | None = None, valor_inicial: float = 1.
     return curva
 
 
+def _curva_con_capital_inicial(
+    rendimientos, tipo: str | None, valor_inicial: float = 1.0
+) -> pd.Series:
+    """La curva de valor con el capital invertido como primer punto.
+
+    ``curva_valor`` devuelve el valor DESPUES de cada rendimiento, asi que su
+    primer elemento ya incorpora el primer periodo y el capital de partida no
+    aparece en ninguna fila. Tomar el maximo movil sobre esa curva hace que el
+    maximo de partida sea el valor ya movido, y la perdida del primer periodo
+    deja de existir: con ``[-0,50, +0,30, +0,30, +0,30]``, ``maxima_caida``
+    devolvia **0,0** para una cartera que perdio la mitad el primer dia y
+    nunca la recupero.
+
+    El capital invertido es, obviamente, un valor alcanzado. Se antepone
+    fechado un periodo antes del primer rendimiento.
+    """
+    curva = curva_valor(rendimientos, tipo, valor_inicial)
+    if len(curva.index) >= 2:
+        paso = curva.index[1] - curva.index[0]
+        inicio = curva.index[0] - paso
+    else:  # pragma: no cover - una sola observacion
+        inicio = curva.index[0]
+    con_inicio = pd.concat([pd.Series([valor_inicial], index=[inicio]), curva])
+    con_inicio.index.name = curva.index.name
+    con_inicio.name = curva.name
+    return con_inicio
+
+
 def serie_caidas(rendimientos, tipo: str | None = None) -> pd.Series:
     """Caida relativa respecto al maximo alcanzado hasta cada momento.
 
     Los valores son negativos o cero: -0.18 significa estar un 18 % por debajo
-    del maximo historico.
+    del maximo historico. El capital invertido cuenta como maximo de partida,
+    de modo que una perdida en el primer periodo si es una caida.
     """
-    curva = curva_valor(rendimientos, tipo)
-    maximo = curva.cummax()
-    caidas = curva / maximo - 1.0
+    con_inicio = _curva_con_capital_inicial(rendimientos, tipo)
+    caidas = con_inicio / con_inicio.cummax() - 1.0
+    # La fila sintetica del capital inicial no se publica: su caida es cero
+    # por construccion y su fecha no existe en los datos.
+    caidas = caidas.iloc[1:]
     caidas.name = "caida"
     return caidas
 
@@ -50,8 +81,14 @@ def tabla_caidas(rendimientos, tipo: str | None = None, n: int = 5) -> pd.DataFr
     Para cada episodio se identifica el maximo previo, el suelo y, si llego, la
     fecha de recuperacion. Un episodio sin recuperar aparece con
     ``recuperacion`` a ``NaT``.
+
+    Si la serie empieza cayendo, el maximo previo es el capital invertido, que
+    por definicion es anterior a la primera observacion. En ese caso ``pico``
+    lleva una fecha **un periodo antes del inicio de los datos**: no es una
+    sesion del mercado, es el momento en que se puso el dinero. Sin ella ese
+    episodio no existia, y era justo el peor.
     """
-    curva = curva_valor(rendimientos, tipo)
+    curva = _curva_con_capital_inicial(rendimientos, tipo)
     maximo = curva.cummax()
     caidas = curva / maximo - 1.0
 
@@ -66,7 +103,11 @@ def tabla_caidas(rendimientos, tipo: str | None = None, n: int = 5) -> pd.DataFr
             continue
         posicion_suelo = tramo.idxmin()
         anteriores = curva.loc[:posicion_suelo]
-        fecha_pico = anteriores.idxmax()
+        # La ULTIMA fecha en la que se alcanzo el maximo, no la primera: con
+        # una curva plana en el techo antes de caer, 'idxmax' databa la caida
+        # desde el primer dia de la meseta e inflaba su duracion.
+        cima = anteriores[anteriores == anteriores.max()]
+        fecha_pico = cima.index[-1]
         posteriores = curva.loc[posicion_suelo:]
         recuperados = posteriores[posteriores >= curva.loc[fecha_pico]]
         fecha_recuperacion = recuperados.index[0] if len(recuperados) else pd.NaT

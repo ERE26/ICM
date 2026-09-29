@@ -119,6 +119,15 @@ def bootstrap_historico(
     sueltos (bootstrap por bloques), lo que conserva el agrupamiento de
     volatilidad: en la realidad los dias malos vienen seguidos, y muestrear al
     azar destruiria justo esa dependencia.
+
+    El bootstrap por bloques es **circular**: el bloque que empieza cerca del
+    final continua por el principio de la muestra. Sin eso, las observaciones
+    de los extremos entran muchas menos veces que las del centro -- con 60
+    observaciones y bloques de 10, diez veces menos -- y como las series
+    financieras van en orden cronologico, eso penaliza sistematicamente las
+    sesiones **mas recientes**. Medido: la misma crisis de diez sesiones,
+    movida del centro al final de la muestra, perdia el 41 % de su
+    probabilidad de cola.
     """
     marco = como_matriz(rendimientos_activos, "rendimientos")
     vector_pesos = normalizar_pesos(pesos, marco.columns).to_numpy(float)
@@ -136,17 +145,40 @@ def bootstrap_historico(
     else:
         if tamano_bloque < 1:
             raise ErrorDatos("El tamanio de bloque debe ser positivo.")
+        if tamano_bloque > n_observaciones:
+            raise ErrorDatos(
+                f"El bloque ({tamano_bloque}) no cabe en la muestra "
+                f"({n_observaciones} observaciones): todas las trayectorias serian "
+                "la misma. Reduzca 'tamano_bloque' o alargue la historia."
+            )
         n_bloques = int(np.ceil(horizonte / tamano_bloque))
-        maximo_inicio = max(n_observaciones - tamano_bloque, 0) + 1
-        inicios = generador.integers(0, maximo_inicio, size=(n_simulaciones, n_bloques))
+        # Circular: cualquier observacion puede iniciar un bloque, de modo que
+        # todas entran exactamente 'tamano_bloque' veces.
+        inicios = generador.integers(0, n_observaciones, size=(n_simulaciones, n_bloques))
         desplazamientos = np.arange(tamano_bloque)
         indices = (inicios[:, :, None] + desplazamientos[None, None, :]) % n_observaciones
         indices = indices.reshape(n_simulaciones, -1)[:, :horizonte]
 
     trayectorias = historico[indices]  # (n_simulaciones, horizonte, n_activos)
+    # La suma ponderada de rendimientos solo es exacta en convencion SIMPLE:
+    # el logaritmo de una suma no es la suma de logaritmos. La marca que deja
+    # 'icm.datos.precios.rendimientos' dice en cual estamos, y antes no se
+    # miraba: con rendimientos logaritmicos la media a 21 dias se desviaba
+    # entre un 118 % y un 262 %.
+    if _es_logaritmico(rendimientos_activos, marco):
+        trayectorias = np.expm1(trayectorias)
     rendimiento_cartera = trayectorias @ vector_pesos
     acumulado = np.prod(1.0 + rendimiento_cartera, axis=1) - 1.0
     return pd.Series(acumulado, name="rendimiento_bootstrap")
+
+
+def _es_logaritmico(original, marco: pd.DataFrame) -> bool:
+    """Lee la convencion de la marca que deja ``rendimientos``."""
+    for fuente in (original, marco):
+        marca = getattr(fuente, "attrs", {}).get("tipo_rendimiento")
+        if marca is not None:
+            return str(marca) == "log"
+    return False
 
 
 def var_montecarlo(simulaciones, nivel: float = 0.99) -> float:
@@ -173,6 +205,14 @@ def resumen_simulacion(
 ) -> pd.Series:
     """Resume una distribucion simulada: cuantiles, VaR, ES y probabilidades de perdida."""
     valores = np.asarray(simulaciones, dtype=float)
+    if valores.size < 2:
+        raise ErrorDatos(
+            f"Hacen falta al menos 2 simulaciones para resumir una distribucion; "
+            f"se han recibido {valores.size}. Con una, la desviacion sale NaN y el "
+            "VaR es el propio valor."
+        )
+    if not np.isfinite(valores).any():
+        raise ErrorDatos("Todas las simulaciones son NaN o infinitas.")
     resumen = {
         "simulaciones": float(valores.size),
         "media": float(valores.mean()),
@@ -182,16 +222,27 @@ def resumen_simulacion(
         "maximo": float(valores.max()),
         "prob_perdida": float((valores < 0).mean()),
     }
+    # Las etiquetas llevan los decimales que hagan falta: con '{:.0%}', el
+    # 99,5 % y el 99,9 % daban los dos "100%", el segundo pisaba al primero
+    # dentro del diccionario y el que quedaba salia con una etiqueta que no
+    # era la suya.
     for nivel in niveles:
-        resumen[f"var_{nivel:.0%}"] = var_montecarlo(valores, nivel)
-        resumen[f"es_{nivel:.0%}"] = es_montecarlo(valores, nivel)
+        resumen[f"var_{_etiqueta_nivel(nivel)}"] = var_montecarlo(valores, nivel)
+        resumen[f"es_{_etiqueta_nivel(nivel)}"] = es_montecarlo(valores, nivel)
     for umbral in umbrales_perdida:
-        resumen[f"prob_perder_mas_{umbral:.0%}"] = float((valores < -umbral).mean())
+        resumen[f"prob_perder_mas_{_etiqueta_nivel(umbral)}"] = float((valores < -umbral).mean())
     if valor_cartera is not None:
         for nivel in niveles:
-            resumen[f"var_{nivel:.0%}_monetario"] = resumen[f"var_{nivel:.0%}"] * valor_cartera
-            resumen[f"es_{nivel:.0%}_monetario"] = resumen[f"es_{nivel:.0%}"] * valor_cartera
+            etiqueta = _etiqueta_nivel(nivel)
+            resumen[f"var_{etiqueta}_monetario"] = resumen[f"var_{etiqueta}"] * valor_cartera
+            resumen[f"es_{etiqueta}_monetario"] = resumen[f"es_{etiqueta}"] * valor_cartera
     return pd.Series(resumen, name="simulacion")
+
+
+def _etiqueta_nivel(nivel: float) -> str:
+    """Porcentaje con los decimales justos para no colisionar."""
+    texto = f"{nivel * 100:.4f}".rstrip("0").rstrip(".")
+    return f"{texto}%"
 
 
 def trayectorias_simuladas(

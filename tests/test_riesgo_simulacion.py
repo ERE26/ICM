@@ -121,17 +121,29 @@ def test_el_bootstrap_reproduce_el_riesgo_historico(rend, pesos_iguales):
 
 def test_el_bootstrap_por_bloques_toma_tramos_consecutivos(pesos_iguales):
     # Con el bloque igual al horizonte, cada trayectoria simulada tiene que ser
-    # literalmente una ventana consecutiva de la historia.
+    # literalmente una ventana consecutiva de la historia. La version anterior
+    # de esta prueba construia la referencia con mode="wrap" y comparaba con
+    # <=, asi que la cumplian por igual la implementacion circular y la que no
+    # lo es: el conjunto envolvente contiene al otro. Aqui se separan las
+    # ventanas que cruzan el final y se exige que salgan, que es justo lo que
+    # el muestreo no circular no puede producir.
     generador = np.random.default_rng(17)
     historia = pd.DataFrame(generador.standard_normal((60, 3)) * 0.01, columns=pesos_iguales.index)
     simulaciones = bootstrap_historico(historia, pesos_iguales, 200, horizonte=5, tamano_bloque=5, semilla=18)
 
     cartera = historia.mul(pesos_iguales, axis=1).sum(axis=1).to_numpy()
-    ventanas = {
-        round(float(np.prod(1.0 + np.take(cartera, range(i, i + 5), mode="wrap")) - 1.0), 10)
-        for i in range(len(cartera))
-    }
-    assert {round(float(v), 10) for v in simulaciones} <= ventanas
+    n = len(cartera)
+
+    def acumulado(inicio):
+        tramo = np.take(cartera, range(inicio, inicio + 5), mode="wrap")
+        return round(float(np.prod(1.0 + tramo) - 1.0), 10)
+
+    interiores = {acumulado(i) for i in range(n - 4)}
+    envolventes = {acumulado(i) for i in range(n - 4, n)}
+    obtenidas = {round(float(v), 10) for v in simulaciones}
+
+    assert obtenidas <= interiores | envolventes
+    assert obtenidas & envolventes, "el muestreo no esta llegando al final de la serie"
 
 
 def test_el_bootstrap_por_bloques_puede_repetir_una_crisis_entera(pesos_iguales):
@@ -270,3 +282,116 @@ def test_la_copula_gaussiana_es_el_limite_de_la_t_con_muchos_grados():
     log_gaussiana = CopulaGaussiana(correlacion).log_verosimilitud(uniformes)
     log_t = CopulaT(correlacion, 200.0).log_verosimilitud(uniformes)
     assert log_t == pytest.approx(log_gaussiana, rel=0.05)
+
+
+def test_la_verosimilitud_no_depende_del_orden_de_las_columnas():
+    # Las uniformes se cruzaban con la matriz de correlacion por POSICION
+    # aunque ambas llevan etiquetas: bastaba reordenar las columnas -- un
+    # reindex, un merge, un groupby -- para evaluar la verosimilitud de otro
+    # modelo sin que nada avisara. Medido sobre estos mismos tres activos, la
+    # gaussiana daba +788,19 con el orden natural y -3654,30 con el inverso.
+    generador = np.random.default_rng(7)
+    ruido = generador.standard_normal((600, 3))
+    datos = pd.DataFrame(
+        {
+            "A": ruido[:, 0],
+            "B": 0.9 * ruido[:, 0] + 0.44 * ruido[:, 1],
+            "C": -0.8 * ruido[:, 0] + 0.6 * ruido[:, 2],
+        }
+    )
+    uniformes = pseudo_observaciones(datos)
+    invertidas = uniformes[["C", "B", "A"]]
+    for copula in (ajustar_copula_gaussiana(datos), ajustar_copula_t(datos)):
+        assert copula.log_verosimilitud(invertidas) == pytest.approx(
+            copula.log_verosimilitud(uniformes)
+        )
+
+
+def test_la_verosimilitud_exige_los_activos_de_la_copula(rend):
+    copula = ajustar_copula_t(rend)
+    with pytest.raises(ErrorDatos, match="Faltan columnas"):
+        copula.log_verosimilitud(pseudo_observaciones(rend[[rend.columns[0]]]))
+
+
+def test_la_dependencia_de_cola_declarada_es_la_que_se_simula():
+    # simular_uniformes proyectaba la matriz sobre las definidas positivas y
+    # dependencia_cola leia la original, asi que el objeto declaraba una cosa
+    # y generaba otra. Aqui la matriz pedida no es definida positiva (menor
+    # autovalor -0,043) y las dos cifras tienen que salir de la reparada.
+    pedida = pd.DataFrame(
+        [[1.0, 0.92, 0.92], [0.92, 1.0, 0.58], [0.92, 0.58, 1.0]],
+        index=list("ABC"),
+        columns=list("ABC"),
+    )
+    with pytest.warns(RuntimeWarning, match="definidas positivas"):
+        copula = CopulaT(pedida, 3.0)
+
+    guardada = float(copula.correlacion.loc["A", "C"])
+    assert guardada < 0.92  # la reparacion ha movido la correlacion pedida
+
+    simuladas = copula.simular_uniformes(200_000, semilla=1)
+    # La correlacion que de verdad se simula, leida de los rangos: tiene que
+    # ser la guardada (0,8898), no la pedida (0,9200). Es la comprobacion
+    # limpia; la lambda empirica converge muy despacio y no sirve de arbitro.
+    tau = simuladas[["A", "C"]].corr(method="kendall").iloc[0, 1]
+    assert float(np.sin(np.pi * tau / 2.0)) == pytest.approx(guardada, abs=0.01)
+
+    # Y la dependencia de cola declarada sale de esa misma matriz.
+    declarada = copula.dependencia_cola(("A", "C"))
+    condicionante = simuladas["C"] <= 0.01
+    observada = float(((simuladas["A"] <= 0.01) & condicionante).sum() / condicionante.sum())
+    assert observada == pytest.approx(declarada, abs=0.05)
+
+
+def test_una_correlacion_groseramente_imposible_se_rechaza():
+    # A y C casi perfectamente opuestos, y los dos casi identicos a B: no hay
+    # ningun conjunto de activos con esas correlaciones. Repararla en silencio
+    # devolvia cifras de riesgo de una matriz distinta de la pedida.
+    imposible = pd.DataFrame(
+        [[1.0, 0.99, -0.99], [0.99, 1.0, 0.99], [-0.99, 0.99, 1.0]],
+        index=list("ABC"),
+        columns=list("ABC"),
+    )
+    with pytest.raises(ErrorDatos, match="semidefinida positiva"):
+        CopulaGaussiana(imposible)
+
+
+@pytest.mark.parametrize("grados", [1.5, 2.0, -3.0, float("nan")])
+def test_la_copula_t_rechaza_grados_de_libertad_imposibles(grados):
+    correlacion = pd.DataFrame([[1.0, 0.4], [0.4, 1.0]], index=["X", "Y"], columns=["X", "Y"])
+    with pytest.raises(ErrorDatos, match="mayores que 2"):
+        CopulaT(correlacion, grados)
+
+
+def test_se_puede_simular_con_columnas_no_textuales(rend):
+    # 'activos' devuelve str(c), asi que con columnas numericas el simulador
+    # indexaba las uniformes con un nombre que no existia: KeyError: 0.
+    numerico = rend.copy()
+    numerico.columns = range(rend.shape[1])
+    simulados = simular_rendimientos_copula(numerico, n_simulaciones=2_000, semilla=21)
+    assert list(simulados.columns) == list(numerico.columns)
+    for posicion in numerico.columns:
+        assert simulados[posicion].mean() == pytest.approx(numerico[posicion].mean(), abs=0.002)
+
+
+def test_el_var_de_la_copula_no_suma_rendimientos_logaritmicos(rend, pesos_iguales):
+    # El rendimiento de una cartera no es la media ponderada de los
+    # logaritmos. Con la marca puesta hay que pasar por expm1 antes de
+    # ponderar, igual que hace el bootstrap.
+    logaritmicos = rend.copy()
+    logaritmicos.attrs["tipo_rendimiento"] = "log"
+    simples = rend.copy()
+    simples.attrs["tipo_rendimiento"] = "simple"
+
+    con_log = var_copula(logaritmicos, pesos_iguales, 0.99, "gaussiana", 20_000, semilla=22)
+    con_simple = var_copula(simples, pesos_iguales, 0.99, "gaussiana", 20_000, semilla=22)
+    assert con_log["var"] != pytest.approx(con_simple["var"], rel=1e-9)
+    # La concavidad del logaritmo hace que la perdida verdadera sea menor.
+    assert con_log["var"] < con_simple["var"]
+
+
+def test_simular_con_una_copula_de_otros_activos_da_error(rend):
+    copula = ajustar_copula_t(rend)
+    otros = rend.rename(columns={c: f"otro_{c}" for c in rend.columns})
+    with pytest.raises(ErrorDatos, match="alinee las columnas"):
+        simular_rendimientos_copula(otros, copula, 100)

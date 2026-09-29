@@ -460,12 +460,23 @@ def objetivo_volatilidad(
         :func:`senal_desde_prediccion`.
     volatilidad_realizada:
         Volatilidad **anualizada** estimada con informacion disponible en cada
-        fecha, indexada como la senal. Por ejemplo
-        ``icm.riesgo.volatilidad.volatilidad_movil(rendimientos, 21,
-        anualizar=True)``. Si los numeros parecen volatilidades por periodo se
-        avisa con un ``UserWarning``, porque el error es facil de cometer y su
-        efecto (multiplicador enorme, recorte permanente en ``limite``) no salta
-        a la vista en el resultado.
+        fecha, indexada como la senal. Si los numeros parecen volatilidades por
+        periodo se avisa con un ``UserWarning``, porque el error es facil de
+        cometer y su efecto (multiplicador enorme, recorte permanente en
+        ``limite``) no salta a la vista en el resultado.
+
+        **Que la estimacion no incluya la fecha que dimensiona.** Este ejemplo
+        recomendaba ``volatilidad_movil(rendimientos, 21, anualizar=True)``,
+        cuyo valor en ``t`` incorpora ``r_t``: la posicion de hoy se encoge
+        sola en los dias en que el mercado se mueve mucho, que es saber el
+        resultado antes de apostar. Medido sobre cuatro series reales con una
+        senal constante y objetivo del 10 %, la fuga daba una volatilidad
+        realizada de 10,12 %-10,21 % en las cuatro -- el objetivo clavado, que
+        es la senal de que algo va mal -- y un peor dia de -2,5 %. Sin ella,
+        la volatilidad realizada va del 11,1 % al 19,9 %, el peor dia del WTI
+        pasa de -2,82 % a -11,74 % y su maxima caida de -34,78 % a -45,03 %.
+        Use ``volatilidad_movil(..., prevision=True)``,
+        ``volatilidad_ewma(rendimientos, anualizar=True)`` o un GARCH.
     objetivo_anual:
         Volatilidad anual a la que se apunta. 0.10 es un objetivo tipico de un
         fondo sistematico diversificado.
