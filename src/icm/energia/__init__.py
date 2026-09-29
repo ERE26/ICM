@@ -21,6 +21,14 @@ hay variables exogenas con poder predictivo real.
     Perfiles, descomposicion y contraste de la estacionalidad anual y semanal.
 """
 
+from icm.energia.almacenamiento import (
+    ALMACENAMIENTOS,
+    Despacho,
+    ParametrosAlmacenamiento,
+    despacho_optimo,
+    liquidar_plan,
+    valor_de_la_prevision,
+)
 from icm.energia.curvas import (
     descomponer_rendimiento,
     dias_a_vencimiento,
@@ -72,6 +80,12 @@ from icm.energia.spreads import (
 )
 
 __all__ = [
+    "valor_de_la_prevision",
+    "liquidar_plan",
+    "despacho_optimo",
+    "ParametrosAlmacenamiento",
+    "Despacho",
+    "ALMACENAMIENTOS",
     "CATALOGO",
     "Descomposicion",
     "HABILIDAD_PREVISION",

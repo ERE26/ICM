@@ -200,6 +200,42 @@ continua = serie_continua(contratos, vencimientos, metodo="ratio", dias_antes=5)
 descomponer_rendimiento(continua)   # separa el precio del carry
 ```
 
+**`almacenamiento`** — El activo que sí cobra el patrón. El cuaderno 03 llega a
+que el mayor patrón del pool —el ciclo semanal— da Sharpe +4,4 con rentabilidad
+compuesta de −100 %: no es estadística, es que **la electricidad no se
+almacena**. Quien lo cobra es una batería, y este módulo la despacha.
+
+```python
+from icm.energia import despacho_optimo, valor_de_la_prevision, ALMACENAMIENTOS
+
+plan = despacho_optimo(precios_horarios, "bateria_4h")   # programación lineal
+plan.resumen()                                            # margen, ciclos, energía movida
+
+valor_de_la_prevision(precios_reales, {"mi_modelo": prevision}, "bateria_4h")
+```
+
+La segunda función es la que cambia la pregunta. En vez de «¿predigo el precio?»
+—que en el spot no se puede y además no se cobra— mide **qué fracción del
+máximo teórico captura una previsión**, despachando con ella y liquidando a los
+precios realizados. Tiene una propiedad que ninguna métrica de error tiene:
+**está acotada por arriba por construcción**. Un MASE se puede hacer bajar
+eligiendo mal la referencia, como pasó en este mismo proyecto; un 78 % del
+oráculo no se puede inflar por encima de 100.
+
+Medido sobre los 67 512 períodos horarios reales de OMIE (2018-2025), batería de
+1 MW / 4 h con rendimiento 0,85 y 3 €/MWh de degradación:
+
+| | €/año por MW | % del oráculo |
+|---|---:|---:|
+| Oráculo (conoce el día) | 42 088 | 100,0 |
+| Repetir el perfil de ayer | 29 930 | 71,1 |
+| Perfil por tipo de día, 60 d | 32 855 | **78,1** |
+
+Un perfil móvil trivial ya bate a la referencia en un 10 %, y quedan **9 200
+€/MW·año** entre eso y el techo. Ese hueco es lo que se disputa un modelo — y es
+la diferencia con predecir rendimientos diarios, donde el MASE se quedaba en
+0,94-0,99 y el IC salía negativo.
+
 **`simulacion`** y **`estacionalidad`** — Escenarios sintéticos con señal
 predecible real, para trabajar sin acceso a los mercados, y descomposición
 estacional con contraste de Kruskal-Wallis.
