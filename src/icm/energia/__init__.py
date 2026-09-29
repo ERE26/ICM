@@ -17,6 +17,10 @@ hay variables exogenas con poder predictivo real.
 ``curvas``
     Estructura temporal de futuros y el rolado de contratos, sin el cual un
     backtest de futuros se inventa el beneficio.
+``curvas_oferta``
+    La pila de ofertas del diario de OMIE y cuanto mueve el precio operar en
+    ella. Es lo que permite dejar de suponer que el activo es precio
+    aceptante, hipotesis que a 500 MW se come el 35 % del margen.
 ``estacionalidad``
     Perfiles, descomposicion y contraste de la estacionalidad anual y semanal.
 """
@@ -32,6 +36,16 @@ from icm.energia.almacenamiento import (
     valor_de_la_prevision,
     valor_van_de_la_prevision,
     van_almacenamiento,
+)
+from icm.energia.curvas_oferta import (
+    ELASTICIDAD_OMIE,
+    casacion,
+    contrastar_casacion,
+    impacto_estimado,
+    impacto_precio,
+    leer_curva_agregada,
+    margen_con_impacto,
+    tramo_de_precio,
 )
 from icm.energia.curvas import (
     descomponer_rendimiento,
@@ -84,6 +98,14 @@ from icm.energia.spreads import (
 )
 
 __all__ = [
+    "ELASTICIDAD_OMIE",
+    "casacion",
+    "contrastar_casacion",
+    "impacto_estimado",
+    "impacto_precio",
+    "leer_curva_agregada",
+    "margen_con_impacto",
+    "tramo_de_precio",
     "van_almacenamiento",
     "valor_van_de_la_prevision",
     "curva_margen_por_capacidad",

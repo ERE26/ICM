@@ -1,0 +1,9 @@
+concepto,anio,valor,unidad,fuente
+banda_regulacion_secundaria_subir,2024,34.28,EUR/MW por hora de banda asignada,"REE, Informe del Sistema Electrico 2024, Mercados de reserva"
+banda_regulacion_secundaria_bajar,2024,36.7,"EUR/MWh (desde noviembre, con el SRS en operacion)","REE, Informe del Sistema Electrico 2024, Mercados de reserva"
+banda_media_horaria_asignada_subir,2024,922.0,MW,"REE, Informe del Sistema Electrico 2024, Mercados de reserva"
+coste_total_servicios_ajuste,2024,2668.0,millones de EUR,"REE, Informe del Sistema Electrico 2024"
+coste_total_servicios_ajuste,2023,1751.0,millones de EUR,"REE, series historicas"
+coste_total_servicios_ajuste,2022,1104.0,millones de EUR,"REE, series historicas"
+coste_total_servicios_ajuste,2021,724.0,millones de EUR,"REE, series historicas"
+coste_total_servicios_ajuste,2025,3347.0,millones de EUR,"REE, series historicas"

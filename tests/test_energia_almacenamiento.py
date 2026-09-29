@@ -9,6 +9,8 @@ conocido.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -452,3 +454,58 @@ def test_el_valor_van_de_la_prevision_ordena_oraculo_ingenua():
     assert tabla.loc["ingenua", "van"] < tabla.loc["oraculo", "van"]
     # La diferencia de VAN es el valor maximo que puede tener un modelo.
     assert tabla.loc["oraculo", "van"] - tabla.loc["ingenua", "van"] > 0.0
+
+
+# --- La cadencia del indice frente a 'horas_por_periodo' -----------------
+
+
+def test_una_serie_cuartohoraria_con_ficha_horaria_avisa():
+    """El error que 'omie_intradiario.csv' provoca con los parametros de serie.
+
+    El fichero real del proyecto es horario hasta el 2025-09-30 y
+    cuarto-horario desde el 2025-10-01. Despacharlo con el valor por omision
+    de una hora multiplica por cuatro la energia del ultimo tercio, y el plan
+    resultante sigue siendo factible, asi que nada lo delata.
+    """
+    indice = pd.date_range("2024-01-01", periods=96, freq="15min")
+    precios = pd.Series(np.tile([10.0, 20.0, 80.0, 90.0], 24), index=indice)
+    with pytest.warns(RuntimeWarning, match="avanza 0.25 h"):
+        despacho_optimo(precios, "bateria_4h")
+
+
+def test_una_serie_horaria_limpia_no_avisa():
+    indice = pd.date_range("2024-01-01", periods=96, freq="h")
+    precios = pd.Series(np.tile([10.0, 20.0, 80.0, 90.0], 24), index=indice)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        despacho_optimo(precios, "bateria_4h")
+
+
+def test_el_cambio_de_hora_no_cuenta_como_cadencia_mixta():
+    """Un salto raro al anio es el horario de verano, no un fichero mixto.
+
+    El caso se construye en hora local sin huso, que es como llegan los
+    ficheros de OMIE: en el cambio de marzo falta la hora de las dos, asi que
+    el indice tiene un salto de 2 h de verdad. Si el aviso saltara con esto
+    seria ruido en toda serie horaria europea, y un aviso que siempre salta no
+    se lee.
+    """
+    horas = pd.date_range("2024-03-30", periods=120, freq="h")
+    indice = horas[(horas.month != 3) | (horas.day != 31) | (horas.hour != 2)]
+    precios = pd.Series(np.arange(len(indice), dtype=float) % 4 * 30.0, index=indice)
+    saltos = indice.to_series().diff().dropna().unique()
+    assert len(saltos) == 2, "el caso tiene que tener un salto de 2 h de verdad"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        despacho_optimo(precios, "bateria_4h")
+
+
+def test_una_ficha_cuartohoraria_con_serie_cuartohoraria_no_avisa():
+    indice = pd.date_range("2024-01-01", periods=96, freq="15min")
+    precios = pd.Series(np.tile([10.0, 20.0, 80.0, 90.0], 24), index=indice)
+    ficha = ParametrosAlmacenamiento(
+        nombre="cuarto-horaria", capacidad=4.0, potencia=1.0, horas_por_periodo=0.25
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        despacho_optimo(precios, ficha)

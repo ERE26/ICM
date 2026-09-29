@@ -174,6 +174,130 @@ Solapa 1 004 días con OMIE (2018-01-01 a 2020-09-30). OPSD dejó de
 actualizarse en octubre de 2020, así que para años posteriores haría falta
 ENTSO-E directamente, que pide un token gratuito.
 
+## La pila de ofertas de OMIE, y por qué hizo falta bajar a ella
+
+Hasta aquí todo eran precios. Un precio no basta para una pregunta concreta:
+**cuánto mueve el precio el propio activo al operar**. Eso no se puede
+responder con series de precios, porque un precio es el resultado de la
+casación, no la curva que la produjo. Hace falta la pila de ofertas.
+
+OMIE publica la [curva agregada de oferta y
+demanda](https://www.omie.es/es/file-access-list?parents=curva_pbc_uof&dir=Curvas%20agregadas%20de%20oferta%20y%20demanda%20del%20mercado%20diario)
+de cada sesión del diario: todas las ofertas de compra y de venta de cada
+período, con precio, cantidad y si quedaron casadas. Pesan unos 7 MB por
+sesión, así que **no se guardan en el repositorio**: se descargaron 21
+sesiones, se midió sobre ellas y lo que queda aquí es el resultado.
+
+Las 21 sesiones, elegidas para cubrir los tres formatos del fichero, las
+cuatro estaciones y los dos regímenes de precio (la crisis del gas y la
+normalización posterior):
+
+```
+2023-01-17  2023-03-21  2023-04-18  2023-07-18  2023-10-17
+2024-01-03  2024-01-17  2024-04-18  2024-04-21  2024-07-18  2024-10-17
+2025-01-08  2025-01-17  2025-04-18  2025-04-20  2025-07-18  2025-10-17
+2026-01-17  2026-01-18  2026-04-18  2026-07-18
+```
+
+Son 864 períodos: 384 horarios y 480 cuarto-horarios.
+
+### El fichero ha cambiado de formato dos veces
+
+Y las tres variantes conviven en el histórico, así que un lector que solo
+entienda una de ellas suma mal:
+
+| Variante | Columnas | Etiqueta de período | Vigencia |
+|---|---|---|---|
+| 1 | `Hora` + `Energía` (MWh) | enteros 1–24 | hasta 2025-04-17 |
+| 2 | `Período` + `Potencia` (MW) | enteros 1–24 | 2025-04-18 a 2025-09-30 |
+| 3 | `Período` + `Potencia` (MW) | `H1Q1`…`H24Q4` | desde 2025-10-01 |
+
+El detalle que hay que acertar es que **en las variantes 2 y 3 la cantidad es
+potencia, no energía**. Con períodos horarios coincide numéricamente, así que
+el error pasa desapercibido durante cinco meses de datos; con
+cuarto-horarios sobrestima la energía por cuatro. `leer_curva_agregada`
+deduce la duración de cuántos períodos tiene el día, con la misma regla que
+ya usaba el cargador de precios.
+
+### Comprobación de autenticidad: el precio publicado sale de la curva
+
+Es el contraste que decide si la lectura vale para algo, porque una curva mal
+leída daría impactos plausibles y falsos sin que nada lo delatara. El precio
+publicado tiene que poder reconstruirse de la propia pila:
+
+| Resultado | Períodos | % |
+|---|---:|---:|
+| Coincide **exacto** con el máximo de venta casada o el mínimo de compra casada | 709 | 82,1 % |
+| Cae **dentro del cruce**, entre ambos | 134 | 15,5 % |
+| Queda fuera | 21 | 2,4 % |
+
+El 15,5 % del medio no es un fallo de lectura: la curva agregada viene
+redondeada a MWh enteros y la unidad marginal se casa parcialmente, así que el
+equilibrio cae *entre* los dos extremos y no sobre uno de ellos. El error
+mediano ahí es de 0,24 €/MWh y el percentil 99 de 2,00.
+
+El 2,4 % restante se explica por la **separación de mercados**: cuando la
+interconexión con Portugal se satura, España y Portugal casan por separado y
+el precio español no es el de la casación ibérica única que describe el
+fichero. Se ve en la etiqueta de país de las ofertas casadas — en los 43
+períodos marcados `ES,PT` el acierto baja al 53,5 %, frente al 83,6 % de los
+821 marcados `MI`.
+
+Nada de esto afecta a la medida de impacto, y la razón importa: **el impacto
+es una diferencia de dos puntos leídos de la misma curva**, así que un sesgo
+de nivel se cancela. Lo que lo haría falso sería leer mal la *pendiente*, y la
+pendiente es justo lo que confirma el contraste del cruce.
+
+### Lo que salió: el impacto no es simétrico
+
+`omie_elasticidad_oferta.csv`, 25 filas. Mediana del movimiento del precio
+marginal, en €/MWh:
+
+| Tramo | % de horas | Subir al comprar 500 MW | Bajar al vender 500 MW |
+|---|---:|---:|---:|
+| < 5 €/MWh | 6,0 % | 0,48 | 2,29 |
+| 5–25 | 6,6 % | 7,06 | 7,51 |
+| 25–60 | 36,0 % | 5,71 | 6,89 |
+| 60–120 | 31,6 % | 3,83 | 9,68 |
+| > 120 | 19,7 % | 1,44 | **20,01** |
+
+Añadir 500 MW de demanda sube el precio 1,93 €/MWh en la mediana global;
+añadir 500 MW de oferta lo baja 10,57. Un factor de **5,5**. La razón es
+económica y no un artefacto: la demanda eléctrica es mucho más inelástica que
+la oferta, porque buena parte se oferta al límite del mercado —tiene que
+consumir pase lo que pase—, así que en cuanto se agota el tramo elástico el
+precio se desploma. La oferta, en cambio, tiene un tramo plano largo de
+renovables a coste cero.
+
+Y la asimetría va **justo en contra del almacenamiento**, porque se ordena por
+nivel de precio al revés de como opera una batería: carga en el tramo barato,
+donde comprar casi no mueve el precio (0,48), y descarga en el caro, donde
+vender lo hunde 20,01. El activo destruye el pico del que vive.
+
+## Servicios de ajuste
+
+`ree_servicios_ajuste.csv`, 8 filas, transcritas a mano del [Informe del
+Sistema Eléctrico](https://www.sistemaelectrico-ree.es/informe-del-sistema-electrico)
+de Red Eléctrica — no hay descarga automática porque las cifras están en el
+PDF del informe.
+
+Hacen falta porque son el ingreso que `ParametrosInversion` pide a mano y que
+el proyecto no tenía de ninguna fuente: el precio de la **banda de regulación
+secundaria**, 34,28 €/MW por hora asignada en 2024, y el coste total de los
+servicios de ajuste, que pasó de 724 M€ en 2021 a 3 347 M€ en 2025.
+
+La unidad del 34,28 no venía indicada sin ambigüedad en el informe, así que se
+comprobó aritméticamente: con una banda media asignada de 922 MW, 34,28 ×
+922 × 8 760 = **277 M€**, el 10,4 % de los 2 668 M€ de servicios de ajuste de
+2024. Cuadra con que la banda secundaria sea una partida mediana del total, lo
+que confirma que es €/MW **y por hora**, no por año ni por MWh.
+
+**El mercado de capacidad no tiene histórico que buscar.** Se creó el 15 de
+septiembre de 2026, dos semanas antes de esta descarga, así que no existe
+serie de precios de capacidad para España. Cualquier cifra que se pusiera ahí
+sería inventada, y por eso `ingreso_adicional_anual_por_mw` sigue valiendo
+cero por omisión.
+
 ## Lo que no se pudo conseguir
 
 - **ESIOS** necesita un token personal gratuito que se pide por correo a
@@ -187,3 +311,9 @@ ENTSO-E directamente, que pide un token gratuito.
 - **TTF y derechos de emisión EUA.** El primero lo publica ICE bajo licencia y
   el segundo EEX; ninguno tiene descarga abierta comparable. Por eso el CO2
   entra en el cuaderno como análisis de sensibilidad y no como serie.
+- **Precios del mercado de capacidad.** No es que estén cerrados: **no
+  existen**. El mercado se creó el 15 de septiembre de 2026.
+- **Curvas agregadas de OMIE completas.** Están abiertas y se descargan sin
+  credencial, pero son ~7 MB por sesión y hay más de 3 000 sesiones. Se
+  tomaron 21, que bastan para medir la pendiente de la pila; no bastarían para
+  un estudio de cómo ha ido cambiando esa pendiente con los años.

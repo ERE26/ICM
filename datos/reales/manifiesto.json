@@ -199,6 +199,34 @@
    "desde": "2015-01-01",
    "hasta": "2020-09-30",
    "sha256_12": "69fe39ed83cb"
+  },
+  {
+   "fichero": "omie_impacto_precio.csv",
+   "descripcion": "Impacto en el precio marginal de OMIE de aniadir 50 a 1000 MW de demanda o de oferta, periodo a periodo, EUR/MWh. Derivado.",
+   "origen": "Calculado con icm.energia.curvas_oferta a partir de 21 ficheros de curva agregada del diario de OMIE",
+   "url_origen": "https://www.omie.es/es/file-access-list?parents=curva_pbc_uof",
+   "columna_fecha": "fecha",
+   "filas": 864,
+   "sha256_12": "a023e5aed175",
+   "desde": "2023-01-17",
+   "hasta": "2026-07-18"
+  },
+  {
+   "fichero": "omie_elasticidad_oferta.csv",
+   "descripcion": "Elasticidad mediana de la pila de ofertas por tramo de precio y potencia, los dos lados del mercado, EUR/MWh. Derivado.",
+   "origen": "Agregado de omie_impacto_precio.csv; embebido en icm.energia.curvas_oferta.ELASTICIDAD_OMIE",
+   "url_origen": "https://www.omie.es/es/file-access-list?parents=curva_pbc_uof",
+   "filas": 25,
+   "sha256_12": "729b2fd4ab5f"
+  },
+  {
+   "fichero": "ree_servicios_ajuste.csv",
+   "descripcion": "Precio de la banda de regulacion secundaria y coste total de los servicios de ajuste del sistema espaniol, 2021-2025.",
+   "origen": "Transcrito a mano del Informe del Sistema Electrico de Red Electrica; las cifras estan en el PDF del informe y no hay descarga automatica",
+   "url_origen": "https://www.sistemaelectrico-ree.es/informe-del-sistema-electrico",
+   "filas": 8,
+   "sha256_12": "47e9c12f2afb"
   }
- ]
+ ],
+ "derivados": "omie_impacto_precio.csv, omie_elasticidad_oferta.csv y ree_servicios_ajuste.csv no son descargas directas: los dos primeros se calculan de las curvas agregadas de OMIE, que pesan unos 7 MB por sesion y no se versionan, y el tercero esta transcrito del informe anual de REE. Las 21 sesiones usadas estan listadas en el README de esta carpeta para que el calculo se pueda repetir."
 }

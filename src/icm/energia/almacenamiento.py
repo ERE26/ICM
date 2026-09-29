@@ -56,6 +56,7 @@ arbitraje destruye valor aunque el margen de energia salga positivo.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -352,6 +353,7 @@ def despacho_optimo(
             f"La carga inicial ({carga_inicial}) tiene que estar entre 0 y la capacidad "
             f"({ficha.capacidad})."
         )
+    _avisar_si_la_duracion_no_cuadra(serie, ficha)
 
     valores = serie.to_numpy(dtype=float)
     carga = np.zeros_like(valores)
@@ -381,6 +383,63 @@ def despacho_optimo(
         )
 
     return _construir_despacho(serie, carga, descarga, ficha, float(carga_inicial))
+
+
+def _avisar_si_la_duracion_no_cuadra(
+    serie: pd.Series, ficha: ParametrosAlmacenamiento
+) -> None:
+    """Avisa si ``horas_por_periodo`` no cuadra con la cadencia del indice.
+
+    Hace falta porque el parametro es un escalar y la serie puede no serlo.
+    ``datos/reales/omie_intradiario.csv`` es el caso exacto: es horario hasta
+    el 2025-09-30 y cuarto-horario desde el 2025-10-01, cuando el mercado
+    cambio de cadencia. Despacharlo entero con el valor por omision de una
+    hora **multiplica por cuatro la energia** del ultimo tercio de la muestra,
+    y el error no salta a la vista: el plan sigue siendo factible y el margen
+    sale simplemente demasiado alto.
+
+    Se avisa y no se aborta porque despachar una serie de cadencia mixta es
+    una decision legitima si se sabe lo que se hace --por ejemplo para ver la
+    forma del plan y no su magnitud--, y porque hay indices sin cadencia
+    regular por razones validas. Pero por omision tiene que doler.
+    """
+    if not isinstance(serie.index, pd.DatetimeIndex) or len(serie) < 3:
+        return
+    separaciones = serie.index.to_series().diff().dropna()
+    if separaciones.empty:
+        return
+    horas_observadas = separaciones.dt.total_seconds().to_numpy() / 3600.0
+    declaradas = float(ficha.horas_por_periodo)
+
+    moda = float(pd.Series(horas_observadas).round(6).mode().iloc[0])
+    if not np.isclose(moda, declaradas, rtol=0.01):
+        warnings.warn(
+            f"El indice avanza {moda:g} h entre periodos y la ficha "
+            f"'{ficha.nombre}' declara {declaradas:g}. La energia de cada "
+            f"periodo se calcula con lo declarado, asi que el margen sale "
+            f"escalado por {moda / declaradas:.2g} respecto de lo que el "
+            f"activo puede mover de verdad.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return
+
+    distintas = np.unique(np.round(horas_observadas, 6))
+    fuera = distintas[~np.isclose(distintas, declaradas, rtol=0.01)]
+    # Un indice horario tiene saltos de 2 h y de 0 h dos veces al anio por el
+    # cambio de hora, y eso no es una cadencia mixta.
+    proporcion = float(np.mean(~np.isclose(horas_observadas, declaradas, rtol=0.01)))
+    if len(fuera) and proporcion > 0.01:
+        warnings.warn(
+            f"El indice mezcla cadencias: el {100 * proporcion:.0f} % de los "
+            f"saltos no son de {declaradas:g} h (tambien hay "
+            f"{', '.join(f'{v:g}' for v in fuera[:4])}). 'horas_por_periodo' "
+            f"es un escalar, asi que los periodos de otra duracion se "
+            f"despachan con la energia equivocada. Separe la serie por "
+            f"cadencia y despache cada tramo con su ficha.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def _construir_despacho(
@@ -689,6 +748,7 @@ def van_almacenamiento(
     inversion: ParametrosInversion | None = None,
     por_dia: bool = True,
     curva: pd.Series | None = None,
+    merma_por_impacto: float = 0.0,
 ) -> pd.Series:
     """VAN del activo: capex, degradacion, O&M y el margen que de verdad captura.
 
@@ -713,6 +773,23 @@ def van_almacenamiento(
     Cuanto vale esa diferencia no es teorico, sale en la propia tabla:
     ``margen_bruto_anual`` frente a ``margen_neto_anual``.
 
+    Sobre la escala del activo
+    -------------------------
+    El despacho se resuelve como precio aceptante, asi que este VAN vale tal
+    cual para 1 MW y sobrestima para 100. ``merma_por_impacto`` es la fraccion
+    del margen de arbitraje que el activo se destruye a si mismo al mover el
+    precio, y sale medida de
+    :func:`~icm.energia.curvas_oferta.margen_con_impacto`. Sobre los 67 871
+    periodos horarios de OMIE (2018-2025) con una bateria de cuatro horas:
+    0,001 a 1 MW, 0,012 a 10 MW, 0,060 a 50, 0,103 a 100, 0,234 a 250 y 0,415
+    a 500.
+
+    Va como parametro y no calculado por dentro a proposito: aplicarlo exige
+    una hipotesis sobre la escala y sobre si el activo opera solo o junto a
+    todos los demas, y esa hipotesis la tiene que poner quien valore. Que no
+    escale es el resultado incomodo: **duplicar el activo no duplica el VAN**,
+    porque la merma crece mas que proporcionalmente.
+
     Devuelve
     --------
     Una Series con el capex, los flujos, el VAN, la TIR, el periodo de retorno
@@ -721,6 +798,12 @@ def van_almacenamiento(
     ficha = _resolver_parametros(parametros)
     datos = inversion or ParametrosInversion()
     serie = como_serie(precios, "precios")
+    merma = float(merma_por_impacto)
+    if not 0.0 <= merma < 1.0:
+        raise ErrorDatos(
+            f"'merma_por_impacto' es la fraccion del margen que se pierde por "
+            f"impacto en el precio y tiene que estar en [0, 1); vale {merma}."
+        )
 
     if curva is None:
         curva = curva_margen_por_capacidad(serie, ficha, por_dia=por_dia)
@@ -736,7 +819,7 @@ def van_almacenamiento(
     for anio in range(1, int(datos.vida_anios) + 1):
         # La capacidad media del anio: se degrada a lo largo de el.
         media = retencion * (1.0 + float(datos.retencion_anual)) / 2.0
-        arbitraje = float(np.interp(media, factores, valores_curva))
+        arbitraje = float(np.interp(media, factores, valores_curva)) * (1.0 - merma)
         flujo = arbitraje + adicional - fijo
         if anio == int(datos.vida_anios):
             flujo += float(datos.valor_residual)
@@ -756,6 +839,7 @@ def van_almacenamiento(
             "margen_neto_anual": plan_nominal.margen_total / anios_muestra,
             "coste_fijo_anual": fijo,
             "ingreso_adicional_anual": adicional,
+            "merma_por_impacto": merma,
             "flujo_anio_1": float(flujos[1]),
             "flujo_ultimo_anio": float(flujos[-1]),
             "van": van,

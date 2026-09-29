@@ -1153,4 +1153,133 @@ fingirlo habría sido peor que decirlo:
 - El agrupamiento de volatilidad del simulador, que sigue entre 0,07 y 0,13
   cuando los datos dan 0,25-0,44.
 
-La suite pasa de las 944 pruebas con que empezó la revisión a **1 113**.
+La suite pasa de las 944 pruebas con que empezó la revisión a **1 113**, y a
+**1 183** con el apéndice de datos que cierra este documento.
+
+---
+
+# Apéndice: los datos que faltaban
+
+La revisión y el optimizador dejaron tres huecos señalados explícitamente como
+«no están en los datos de este proyecto»: el ingreso de capacidad, el de
+servicios de ajuste y el impacto del propio activo en el precio. Este apéndice
+los cierra —dos de ellos con datos, uno con la constatación de que el dato no
+existe.
+
+## 1. Mercado de capacidad: el dato no existe
+
+No es que esté cerrado o de pago. **El mercado de capacidad español se creó el
+15 de septiembre de 2026**, dos semanas antes de esta descarga, así que no hay
+serie histórica de precios que buscar. Cualquier cifra sería inventada, y por
+eso `ingreso_adicional_anual_por_mw` sigue valiendo cero por omisión y siendo
+un parámetro obligatorio de rellenar a mano.
+
+## 2. Servicios de ajuste: 34,28 €/MW y hora
+
+Transcrito del Informe del Sistema Eléctrico de REE a
+`datos/reales/ree_servicios_ajuste.csv`. ESIOS exige un token que se pide por
+correo y `apidatos.ree.es` está tras protección anti-bot, así que no hubo
+descarga automática.
+
+La unidad no venía sin ambigüedad en el informe, y una unidad mal interpretada
+aquí cambia el VAN por un factor de 8 760. Se resolvió aritméticamente: con
+una banda media asignada de 922 MW, 34,28 × 922 × 8 760 = **277 M€**, el
+10,4 % de los 2 668 M€ de servicios de ajuste de 2024. Es coherente con que la
+banda secundaria sea una partida mediana del total, lo que confirma €/MW **y
+por hora**. Si fuera por año daría 32 000 €, el 0,001 % del total, absurdo; si
+fuera €/MWh no cuadraría con que la banda se retribuye por disponibilidad.
+
+## 3. Impacto en el precio: el hallazgo que cambia la conclusión
+
+Este era el hueco de verdad, porque afectaba a la validez de todo el módulo de
+almacenamiento: el despacho se resuelve como precio aceptante. Se descargaron
+21 sesiones de curvas agregadas de OMIE (144 MB, no versionadas) y se midió.
+
+**El lector tuvo tres errores antes de funcionar**, los tres del tipo que da
+números plausibles y falsos:
+
+1. `skiprows=2` se comía la primera fila de datos en vez del preámbulo.
+2. Se asumieron dos formatos cuando hay **tres**: `Hora`+`Energía` hasta
+   2025-04-17, `Período`+`Potencia` con enteros hasta 2025-09-30, y
+   `Período`+`Potencia` con etiquetas `HxQy` desde el paso a cuartos de hora.
+3. El peor: en las variantes 2 y 3 la cantidad es **potencia, no energía**. Con
+   períodos horarios coincide numéricamente, así que el error habría pasado
+   inadvertido en cinco meses de datos y habría multiplicado por cuatro el
+   volumen del tercer formato.
+
+**La validación.** El precio publicado sale exacto de la pila en el 82,1 % de
+los 864 períodos. Ese 17,9 % restante se investigó en vez de reportarlo como
+hueco, y se descompone: el 15,5 % cae **dentro del cruce** con error mediano de
+0,24 €/MWh —redondeo del fichero y casación parcial de la unidad marginal, no
+un fallo de lectura— y solo el **2,4 % queda fuera**, concentrado en los días
+con separación del mercado ibérico (acierto del 53,5 % en los períodos
+marcados `ES,PT` frente al 83,6 % de los `MI`). Nada de ello afecta al
+impacto, porque el impacto es una diferencia de dos puntos de la misma curva y
+un sesgo de nivel se cancela.
+
+**El resultado.** Añadir 500 MW de demanda sube el precio 1,93 €/MWh en la
+mediana; añadir 500 MW de oferta lo baja 10,57. Un factor de **5,5**, por la
+mayor inelasticidad de la demanda. Y ordenado por nivel de precio va en contra
+de la batería: en las horas de más de 120 €/MWh —donde descarga— vender 500 MW
+hunde el precio 20,01, mientras que en las de menos de 5 —donde carga—
+comprarlos lo sube 0,48.
+
+**Lo que eso cambia.** El VAN dejaba el capex de equilibrio en 80,8 €/kWh
+frente a un mercado de 200-400, y se concluyó que el arbitraje se queda a un
+factor 3-5. Con el impacto dentro la conclusión es más fuerte y distinta:
+
+| Potencia | Merma | Capex de equilibrio |
+|---:|---:|---:|
+| 1 MW | 0,1 % | 81,2 €/kWh |
+| 100 MW | 10,3 % | 71,2 €/kWh |
+| 500 MW | 41,5 % | 40,5 €/kWh |
+
+**No hay escala a la que el arbitraje solo funcione.** Crecer empeora el
+negocio en vez de mejorarlo, que es lo contrario de la intuición de economías
+de escala, y explica por qué el almacenamiento se financia con pagos por MW
+disponible —capacidad, banda de regulación— y no con el *spread* horario: esos
+se cobran por potencia y no se autodestruyen al crecer.
+
+## 4. Un fallo latente encontrado de camino
+
+`ParametrosAlmacenamiento.horas_por_periodo` es un escalar y
+`datos/reales/omie_intradiario.csv` **no lo es**: es horario hasta el
+2025-09-30 y cuarto-horario desde el 2025-10-01. Despachar el fichero entero
+con los parámetros por omisión multiplicaba por cuatro la energía del último
+tercio de la muestra —33,6 % de los períodos— sin que nada lo delatara: el
+plan sigue siendo factible y el margen sale simplemente demasiado alto.
+
+Es exactamente la clase de error que esta revisión busca, y estaba en el
+camino por defecto de los datos propios del proyecto. `despacho_optimo` ahora
+avisa con `RuntimeWarning` cuando la cadencia del índice no cuadra con la
+declarada, distinguiendo el caso legítimo del cambio de hora —dos saltos raros
+al año— de una cadencia realmente mixta. Por eso todas las cifras de este
+apéndice se miden sobre los 67 871 períodos horarios homogéneos y no sobre los
+102 143 del fichero completo.
+
+## 5. Lo que los datos nuevos cambian en la conclusión del proyecto
+
+Con las dos piezas juntas —el impacto medido y el precio de la banda— la
+valoración de la batería de 100 MW queda así:
+
+| Escenario | Capex de equilibrio | ¿Viable a 200-400 €/kWh? |
+|---|---:|---|
+| Arbitraje, precio aceptante | 81,2 €/kWh | No, por factor 3-5 |
+| Arbitraje, con impacto propio | 71,2 €/kWh | No, peor aún |
+| + banda el 10 % de las horas | 135,4 €/kWh | Todavía no |
+| + banda el 25 % de las horas | **231,8 €/kWh** | **Sí, en el rango bajo** |
+| + banda el 50 % de las horas | 392,5 €/kWh | Sí, y con VAN positivo |
+
+Es la primera vez en todo el proyecto que una configuración sale viable, y el
+mecanismo que la hace viable no es el que se optimiza: **el arbitraje paga la
+operación, la banda paga la inversión**. La razón estructural es que la banda
+se retribuye por MW disponible y el arbitraje por MWh movido, así que solo el
+segundo se autodestruye al crecer.
+
+Eso tiene una consecuencia para el resto del proyecto que conviene dejar
+escrita: `valor_de_la_prevision` mide lo que una previsión captura **del
+arbitraje**, que es la parte pequeña y la que no escala. Una previsión buena
+sigue valiendo los 72 156 € de VAN que calcula el módulo, pero no es lo que
+decide si la batería se construye. Quien quiera que este proyecto informe una
+inversión real tiene que modelar la banda, y para eso hacen falta datos de
+asignación de banda por unidad que ESIOS publica y este proyecto no tiene.

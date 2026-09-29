@@ -245,6 +245,9 @@ descuento. El resultado sobre OMIE es contundente y conviene no maquillarlo:
 |---|---:|
 | Margen bruto anual (oráculo, 4 MWh) | 50 168 €/MW |
 | Capex de equilibrio, **solo arbitraje** | **80,8 €/kWh** |
+
+(Sobre los 67 871 períodos del fichero actual la misma cifra sale 81,2 €/kWh;
+la diferencia es que la muestra creció en 359 períodos desde que se midió.)
 | Capex de mercado de una batería de red | 200-400 €/kWh |
 
 **Una batería no se financia con el arbitraje de OMIE: se queda a un factor 3-5
@@ -278,6 +281,89 @@ Dos cuidados que el módulo toma y que un Excel no suele tomar:
   capex sería pagar la batería dos veces. El flujo usa el margen **bruto** y la
   degradación entra como pérdida de capacidad. La diferencia son 8 094 €/año, y
   la tabla informa las dos cifras.
+
+**`curvas_oferta`** — Hasta aquí todo el módulo suponía que el activo es
+**precio aceptante**: compra y vende sin mover el precio. Eso vale para 1 MW y
+es falso para 500, y no se puede comprobar con series de precios, porque un
+precio es el resultado de la casación y no la curva que la produjo. Así que se
+bajó a la pila de ofertas: 21 sesiones del diario de OMIE, 864 períodos.
+
+```python
+from icm.energia import leer_curva_agregada, contrastar_casacion, margen_con_impacto
+
+curva = leer_curva_agregada("curva_pbc_uof_20260418.txt")   # los tres formatos
+contrastar_casacion(curva, precios_publicados)               # ¿sale el precio de la pila?
+margen_con_impacto(despacho_optimo(precios, ficha), precios) # lo que cuesta ser grande
+```
+
+Antes de usar nada de esto hay que saber si la lectura vale, porque una curva
+mal leída daría impactos plausibles y falsos. El contraste es que el precio
+publicado tiene que reconstruirse de la propia pila: sale **exacto en el
+82,1 %** de los períodos, cae **dentro del cruce en el 15,5 %** —redondeo del
+fichero y casación parcial de la unidad marginal, error mediano 0,24 €/MWh— y
+queda fuera en el **2,4 %**, que son los días en que la interconexión con
+Portugal se satura y España y Portugal casan por separado. Eso último no
+afecta a la medida, porque el impacto es una diferencia de dos puntos de la
+misma curva y un sesgo de nivel se cancela.
+
+Y lo que sale no es lo que cabría esperar:
+
+| Tramo de precio | % horas | Subir al comprar 500 MW | Bajar al vender 500 MW |
+|---|---:|---:|---:|
+| < 5 €/MWh | 6,0 % | 0,48 | 2,29 |
+| 60–120 | 31,6 % | 3,83 | 9,68 |
+| > 120 | 19,7 % | 1,44 | **20,01** |
+
+**El impacto es asimétrico por un factor 5,5**, y la razón es económica: la
+demanda eléctrica es mucho más inelástica que la oferta, porque buena parte se
+oferta al límite del mercado. En cuanto se agota el tramo elástico el precio se
+desploma; la oferta, en cambio, tiene un tramo plano largo de renovables a
+coste cero.
+
+La asimetría va **justo en contra de la batería**, porque se ordena al revés de
+como opera: carga en el tramo barato, donde comprar casi no mueve el precio, y
+descarga en el caro, donde vender lo hunde 20 €/MWh. El activo destruye el pico
+del que vive. Sobre los 67 871 períodos horarios de OMIE:
+
+| Potencia | Merma del arbitraje | Capex de equilibrio |
+|---:|---:|---:|
+| 1 MW | 0,1 % | 81,2 €/kWh |
+| 10 MW | 1,2 % | 80,1 €/kWh |
+| 50 MW | 6,0 % | 75,4 €/kWh |
+| 100 MW | 10,3 % | 71,2 €/kWh |
+| 250 MW | 23,4 % | 58,3 €/kWh |
+| 500 MW | 41,5 % | **40,5 €/kWh** |
+
+El **69 % de ese coste lo pone la descarga**, no la carga. Y la conclusión
+práctica contradice la intuición de las economías de escala: **crecer empeora
+el negocio**. Un activo de 500 MW necesita un capex **la mitad** por kWh que
+uno de 1 MW para ser igual de viable, y el capex por kWh no se divide por dos al
+crecer. El arbitraje de OMIE no admite tamaño.
+
+Eso reordena la conclusión anterior. No es solo que una batería de 1 MW se
+quede a un factor 3-5 de financiarse con el *spread*: es que **no hay ninguna
+escala a la que el arbitraje solo funcione**.
+
+Y ahí es donde el dato de servicios de ajuste cierra el argumento. La banda de
+regulación secundaria se pagó a **34,28 €/MW y hora asignada** en 2024
+(`datos/reales/ree_servicios_ajuste.csv`, transcrito del informe de REE y
+comprobado aritméticamente: 34,28 × 922 MW × 8 760 h = 277 M€, el 10,4 % de los
+2 668 M€ de servicios de ajuste de ese año). Para la batería de 100 MW, con el
+impacto en el precio ya descontado:
+
+| Horas con banda asignada | Ingreso adicional | Capex de equilibrio |
+|---:|---:|---:|
+| 0 % (solo arbitraje) | 0 | 71,2 €/kWh |
+| 10 % | 30 029 €/MW·año | 135,4 €/kWh |
+| 25 % | 75 073 €/MW·año | **231,8 €/kWh** |
+| 50 % | 150 146 €/MW·año | 392,5 €/kWh |
+
+**Con la banda cubriendo una hora de cada cuatro, el activo entra en el rango
+de mercado** (200-400 €/kWh) por primera vez en todo el proyecto. Es la
+respuesta cuantificada a por qué el almacenamiento en España se financia con
+pagos por potencia disponible y no con el *spread* horario: se cobran por MW y
+no por MWh, así que **no se autodestruyen al crecer**. El arbitraje paga la
+operación; la banda paga la inversión.
 
 **`simulacion`** y **`estacionalidad`** — Escenarios sintéticos con señal
 predecible real, para trabajar sin acceso a los mercados, y descomposición
