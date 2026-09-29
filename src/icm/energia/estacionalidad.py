@@ -41,6 +41,8 @@ Convenciones
 
 from __future__ import annotations
 
+import warnings
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -412,6 +414,97 @@ class Descomposicion:
         return float(np.clip(1.0 - residual / varianza, 0.0, 1.0))
 
 
+#: Ciclos de calendario con su longitud nominal en dias naturales.
+CICLOS_NATURALES = {"anual": 365.25, "semanal": 7.0}
+
+
+def periodo_del_indice(indice, ciclo: str = "anual") -> int:
+    """Observaciones por ciclo que de verdad tiene un indice de fechas.
+
+    ``descomponer`` toma la posicion del ciclo como ``arange(n) % periodo``, o
+    sea **por posicion y no por calendario**, asi que el ``periodo`` tiene que
+    ser el numero real de observaciones por ciclo. El 252 que suele escribirse
+    para una serie diaria es el numero convencional de sesiones de bolsa de un
+    anio, no el de un calendario de dias habiles: ``bdate_range`` da **261**
+    dias al anio, y esos 9 de diferencia desplazan la fase un poco cada anio.
+
+    Medido sobre nueve anios de dias habiles con una estacionalidad anual pura
+    de amplitud 40: con ``periodo=252`` la amplitud estimada baja a **34,10** y
+    queda el **6,1 %** de la varianza mensual dentro del residuo; con
+    ``periodo=261`` sale 40,01 y 0,0 %.
+
+    >>> import pandas as pd
+    >>> periodo_del_indice(pd.bdate_range("2015-01-01", "2023-12-29"))
+    261
+    >>> periodo_del_indice(pd.date_range("2015-01-01", "2023-12-31"))
+    365
+    >>> periodo_del_indice(pd.date_range("2015-01-31", periods=96, freq="ME"))
+    12
+    """
+    fechas = pd.DatetimeIndex(indice)
+    if len(fechas) < 3:
+        raise ErrorDatos("Hacen falta al menos tres fechas para medir el periodo.")
+    if not fechas.is_monotonic_increasing:
+        raise ErrorDatos("El indice tiene que estar ordenado para medir el periodo.")
+    if ciclo not in CICLOS_NATURALES:
+        raise ErrorDatos(
+            f"Ciclo '{ciclo}' desconocido: use {' o '.join(CICLOS_NATURALES)}."
+        )
+    dias = (fechas[-1] - fechas[0]).total_seconds() / 86400.0
+    if dias <= 0:
+        raise ErrorDatos("Todas las fechas del indice son la misma.")
+    por_dia = (len(fechas) - 1) / dias
+    periodo = int(round(por_dia * CICLOS_NATURALES[ciclo]))
+    if periodo < 2:
+        raise ErrorDatos(
+            f"Con esta frecuencia el ciclo {ciclo} ocupa menos de dos observaciones "
+            f"({periodo}): no se puede descomponer."
+        )
+    return periodo
+
+
+def _avisar_si_el_periodo_no_encaja(valores: pd.Series, periodo: int) -> None:
+    """Compara el periodo pedido con el que tiene el indice, si es de fechas."""
+    if not isinstance(valores.index, pd.DatetimeIndex) or len(valores) < 3:
+        return
+    if not valores.index.is_monotonic_increasing:
+        return
+    for ciclo in CICLOS_NATURALES:
+        try:
+            real = periodo_del_indice(valores.index, ciclo)
+        except ErrorDatos:  # pragma: no cover - indice degenerado
+            continue
+        if real == periodo:
+            return
+    try:
+        anual = periodo_del_indice(valores.index, "anual")
+    except ErrorDatos:  # pragma: no cover - indice degenerado
+        return
+    # Se avisa cuando el periodo pedido esta dentro de un factor 2 del anual,
+    # que es el rango en el que quien llama claramente buscaba el ciclo anual y
+    # se ha equivocado de numero. Fuera de ahi se supone que pide otro ciclo a
+    # proposito (7 para el semanal, 3 para el trimestral de una serie mensual).
+    #
+    # La banda era del 25 % y dejaba escapar justo el caso peor: la serie de
+    # temperatura de Madrid tiene 353 observaciones por anio -- dias naturales
+    # con huecos -- y pedir 252 se quedaba fuera del +-25 % sin avisar. Con
+    # periodo=252 la amplitud estacional de esa serie cae de 10,67 C a 3,16 C:
+    # el ciclo anual de Madrid practicamente desaparece.
+    if not 0.5 * anual <= periodo <= 2.0 * anual or periodo == anual:
+        return
+    desfase = abs(anual - periodo)
+    warnings.warn(
+        f"Se ha pedido periodo={periodo} pero este indice trae {anual} observaciones "
+        f"por anio, asi que la posicion del ciclo se desplaza {desfase} observaciones "
+        f"cada anio y al final de la muestra la fase esta corrida "
+        f"{desfase * len(valores) / anual:.0f}. La descomposicion toma la posicion del "
+        f"ciclo por POSICION, no por calendario. Use periodo={anual} o "
+        f"'periodo_del_indice(serie.index)'.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def descomponer(
     serie,
     periodo: int = 252,
@@ -430,9 +523,18 @@ def descomponer(
     Parametros
     ----------
     periodo:
-        Longitud del ciclo en **observaciones**: 252 para el ciclo anual de una
-        serie diaria de dias habiles, 365 si la serie es de dias naturales, 12
-        si es mensual, 7 para el ciclo semanal de una serie diaria.
+        Longitud del ciclo en **observaciones**, y tiene que ser el numero real
+        que tenga la serie: 365 para dias naturales, 12 para mensual, 7 para el
+        ciclo semanal de una serie diaria, y **261** -- no 252 -- para el ciclo
+        anual de un calendario de dias habiles. El 252 es el numero
+        convencional de sesiones de bolsa, no el de dias que da
+        ``bdate_range``, y esos 9 de diferencia desplazan la fase un poco cada
+        anio: la posicion del ciclo se toma como ``arange(n) % periodo``, por
+        posicion y no por calendario. Medido sobre nueve anios con una
+        estacionalidad anual pura de amplitud 40, ``periodo=252`` estima 34,10
+        y deja el 6,1 % de la varianza mensual en el residuo. Si el indice es
+        de fechas y el periodo no encaja, se avisa;
+        :func:`periodo_del_indice` da el correcto.
     modelo:
         ``"multiplicativo"`` si la amplitud estacional **crece con el nivel**
         (el invierno aniade un 20 % al precio, valga este 30 o 300 EUR/MWh: es
@@ -462,6 +564,7 @@ def descomponer(
     valores = como_serie(serie, "serie")
     periodo = _validar_entero(periodo, "periodo", minimo=2)
     _validar_opcion(modelo, MODELOS, "modelo")
+    _avisar_si_el_periodo_no_encaja(valores, periodo)
 
     n = len(valores)
     if n < 2 * periodo:
@@ -651,19 +754,70 @@ def contraste_estacionalidad(serie, por: str = "mes") -> dict:
     mas alto" y no como "cuarenta desviaciones tipicas", que es lo que hace
     falta para que un solo dia no decida el contraste.
 
-    Devuelve
-    --------
-    dict con ``estadistico`` (H), ``p_valor``, ``rechaza_al_5pct`` y
-    ``tamano_efecto``, ademas de los grados de libertad, el numero de grupos y
-    las observaciones.
+    Pero la eleccion del contraste no era el problema
+    -------------------------------------------------
+    Kruskal-Wallis, como el ANOVA, supone **observaciones independientes**, y
+    una serie de precios no lo es ni de lejos. Con un AR(1) y **sin ninguna
+    estacionalidad**, el p-valor asintotico rechaza:
 
-    El tamanio del efecto es ``epsilon`` cuadrado, ``H / (n - 1)``: la fraccion
-    de la variabilidad de los rangos que explica la agrupacion, entre 0 y 1. Va
-    aparte del p-valor porque responden a preguntas distintas y confundirlas es
-    el error habitual: con 4.000 observaciones diarias, una estacionalidad
-    ridicula sale significativa. El p-valor dice si el patron existe; el
-    tamanio del efecto, si importa. Como referencia orientativa, 0,01 es
-    pequenio, 0,06 medio y 0,14 grande.
+    ===========  ==========================
+    ``phi``      Rechaza al 5 %
+    ===========  ==========================
+    0,00          5,5 %  (correcto)
+    0,50         81,0 %
+    0,90        100,0 %
+    0,99         97,5 %
+    ===========  ==========================
+
+    Es decir: sobre cualquier serie de precios el contraste dice "hay
+    estacionalidad" practicamente siempre, y ese 100 % no lleva informacion.
+    El docstring dedicaba seis lineas a justificar por que los rangos y ni una
+    a la independencia.
+
+    Lo que NO arregla esto, y lo que se intento
+    -------------------------------------------
+    No hay remuestreo sencillo que devuelva un p-valor valido aqui. Se
+    probaron tres, y los tres fallan de forma caracterizable; queda escrito
+    para que nadie los vuelva a intentar:
+
+    * **Permutacion por desplazamiento circular.** Conserva toda la
+      dependencia y corrige el tamanio en series diarias (5,5 %, 2,5 %, 1,5 %
+      y 5,5 % para los cuatro ``phi``). Pero cuando la serie se muestrea al
+      mismo periodo con que se agrupa -- una serie mensual agrupada por mes --
+      un desplazamiento es una simple **reetiquetacion ciclica de los
+      grupos**, y H es invariante a como se llamen los grupos: el p-valor sale
+      proximo a 1 pase lo que pase.
+    * **Surrogates de fase aleatoria.** Tamanio correcto en todos los casos
+      (3,5 % a 7,0 %), pero **sin potencia** contra lo que mas interesa: un
+      patron sinusoidal con el periodo de la agrupacion produce los mismos
+      doce grupos a cualquier fase, asi que el surrogate marca lo mismo que la
+      serie. Sobre serie mensual con amplitud 1,2 sigma detecta el 4 %.
+    * **Wald conjunto con errores HAC sobre los rangos.** Sobre-rechaza: 12,8 %
+      con datos iid diarios y 19,5 % mensuales, y 82,8 % con ``phi = 0,9``. El
+      truncamiento de retardos de la regla habitual es cortisimo para esa
+      persistencia y el Wald tiene sesgo de muestra pequenia con doce grupos.
+
+    Asi que el p-valor se deja como esta -- el asintotico, sin cambiar el
+    significado de nada ya publicado -- y lo que se aniade es el diagnostico
+    que faltaba: ``autocorrelacion_1`` y ``observaciones_efectivas``. Para
+    concluir algo sobre el calendario en una serie con dependencia serial hace
+    falta un modelo que la especifique (una regresion sobre indicadores de
+    calendario con la estructura de errores bien puesta, o un SARIMA), no un
+    contraste de un factor.
+
+    ``autocorrelacion_1`` se mide **sobre los residuos dentro de cada grupo**,
+    porque la autocorrelacion que invalida el contraste es la del ruido y no la
+    que crea el propio patron estacional: una serie con estacionalidad limpia y
+    ruido iid tiene autocorrelacion total alta y aun asi el contraste esta bien
+    calibrado.
+
+    ``observaciones_efectivas`` es ``n (1 - rho) / (1 + rho)``, el tamanio de
+    muestra equivalente en observaciones independientes. Es la cifra que
+    explica de un golpe por que el p-valor sale como sale: con ``rho = 0,9``,
+    mil observaciones valen como **cincuenta y tres**, y un contraste de doce
+    grupos sobre cincuenta y tres observaciones no puede decir nada del
+    calendario. Cuando cae por debajo de diez veces el numero de grupos, se
+    avisa.
     """
     valores = _serie_fechada(serie, "serie")
     claves = _claves(valores.index, por)
@@ -692,18 +846,98 @@ def contraste_estacionalidad(serie, por: str = "mes") -> dict:
     estadistico, p_valor = stats.kruskal(*grupos)
     n = len(valores)
     k = len(grupos)
-    epsilon_cuadrado = float(np.clip(float(estadistico) / (n - 1), 0.0, 1.0))
+    estadistico = float(estadistico)
+
+    autocorrelacion = _autocorrelacion_1(valores, claves)
+    n_efectivas = _observaciones_efectivas(n, autocorrelacion)
+    if n_efectivas < 10.0 * k:
+        warnings.warn(
+            f"La serie tiene autocorrelacion de orden 1 de {autocorrelacion:+.3f}, asi "
+            f"que sus {n} observaciones valen como {n_efectivas:.0f} independientes y "
+            f"el p-valor ({p_valor:.2e}) no es utilizable: Kruskal-Wallis supone "
+            f"independencia, y sobre un AR(1) de phi = 0,9 SIN ninguna estacionalidad "
+            f"rechaza el 100 % de las veces con un tamanio de efecto medio de 0,1157, "
+            f"'grande' en la escala de referencia. Mire 'tamano_efecto' contra ese "
+            f"0,1157 y no el p-valor, y para concluir algo use un modelo que "
+            f"especifique la dependencia.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     return {
-        "estadistico": float(estadistico),
+        "estadistico": estadistico,
         "p_valor": float(p_valor),
         "rechaza_al_5pct": bool(p_valor < 0.05),
-        "tamano_efecto": epsilon_cuadrado,
+        "tamano_efecto": _epsilon_cuadrado(estadistico, n, k),
+        "autocorrelacion_1": autocorrelacion,
+        "observaciones_efectivas": n_efectivas,
         "grados_libertad": k - 1,
         "n_grupos": k,
         "observaciones": n,
         "por": por,
     }
+
+
+def _observaciones_efectivas(n: int, autocorrelacion: float) -> float:
+    """Tamanio de muestra equivalente en observaciones independientes.
+
+    Para un AR(1), ``n_eff = n (1 - rho) / (1 + rho)``. Es la cifra que explica
+    de un golpe por que el p-valor sale como sale: con ``rho = 0,9``, mil
+    observaciones valen como **cincuenta y tres**, y un contraste de doce
+    grupos sobre cincuenta y tres observaciones no puede decir nada del
+    calendario. Con ``rho`` negativa la formula da mas de ``n``; se acota en
+    ``n`` porque pasar de ahi no significa nada util.
+    """
+    rho = float(np.clip(autocorrelacion, -0.999, 0.999))
+    return float(min(n * (1.0 - rho) / (1.0 + rho), float(n)))
+
+
+def _epsilon_cuadrado(estadistico: float, n: int, k: int) -> float:
+    """Epsilon cuadrado **corregido por grados de libertad**: (H - k + 1) / (n - k).
+
+    La version sin corregir, ``H / (n - 1)``, no vale cero bajo la nula: su
+    valor esperado es ``(k - 1) / (n - 1)``. Medido con ruido iid puro sobre
+    cuatro anios de dias habiles y agrupando por mes, el efecto medio salia
+    **0,0106** frente al 0,0105 que predice esa formula, o sea justo el sesgo y
+    nada mas. Es poco -- "pequenio" en la escala del propio docstring -- pero
+    es gratis quitarlo.
+
+    Ojo con atribuirle mas de lo que es: el 0,26 con ruido que anoto la
+    revision adversarial **no venia de aqui**. Venia de la autocorrelacion, que
+    infla H directamente; con un AR(1) de phi = 0,9 el efecto medio sube a
+    0,1157, "grande" en esa escala, y ninguna correccion de grados de libertad
+    lo arregla porque el problema no son los grados de libertad sino que las
+    observaciones no son independientes.
+    """
+    return float(np.clip((float(estadistico) - k + 1.0) / (n - k), 0.0, 1.0))
+
+
+def _autocorrelacion_1(valores: pd.Series, claves=None) -> float:
+    """Autocorrelacion de orden 1 **de los residuos dentro de cada grupo**.
+
+    La que invalida el contraste es la del ruido, no la que crea el propio
+    patron estacional. Una serie con una estacionalidad anual limpia y ruido
+    iid tiene autocorrelacion total alta -- enero se parece a febrero porque
+    los dos son invierno -- y sin embargo el contraste esta perfectamente
+    calibrado, porque las observaciones son independientes **dado el grupo**.
+    Midiendola sobre la serie entera, el aviso salia en cualquier serie
+    estacional de las pruebas: 135 avisos sobre 127 casos.
+
+    Asi que se quitan primero las medias de grupo. Lo que queda es lo que
+    Kruskal-Wallis trata como independiente, y ahi la autocorrelacion si es
+    sintoma de que no lo es.
+    """
+    x = valores.to_numpy(float)
+    if len(x) < 3:  # pragma: no cover - ya se exige mas arriba
+        return 0.0
+    if claves is not None:
+        medias = pd.Series(x, index=valores.index).groupby(claves).transform("mean")
+        x = x - medias.to_numpy(float)
+    centrado = x - x.mean()
+    denominador = float(centrado @ centrado)
+    if denominador <= 0:  # pragma: no cover - serie constante, ya rechazada
+        return 0.0
+    return float(centrado[:-1] @ centrado[1:] / denominador)
 
 
 # --- meteorologia ---------------------------------------------------------------

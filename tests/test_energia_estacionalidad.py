@@ -16,6 +16,8 @@ que es la propiedad que define un contraste bien calibrado.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -666,3 +668,122 @@ def test_una_base_no_numerica_da_error(indice_diario):
 def test_una_serie_de_temperatura_vacia_da_error():
     with pytest.raises(ErrorDatos):
         grados_dia_acumulados(pd.Series([np.nan, np.nan]))
+
+
+# --- lo que la segunda revision adversarial encontro ---------------------------
+
+
+def _ar1(phi, n, semilla):
+    """Un AR(1), que es lo que se parece a una serie de precios."""
+    generador = np.random.default_rng(semilla)
+    ruido = generador.standard_normal(n)
+    x = np.zeros(n)
+    for t in range(1, n):
+        x[t] = phi * x[t - 1] + ruido[t]
+    return x
+
+
+def test_el_periodo_de_un_indice_se_mide_del_calendario():
+    from icm.energia.estacionalidad import periodo_del_indice
+
+    # 252 es el numero convencional de sesiones de bolsa; 'bdate_range' da 261.
+    assert periodo_del_indice(pd.bdate_range("2015-01-01", "2023-12-29")) == 261
+    assert periodo_del_indice(pd.date_range("2015-01-01", "2023-12-31")) == 365
+    assert periodo_del_indice(pd.date_range("2015-01-31", periods=96, freq="ME")) == 12
+    assert periodo_del_indice(pd.bdate_range("2015-01-01", periods=600), "semanal") == 5
+
+
+def test_descomponer_avisa_si_el_periodo_no_encaja_con_el_indice():
+    # La posicion del ciclo se toma como arange(n) % periodo, o sea por
+    # POSICION y no por calendario, asi que un periodo que no sea el real
+    # desplaza la fase un poco cada anio.
+    indice = pd.bdate_range("2015-01-01", "2023-12-29")
+    serie = pd.Series(
+        100.0 + 40.0 * np.sin(2.0 * np.pi * indice.dayofyear.to_numpy() / 365.25),
+        index=indice,
+    )
+    with pytest.warns(UserWarning, match="261 observaciones"):
+        descomponer(serie, periodo=252, modelo="aditivo")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        descomponer(serie, periodo=261, modelo="aditivo")
+        descomponer(serie, periodo=7, modelo="aditivo")  # ciclo semanal, no anual
+
+
+def test_el_periodo_equivocado_estropea_la_descomposicion():
+    indice = pd.bdate_range("2015-01-01", "2023-12-29")
+    senal = 40.0 * np.sin(2.0 * np.pi * indice.dayofyear.to_numpy() / 365.25)
+    serie = pd.Series(100.0 + senal, index=indice)
+
+    amplitudes = {}
+    resto_mensual = {}
+    for periodo in (252, 261):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            piezas = descomponer(serie, periodo=periodo, modelo="aditivo")
+        amplitudes[periodo] = float(piezas.estacional.max() - piezas.estacional.min()) / 2.0
+        residuo = piezas.residuo.dropna()
+        resto_mensual[periodo] = float(residuo.groupby(residuo.index.month).mean().var(ddof=0))
+
+    referencia = float(pd.Series(senal, index=indice).groupby(indice.month).mean().var(ddof=0))
+    assert amplitudes[261] == pytest.approx(40.0, abs=0.1)
+    assert amplitudes[252] < 36.0  # medido 34,10
+    assert resto_mensual[261] / referencia < 1e-3
+    assert resto_mensual[252] / referencia > 0.02  # medido 6,1 %
+
+
+def test_el_tamano_del_efecto_vale_cero_bajo_la_hipotesis_nula():
+    # 'H / (n - 1)' no vale cero bajo la nula: su valor esperado es
+    # (k - 1) / (n - 1), que con 12 meses sobre cuatro anios de dias habiles
+    # da 0,0105 -- y el medido con ruido iid puro era 0,0106, o sea justo el
+    # sesgo. La version corregida (H - k + 1) / (n - k) lo quita.
+    indice = pd.bdate_range("2015-01-01", periods=4 * 261)
+    generador = np.random.default_rng(7)
+    efectos = [
+        contraste_estacionalidad(
+            pd.Series(generador.standard_normal(len(indice)), index=indice), "mes"
+        )["tamano_efecto"]
+        for _ in range(60)
+    ]
+    sin_corregir = (12 - 1) / (len(indice) - 1)
+    assert np.mean(efectos) < sin_corregir / 2.0
+    assert np.mean(efectos) < 0.005
+
+
+def test_el_contraste_avisa_cuando_la_dependencia_serial_lo_invalida():
+    # Kruskal-Wallis supone independencia. Sobre un AR(1) de phi = 0,9 y SIN
+    # ninguna estacionalidad rechaza el 100 % de las veces con un tamanio de
+    # efecto medio de 0,1157, 'grande' en la escala de referencia.
+    indice = pd.bdate_range("2015-01-01", periods=4 * 261)
+    serie = pd.Series(_ar1(0.9, len(indice), 11), index=indice)
+
+    with pytest.warns(UserWarning, match="observaciones efectivas|valen como"):
+        resultado = contraste_estacionalidad(serie, "mes")
+
+    assert resultado["p_valor"] < 1e-10  # el p-valor miente
+    assert resultado["autocorrelacion_1"] > 0.8
+    assert resultado["observaciones_efectivas"] < len(indice) / 10
+    assert resultado["tamano_efecto"] > 0.05  # "medio" sin que haya nada
+
+
+def test_la_autocorrelacion_se_mide_sobre_los_residuos_del_grupo():
+    # Una serie con estacionalidad limpia y ruido iid tiene autocorrelacion
+    # TOTAL alta -- enero se parece a febrero porque los dos son invierno -- y
+    # sin embargo el contraste esta bien calibrado, porque las observaciones
+    # son independientes dado el grupo. Midiendola sobre la serie entera, el
+    # aviso saltaba en cualquier serie estacional.
+    indice = pd.bdate_range("2015-01-01", periods=4 * 261)
+    forma = 2.0 * np.sin(2.0 * np.pi * indice.month.to_numpy() / 12.0)
+    generador = np.random.default_rng(11)
+    estacional = pd.Series(forma + generador.standard_normal(len(indice)), index=indice)
+
+    total = float(pd.Series(forma).autocorr(1))
+    assert total > 0.9, "la serie si tiene autocorrelacion total alta"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        resultado = contraste_estacionalidad(estacional, "mes")
+    assert abs(resultado["autocorrelacion_1"]) < 0.1
+    assert resultado["observaciones_efectivas"] == pytest.approx(len(indice), rel=0.2)
+    assert resultado["rechaza_al_5pct"]

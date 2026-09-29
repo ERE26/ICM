@@ -771,3 +771,149 @@ menos de 2e−05 de 1/6. Y los pesos son los que tienen que ser: OMIE, con una
 volatilidad anualizada 176 veces mayor que la del EUR/USD, se lleva el **0,43 %**
 de la cartera y el EUR/USD el **76,88 %**. Con las claves del diccionario en
 orden inverso, la volatilidad de esa cartera sale 0,143735 en los dos casos.
+
+---
+
+## Estado: spreads y estacionalidad, cerrados
+
+Septiembre de 2026. `energia/spreads.py` y `estacionalidad.py`. De los tres
+hallazgos que el revisor nombraba, uno se confirma, uno es **mucho menor** de
+lo que decía y el tercero es **mucho mayor**. Y la aritmética de los spreads,
+que la revisión daba por verificada, lo estaba.
+
+### El período por posición: confirmado, y peor de lo que parecía
+
+`descomponer` toma la posición del ciclo como `arange(n) % periodo`, o sea
+**por posición y no por calendario**, así que el `periodo` tiene que ser el
+número real de observaciones por ciclo. El 252 que suele escribirse es el
+número convencional de sesiones de bolsa, y ningún calendario real lo tiene:
+`bdate_range` da 261 días al año.
+
+Sobre nueve años de días hábiles con una estacionalidad anual pura de amplitud
+40:
+
+| `periodo` | Amplitud estimada | Varianza mensual en el residuo |
+|---:|---:|---:|
+| 252 | 34,10 | 6,1 % |
+| 261 | **40,01** | **0,0 %** |
+
+Pero el caso que de verdad duele es con datos reales. La serie de temperatura
+de Madrid tiene **353 observaciones por año** —días naturales con huecos—, y
+pedir 252 sobre ella no desplaza la fase: la **destruye**.
+
+| `periodo` | Amplitud estacional | Enero | Julio |
+|---:|---:|---:|---:|
+| 353 (el del calendario) | **10,67 °C** | **−7,56** | **+8,66** |
+| 252 (el de manual) | 3,16 °C | −0,14 | +0,23 |
+
+El ciclo anual de Madrid prácticamente desaparece: enero pasa de −7,56 °C a
+−0,14 °C. Y OMIE y MIBGAS tienen 365 y 362 observaciones por año, así que
+escribir 252 sobre ellas sería un desfase de **110 observaciones al año**.
+
+Añadida `periodo_del_indice(indice, ciclo)`, que lo mide del calendario, y una
+detección que avisa cuando el `periodo` pedido está dentro de un factor 2 del
+anual del índice pero no coincide. Esa banda la puse primero en ±25 % y
+**dejaba escapar justo el caso peor**: 252 frente a 353 se quedaba fuera. El
+factor 2 lo cubre sin molestar a quien pide de verdad el ciclo semanal.
+
+### El tamaño del efecto: el revisor se equivocó de causa
+
+El hallazgo decía que `tamano_efecto` «con ruido puro vale 0,26 sobre cuatro
+años diarios, *grande* en la escala del propio docstring», y lo atribuía a que
+`H / (n − 1)` no está corregido por grados de libertad.
+
+La corrección es real, pero es **veinticinco veces más pequeña** que eso.
+Medido con ruido iid puro sobre cuatro años de días hábiles agrupando por mes,
+el efecto medio sale **0,0106**, que es exactamente el `(k − 1)/(n − 1) =
+0,0105` que predice la fórmula: el sesgo y nada más. Es «pequeño» en esa misma
+escala. Corregido a `(H − k + 1)/(n − k)`, que es gratis.
+
+El 0,26 que vio el revisor **venía de otro sitio**, y de algo bastante más
+grave.
+
+### Kruskal-Wallis sobre una serie de precios no vale, y no hay arreglo barato
+
+Kruskal-Wallis, como el ANOVA, supone **observaciones independientes**. Con un
+AR(1) y sin ninguna estacionalidad:
+
+| `φ` | Rechaza al 5 % | Tamaño del efecto medio |
+|---:|---:|---:|
+| 0,00 | 5,5 % (correcto) | 0,0109 |
+| 0,50 | 81,0 % | 0,0288 |
+| 0,90 | **100,0 %** | **0,1157** |
+| 0,99 | 97,5 % | 0,1234 |
+
+Ahí está el 0,26 del revisor: no en los grados de libertad, en la
+autocorrelación. El docstring dedicaba seis líneas a justificar por qué los
+rangos y ni una a la independencia.
+
+**Se intentaron tres arreglos y los tres fallan.** Queda escrito para que nadie
+los repita:
+
+1. **Permutación por desplazamiento circular.** Conserva toda la dependencia y
+   corrige el tamaño en series diarias: 5,5 %, 2,5 %, 1,5 % y 5,5 % para los
+   cuatro `φ`. Pero cuando la serie se muestrea al mismo período con que se
+   agrupa —una serie mensual agrupada por mes— un desplazamiento es una simple
+   **reetiquetación cíclica de los grupos**, y H es invariante a cómo se llamen
+   los grupos: el p-valor sale próximo a 1 pase lo que pase.
+2. **Surrogates de fase aleatoria.** Tamaño correcto en todos los casos (3,5 %
+   a 7,0 %), pero **sin potencia** contra lo que más interesa: un patrón
+   sinusoidal con el período de la agrupación da los mismos doce grupos a
+   cualquier fase. Sobre serie mensual con amplitud 1,2 σ detecta el 4 %.
+3. **Wald conjunto con errores HAC sobre los rangos.** Sobre-rechaza: 12,8 %
+   con datos iid diarios, 19,5 % mensuales y 82,8 % con `φ = 0,9`. El
+   truncamiento de retardos de la regla habitual es cortísimo para esa
+   persistencia y el Wald tiene sesgo de muestra pequeña con doce grupos.
+
+Así que **no se finge un arreglo**. El p-valor se queda como estaba y lo que se
+añade es el diagnóstico que faltaba: `autocorrelacion_1` y
+`observaciones_efectivas = n(1−ρ)/(1+ρ)`, con un aviso cuando esta última baja
+de diez veces el número de grupos. Es la cifra que lo explica de un golpe:
+
+| Serie real | p-valor | Efecto | ρ₁ residual | Observaciones efectivas |
+|---|---:|---:|---:|---:|
+| OMIE diario | 1,4e−52 | 0,0833 | +0,941 | **97** de 3 185 |
+| MIBGAS diario | 9,2e−12 | 0,0168 | +0,989 | **21** de 3 877 |
+| Temperatura de Madrid | 0,0 | **0,8330** | +0,795 | 351 de 3 078 |
+
+Las dos primeras avisan: un contraste de doce grupos sobre 97 o 21
+observaciones efectivas no puede decir nada del calendario, por mucho que el
+p-valor sea 1e−52. La tercera **no avisa**, y es la correcta: la
+estacionalidad de la temperatura es real, el efecto es 0,83 y hay 351
+observaciones efectivas. El diagnóstico distingue los dos casos.
+
+**La autocorrelación se mide sobre los residuos dentro de cada grupo**, no
+sobre la serie entera, y eso importa: una serie con estacionalidad limpia y
+ruido iid tiene autocorrelación total altísima —enero se parece a febrero
+porque los dos son invierno— y sin embargo el contraste está perfectamente
+calibrado, porque las observaciones son independientes *dado el grupo*.
+Midiéndola sobre la serie entera salían 135 avisos en 127 pruebas; sobre los
+residuos del grupo, cero falsos.
+
+### Lo que estaba bien
+
+La revisión daba por verificada la aritmética de `spreads.py` y lo está. Se
+deja fijado como prueba en lugar de como nota: **error 0,000e+00** en 3 000
+casos aleatorios contra una reimplementación independiente, para el spark, el
+dark limpio (con el CO₂) y el crack 3-2-1, incluyendo precios de electricidad
+negativos. Y la desigualdad de Jensen que promete `valor_opcionalidad` se
+cumple y crece con la volatilidad: con spread medio −5, la media de
+`max(spread, 0)` vale 0,425 · 5,662 · 21,848 para volatilidades de 5, 20 y 60.
+Una planta con spread medio negativo vale dinero, que es el caso del ciclo
+abierto de punta.
+
+La corrección 2×M de la media móvil centrada para períodos pares también está
+bien: coincide con `statsmodels.seasonal_decompose` a **3,6e−15**.
+
+Y cuatro sospechas mías que tampoco eran hallazgos, medidas y descartadas: los
+percentiles de `resumen_spread` usan la interpolación de `numpy`, pero son
+descriptivos y no una medida de riesgo; `spread_locacional` da +8 en un sentido
+y −12 en el otro, que es correcto porque el transporte cuesta en los dos;
+`horas_en_dinero` con huecos da 2 de 3 y no 2 de 4, que también es lo correcto
+—una hora desconocida no estuvo en dinero— y el recuento queda visible en
+`resumen_spread`; y el caso de un solo año en `indice_estacional` ya levantaba
+el error adecuado.
+
+Los módulos de prueba pasan de 67 y 60 casos a 73 y 62: **5 de los nuevos
+fallan contra el código viejo** y los 2 de spreads pasan en las dos versiones a
+propósito, porque fijan lo que estaba bien.

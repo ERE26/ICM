@@ -451,3 +451,73 @@ def test_una_secuencia_de_longitud_distinta_da_error():
 def test_dos_secuencias_sin_indice_deben_medir_lo_mismo():
     with pytest.raises(ErrorDatos, match="longitudes distintas"):
         spark_spread([100.0, 110.0], [30.0, 30.0, 30.0])
+
+
+# --- lo que la segunda revision adversarial verifico como correcto -------------
+
+
+def test_la_aritmetica_de_los_spreads_contra_una_reimplementacion_independiente():
+    """Lo que el revisor comprobo y salio bien: se deja fijado como prueba.
+
+    Error 0,000e+00 en 3 000 casos aleatorios, con la eficiencia dividiendo al
+    combustible y el factor de emision por MWh termico, que es lo que promete
+    el docstring. Se incluyen precios de electricidad negativos, que en el pool
+    iberico son rutina.
+    """
+    generador = np.random.default_rng(11)
+    peor_spark = peor_dark_limpio = peor_crack = 0.0
+
+    for _ in range(3000):
+        electricidad = generador.uniform(-50.0, 700.0)
+        gas = generador.uniform(5.0, 250.0)
+        eficiencia = generador.uniform(0.25, 0.65)
+        costes = generador.uniform(0.0, 10.0)
+        obtenido = float(
+            spark_spread(pd.Series([electricidad]), pd.Series([gas]), eficiencia, costes).iloc[0]
+        )
+        peor_spark = max(peor_spark, abs(obtenido - (electricidad - gas / eficiencia - costes)))
+
+        carbon = generador.uniform(5.0, 200.0)
+        co2 = generador.uniform(0.0, 120.0)
+        emision = generador.uniform(0.2, 0.45)
+        obtenido = float(
+            dark_spread_limpio(
+                pd.Series([electricidad]), pd.Series([carbon]), pd.Series([co2]),
+                eficiencia, emision, costes,
+            ).iloc[0]
+        )
+        esperado = electricidad - carbon / eficiencia - co2 * emision / eficiencia - costes
+        peor_dark_limpio = max(peor_dark_limpio, abs(obtenido - esperado))
+
+        crudo = generador.uniform(20.0, 140.0)
+        gasolina, destilado = generador.uniform(0.5, 4.0), generador.uniform(0.5, 4.0)
+        obtenido = float(
+            crack_spread(pd.Series([crudo]), pd.Series([gasolina]), pd.Series([destilado])).iloc[0]
+        )
+        esperado = (42.0 * (2.0 * gasolina + 1.0 * destilado) - 3.0 * crudo) / 3.0
+        peor_crack = max(peor_crack, abs(obtenido - esperado))
+
+    assert peor_spark == 0.0
+    assert peor_dark_limpio < 1e-12
+    assert peor_crack == 0.0
+
+
+def test_la_opcionalidad_cumple_la_desigualdad_de_jensen_y_crece_con_la_volatilidad():
+    """La afirmacion central del docstring de 'valor_opcionalidad'.
+
+    Valorar la planta como si produjese siempre la infravalora, y la diferencia
+    crece con la volatilidad. Una planta con spread medio NEGATIVO puede valer
+    mucho: es el caso del ciclo abierto de punta.
+    """
+    generador = np.random.default_rng(3)
+    pagos = []
+    for volatilidad in (5.0, 20.0, 60.0):
+        spread = pd.Series(generador.normal(-5.0, volatilidad, 8760))
+        media_del_maximo = float(valor_opcionalidad(spread).mean())
+        maximo_de_la_media = max(float(spread.mean()), 0.0)
+        assert media_del_maximo >= maximo_de_la_media
+        assert maximo_de_la_media == 0.0  # spread medio negativo
+        assert media_del_maximo > 0.0  # y aun asi la planta vale
+        pagos.append(media_del_maximo)
+
+    assert pagos == sorted(pagos), "el valor de la opcionalidad crece con la volatilidad"
