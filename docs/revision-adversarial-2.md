@@ -242,3 +242,69 @@ El patrón es el mismo que en la primera ronda: **las fórmulas están bien**. L
 que falla son los bordes, las convenciones y los casos que ninguna prueba tocó —
 la primera observación, el orden de un diccionario, una serie corta, una cartera
 neta corta, un día que el mercado cerró a cero.
+
+---
+
+## Estado: el simulador, cerrado y recalibrado
+
+Septiembre de 2026. Los 17 hallazgos del simulador están cerrados, y el
+módulo se rehízo contra datos del mercado español en vez de contra las
+intuiciones de quien lo escribió.
+
+### Lo que cambió
+
+| | Antes | Ahora | Real |
+|---|---:|---:|---:|
+| Volatilidad de OMIE | 1,14 | 7,20 | 7,69 |
+| Volatilidad de MIBGAS | 0,73 | 1,07 | 1,16 |
+| Curtosis de OMIE | 0,5 | 39,4 | 15,0 |
+| Curtosis de Henry Hub | 5,6 | 107,9 | 90,4 |
+| Ciclo semanal (domingo) | no existía | −0,248 | −0,256 |
+| Correlación Henry Hub-Brent | +0,312 | +0,010 | +0,026 |
+| Correlación WTI-Brent | +0,519 | +0,628 | +0,687 |
+| Mínimo de OMIE / su media | 0,54 | 0,006 | 0,002 |
+| Perfil mensual repetido año a año | +1,00 | +0,13 | +0,08 |
+| Asimetría de XLU | +1,81 | −1,42 | (negativa) |
+
+La circularidad se rompió invirtiendo la causalidad: **la previsión se genera
+primero y la realidad se deriva de ella**. Antes, el cociente entre la
+correlación de la previsión y la contemporánea era *exactamente* el parámetro
+`habilidad` (0,30 → 0,253; 0,90 → 0,883). Ahora ese parámetro gobierna lo que
+dice gobernar —cuánto del clima es predecible— y ya no fija el resultado.
+
+El reparto conserva la varianza del clima, y esto costó dos intentos: el
+primero escalaba la sorpresa hacia arriba, con lo que **una previsión peor
+hacía el clima más variable** y la correlación contemporánea *subía* al
+empeorar la previsión. Una previsión mala no hace que llueva más.
+
+### Donde el revisor se equivocó
+
+El hallazgo *«TTF y MIBGAS correlacionan 0,22 cuando en el mundo real son casi
+el mismo producto»* y su acompañante *«MIBGAS y OMIE deberían ir a 0,7-0,8»*
+eran **la intuición del revisor, no un dato**. Medido sobre 1 652 días
+comunes:
+
+| Par | Real | Simulador de entonces |
+|---|---:|---:|
+| MIBGAS-OMIE | **+0,168** | +0,201 |
+| Henry Hub-Brent | **+0,026** | +0,312 |
+| WTI-Brent | **+0,687** | +0,519 |
+
+El simulador acertaba en el par que el revisor criticaba y fallaba en los
+otros dos, en dirección contraria: el defecto no era que los mercados
+relacionados correlacionasen poco, sino que los **no relacionados**
+correlacionaban demasiado, porque un único factor global los ataba a todos.
+
+Es el recordatorio de que un revisor adversarial con buen criterio sigue
+teniendo priores, y que la regla de «ningún hallazgo sin una reproducción con
+cifras» no protege de un prior cuando lo que se afirma es sobre el mundo y no
+sobre el código.
+
+### Lo que sigue sin reproducir
+
+El **agrupamiento de volatilidad**. La autocorrelación de los rendimientos en
+valor absoluto sale entre 0,07 y 0,13 y en los datos va de 0,25 a 0,44, pese a
+llevar el GARCH casi al límite IGARCH (α+β = 0,995), que es donde lo sitúa el
+ajuste sobre las series reales. La causa es que las componentes exógena,
+estacional y semanal no se agrupan, y ahora pesan más. Queda documentado en la
+cabecera del módulo en lugar de disimulado.

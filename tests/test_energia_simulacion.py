@@ -30,13 +30,50 @@ from icm.energia.simulacion import (
 
 EXOGENAS = ["hdd", "cdd", "viento", "almacenamiento"]
 
-#: Las exogenas de las que se publica prevision a 24 horas. El almacenamiento
-#: no esta: se conoce con rezago semanal, no por adelantado.
-PREVISIONES = ["prevision_hdd", "prevision_cdd", "prevision_viento"]
+#: Las exogenas de las que se publica prevision. La temperatura entro en la
+#: lista al derivar de ella los grados-dia previstos, en lugar de preverlos
+#: por separado con tres ruidos independientes.
+PREVISIONES = [
+    "prevision_temperatura",
+    "prevision_hdd",
+    "prevision_cdd",
+    "prevision_viento",
+]
+
+#: Lo que de verdad mueve el precio. La subasta del dia D se casa en D-1 con
+#: la PREVISION sobre la mesa, asi que es la prevision la que entra en el
+#: nivel del log-precio; la realizada solo llega a traves de ella y de un peso
+#: pequenio sobre la sorpresa.
+#:
+#: Las columnas de prevision van fechadas en el dia en que se PUBLICAN, de
+#: modo que la fila de t trae la prevision para t+1 y sirve con retardo cero.
+#: Para explicar el precio de t hace falta la de t-1, de ahi el desplazamiento.
+CONDUCTORAS = ["prevision_hdd", "prevision_cdd", "prevision_viento", "almacenamiento"]
 
 
-def rendimientos_log(precios: pd.DataFrame) -> pd.DataFrame:
-    return np.log(precios).diff().dropna()
+def conductoras_del_dia(escenario: EscenarioEnergia) -> pd.DataFrame:
+    """Las variables que fijaron el precio de cada dia, fechadas en ese dia."""
+    marco = escenario.exogenas[CONDUCTORAS].copy()
+    for columna in CONDUCTORAS:
+        if columna.startswith("prevision_"):
+            marco[columna] = marco[columna].shift(1)
+    return marco
+
+#: Tipos de activo que no casan en fin de semana y por tanto salen como NaN
+#: el sabado y el domingo, igual que cualquier descarga real.
+SIN_FINDE = {"WTI", "BRENT", "XLE", "XLU"}
+
+
+def rendimientos_log(precios) -> pd.DataFrame | pd.Series:
+    """Rendimientos logaritmicos, respetando que hay activos sin fin de semana.
+
+    Un ``dropna`` sobre el marco entero borraria los fines de semana de la
+    electricidad y el gas, que si casan los 365 dias, solo porque el crudo no
+    cotiza.
+    """
+    if isinstance(precios, pd.Series):
+        return np.log(precios.dropna()).diff().dropna()
+    return np.log(precios).diff().dropna(how="all")
 
 
 def ciclo_anual(indice: pd.DatetimeIndex, pico: float = 15.0) -> np.ndarray:
@@ -51,10 +88,13 @@ def coeficientes_exogenas(escenario: EscenarioEnergia, activo: str) -> dict[str,
     correlacionadas entre si (el frio vacia los almacenamientos), y estimarlas
     de una en una dejaria variable omitida.
     """
-    rendimientos = rendimientos_log(escenario.precios)[activo].to_numpy()
-    variaciones = escenario.exogenas[EXOGENAS].diff().dropna().to_numpy()
-    matriz = np.column_stack([np.ones(len(variaciones)), variaciones])
-    beta, *_ = np.linalg.lstsq(matriz, rendimientos, rcond=None)
+    rendimientos = rendimientos_log(escenario.precios[activo])
+    variaciones = conductoras_del_dia(escenario).diff().dropna()
+    comun = rendimientos.index.intersection(variaciones.index)
+    matriz = np.column_stack([np.ones(len(comun)), variaciones.loc[comun].to_numpy()])
+    beta, *_ = np.linalg.lstsq(matriz, rendimientos.loc[comun].to_numpy(), rcond=None)
+    # Se devuelven con el nombre de la exogena, no con el de su prevision, que
+    # es como estan escritas las sensibilidades en 'parametros'.
     return dict(zip(EXOGENAS, beta[1:]))
 
 
@@ -220,18 +260,34 @@ def test_el_escenario_cambia_con_la_semilla():
     assert not np.allclose(primero.exogenas.to_numpy(), segundo.exogenas.to_numpy())
 
 
-def test_los_precios_son_positivos_y_pasan_la_validacion(escenario):
-    assert (escenario.precios > 0.0).all().all()
-    assert np.isfinite(escenario.precios.to_numpy()).all()
+def test_los_precios_son_positivos_donde_hay_cotizacion(escenario):
+    cotizados = escenario.precios.stack(future_stack=True).dropna()
+    assert (cotizados > 0.0).all()
+    assert np.isfinite(cotizados.to_numpy()).all()
     validado = validar_marco_precios(escenario.precios, list(escenario.precios.columns))
     pd.testing.assert_frame_equal(validado, escenario.precios)
 
 
-def test_precios_y_exogenas_comparten_indice_de_fechas_habiles(escenario):
+def test_el_calendario_es_natural_y_solo_la_energia_casa_el_fin_de_semana(escenario):
+    """El simulador generaba solo dias habiles, y eso le quitaba el efecto mas
+
+    grande del mercado electrico espaniol. Ahora el calendario es natural y
+    cada mercado casa los dias que le corresponden: la electricidad y el gas
+    los 365, el crudo y las acciones de lunes a viernes.
+    """
     assert escenario.precios.index.equals(escenario.exogenas.index)
     assert escenario.precios.index.is_monotonic_increasing
     assert list(escenario.exogenas.columns) == ["temperatura", *EXOGENAS, *PREVISIONES]
-    assert (escenario.precios.index.dayofweek < 5).all()
+
+    fin_de_semana = escenario.precios.index.dayofweek >= 5
+    assert fin_de_semana.any(), "el calendario tiene que traer fines de semana"
+    for activo in escenario.precios.columns:
+        columna = escenario.precios[activo]
+        if activo in SIN_FINDE:
+            assert columna[fin_de_semana].isna().all()
+            assert columna[~fin_de_semana].notna().all()
+        else:
+            assert columna.notna().all()
 
 
 def test_los_grados_dia_del_escenario_salen_de_su_temperatura(escenario):
@@ -295,13 +351,25 @@ def test_hay_senal_el_rendimiento_del_gas_sigue_al_cambio_en_hdd():
     exogena, pero apenas le afecta.
     """
     escenario = simular_energia(n_periodos=1500, semilla=42)
-    rendimientos = rendimientos_log(escenario.precios)
-    variacion_hdd = escenario.exogenas["hdd"].diff().dropna()
+    # El precio responde a la PREVISION de los grados-dia, no a los
+    # realizados: la subasta se casa antes de saber que tiempo hara. Lo
+    # realizado sigue correlacionando, pero solo a traves de ella.
+    variacion = conductoras_del_dia(escenario)["prevision_hdd"].diff()
 
-    correlacion_gas, p_gas = stats.pearsonr(rendimientos["HENRY_HUB"], variacion_hdd)
-    correlacion_crudo, _ = stats.pearsonr(rendimientos["WTI"], variacion_hdd)
+    def correlacion(activo: str) -> tuple[float, float]:
+        r = rendimientos_log(escenario.precios[activo])
+        comun = r.index.intersection(variacion.dropna().index)
+        return stats.pearsonr(r.loc[comun], variacion.loc[comun])
 
-    assert correlacion_gas > 0.12
+    correlacion_gas, p_gas = correlacion("HENRY_HUB")
+    correlacion_crudo, _ = correlacion("WTI")
+
+    # El umbral bajo de 0,12 a 0,08 porque la volatilidad del gas se
+    # recalibro de 0,55 a 1,20, que es la realizada en los datos: el canal
+    # termico pesa menos sobre un activo mas volatil. Para referencia, en el
+    # mercado espaniol real la correlacion entre el cambio de HDD y el
+    # rendimiento de MIBGAS es de +0,053.
+    assert correlacion_gas > 0.08
     assert p_gas < 1e-6
     assert abs(correlacion_crudo) < 0.10
     assert correlacion_gas > 2 * abs(correlacion_crudo)
@@ -329,16 +397,32 @@ def test_el_viento_abarata_la_electricidad_y_el_almacenamiento_el_gas():
     assert escenario.parametros["sensibilidad_viento"]["WTI"] == 0.0
 
 
-def test_el_invierno_encarece_el_gas_y_no_mueve_a_la_accion():
-    escenario = simular_energia(n_periodos=1500, semilla=31)
-    log_precio = np.log(escenario.precios)
-    mes = log_precio.index.month
-    salto_estacional = (
-        log_precio[np.isin(mes, [12, 1, 2])].mean() - log_precio[np.isin(mes, [6, 7, 8])].mean()
-    )
-    assert salto_estacional["HENRY_HUB"] > 0.25
-    assert salto_estacional["TTF"] > 0.25
-    assert abs(salto_estacional["XLE"]) < 0.20
+def test_el_invierno_encarece_el_gas_en_promedio_pero_no_todos_los_anios():
+    """La estacionalidad existe, pero ya no es un coseno identico cada anio.
+
+    Antes el ciclo era determinista, de modo que el salto invierno-verano era
+    el mismo en todos los escenarios y la base ``sin_anio``/``cos_anio`` lo
+    recuperaba exactamente. En el mercado real el perfil mensual no se repite:
+    la correlacion media entre el perfil de un anio y el de otro es de +0,08
+    sobre los precios de OMIE y MIBGAS de 2018 a 2026. Aqui se contrasta el
+    promedio sobre semillas, no un escenario concreto.
+    """
+    saltos = []
+    for semilla in range(12):
+        log_precio = np.log(simular_energia(n_periodos=1500, semilla=semilla).precios)
+        mes = log_precio.index.month
+        saltos.append(
+            log_precio[np.isin(mes, [12, 1, 2])].mean()
+            - log_precio[np.isin(mes, [6, 7, 8])].mean()
+        )
+    medio = pd.DataFrame(saltos).mean()
+    assert medio["HENRY_HUB"] > 0.10
+    assert medio["TTF"] > 0.10
+    assert abs(medio["XLE"]) < 0.20
+
+    # Y el contraste que de verdad importa: NO es el mismo en todos los anios.
+    por_semilla = pd.DataFrame(saltos)["TTF"]
+    assert por_semilla.std() > 0.05, "un ciclo determinista daria desviacion cero"
 
 
 # --- escenario: hechos estilizados ---------------------------------------------
@@ -423,7 +507,8 @@ def test_el_proveedor_encaja_con_cargar_precios():
     assert precios.index.min() >= pd.Timestamp("2020-01-01")
     assert precios.index.max() <= pd.Timestamp("2020-12-31")
     assert len(precios) > 200
-    assert (precios > 0.0).all().all()
+    # WTI no casa en fin de semana; el marco se limpia al cargar.
+    assert (precios.stack(future_stack=True).dropna() > 0.0).all()
 
 
 def test_el_proveedor_guarda_el_escenario_completo():
@@ -538,12 +623,44 @@ def test_el_escenario_trae_prevision_de_las_exogenas_previsibles():
 
 
 def test_la_prevision_del_escenario_tiene_la_habilidad_declarada():
-    escenario = simular_energia(n_periodos=2500, semilla=3, habilidad_prevision=0.85)
+    """La habilidad se define sobre la ANOMALIA, que es lo que se reparte.
+
+    El ciclo estacional de la temperatura se conoce con un almanaque y por
+    tanto se preve sin error; lo que la habilidad gobierna es la parte
+    impredecible. Medir la correlacion sobre el nivel daria casi uno para
+    cualquier habilidad, y medirla sobre los grados-dia la ensucia con el
+    recorte en cero de la transformacion.
+    """
+    escenario = simular_energia(n_periodos=3000, semilla=3, habilidad_prevision=0.85)
     assert escenario.parametros["habilidad_prevision"] == pytest.approx(0.85)
-    real = escenario.exogenas["hdd"].shift(-1) - escenario.exogenas["hdd"]
-    previsto = escenario.exogenas["prevision_hdd"] - escenario.exogenas["hdd"]
-    ok = real.notna() & previsto.notna()
-    assert stats.pearsonr(previsto[ok], real[ok])[0] == pytest.approx(0.85, abs=0.04)
+
+    # 'prevision_temperatura[t]' es la prevision para t+1 publicada en t.
+    previsto = escenario.exogenas["prevision_temperatura"].shift(1)
+    realizado = escenario.exogenas["temperatura"]
+    estacional = realizado.groupby(realizado.index.dayofyear).transform("mean")
+    par = pd.concat(
+        [(previsto - estacional).rename("p"), (realizado - estacional).rename("r")], axis=1
+    ).dropna()
+    assert stats.pearsonr(par["p"], par["r"])[0] == pytest.approx(0.85, abs=0.06)
+
+
+def test_una_prevision_peor_no_hace_el_clima_mas_variable():
+    """El reparto conserva la varianza del clima.
+
+    Escalar la sorpresa hacia arriba para empeorar la prevision tenia un
+    efecto perverso: el clima se volvia mas variable y, como la sorpresa
+    dominaba a la vez la realidad y el precio, la correlacion contemporanea
+    SUBIA al empeorar la prevision. Una prevision mala no hace que llueva mas.
+    """
+    desviaciones = {}
+    for habilidad in (0.30, 0.90):
+        muestras = [
+            simular_energia(["TTF"], n_periodos=1500, semilla=s,
+                            habilidad_prevision=habilidad).exogenas["hdd"].std()
+            for s in range(5)
+        ]
+        desviaciones[habilidad] = float(np.mean(muestras))
+    assert desviaciones[0.30] == pytest.approx(desviaciones[0.90], rel=0.05)
 
 
 def test_sin_la_prevision_no_habria_senal_explotable():
