@@ -603,6 +603,16 @@ Tres cosas que se leen bien ahí, y ninguna se podía leer antes:
   Cornish-Fisher habría avisado en más de la mitad de las 2 250 ventanas y
   esta comparación no habría sido legible; ahora avisa en el 12-13 %, y son
   episodios de colas gruesas de verdad.
+- Con el **histórico completo** en lugar de las últimas 2 500 sesiones el
+  veredicto se endurece, y conviene saberlo antes de presumir de un aprobado:
+  MIBGAS pasa de verde a amarilla (53 excepciones sobre 3 626 ventanas frente
+  a 36,26 esperadas, Kupiec p = 0,0089) y Brent, de amarilla a roja (125 sobre
+  8 841 frente a 88,41, p = 2,3e−04, pero independencia p = 0,3915). El
+  `parametrico_t` da en MIBGAS exactamente las mismas 53 excepciones que el
+  histórico. Ninguno de los cuatro métodos aprueba el contraste condicional en
+  ninguna de las dos series, que es la conclusión honesta: **un VaR de ventana
+  fija no modeliza bien una materia prima energética**, y la librería ahora lo
+  dice en vez de taparlo.
 - El VaR anual de MIBGAS sale **312,82 %** con la media escalada linealmente
   frente a 328,56 % con la raíz del tiempo ingenua. Los dos números son
   disparatados, y eso no es un fallo: son rendimientos logarítmicos y la regla
