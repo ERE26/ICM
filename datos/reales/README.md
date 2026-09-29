@@ -156,23 +156,34 @@ Los grados-día que salen (base 15,5 / 22 °C) van de 1 341 HDD en 2018 a 924 en
 caída de 2025-2026 es que la muestra termina en septiembre y se queda sin los
 meses fríos.
 
+## El sistema eléctrico, y la previsión publicada
+
+`sistema_electrico_diario.csv` y `sistema_electrico_horario.csv` traen, para
+2015-2020, la demanda española realizada, la **previsión de demanda que el
+operador publica antes de que cierre la subasta**, y la generación eólica y
+solar. Vienen de Open Power System Data, que republica ENTSO-E Transparency.
+
+Esa columna de previsión es la pieza que permite contrastar la tesis central
+del proyecto, y costó encontrarla. La intuición inicial —buscar previsiones
+meteorológicas— era la equivocada: **lo que entra en la subasta de OMIE no es
+el tiempo, es la previsión de demanda del operador**. La previsión es buena de
+verdad: 0,84 % de error absoluto medio y correlación de 0,9939 con la demanda
+realizada.
+
+Solapa 1 004 días con OMIE (2018-01-01 a 2020-09-30). OPSD dejó de
+actualizarse en octubre de 2020, así que para años posteriores haría falta
+ENTSO-E directamente, que pide un token gratuito.
+
 ## Lo que no se pudo conseguir
 
-Tres cosas, y ninguna es sustituible por algo parecido:
-
-- **Generación eólica y demanda españolas.** ESIOS necesita un token personal
-  gratuito que se pide por correo a `consultasios@ree.es`. El dominio ya es
-  alcanzable: devuelve 403 por falta de credencial, no por la red. La API
-  `apidatos.ree.es` está detrás de protección anti-bot y no se intentó rodear.
-- **Previsiones meteorológicas publicadas**, que es la pata sobre la que
-  descansaba el primer resultado del proyecto. `open-meteo` tiene un archivo de
-  previsiones pasadas y no pide clave, pero su cuota diaria gratuita se agotó
-  con las pruebas de conexión. Se puede reintentar al día siguiente.
+- **ESIOS** necesita un token personal gratuito que se pide por correo a
+  `consultasios@ree.es`. El dominio es alcanzable: devuelve 403 por falta de
+  credencial, no por la red. La API `apidatos.ree.es` está detrás de protección
+  anti-bot y no se intentó rodear.
+- **`open-meteo`** tiene un archivo de previsiones meteorológicas pasadas y no
+  pide clave, pero devuelve 429 de forma persistente: el límite va por IP de
+  salida y el contenedor la comparte. No se buscó forma de esquivarlo, y al
+  final no hizo falta.
 - **TTF y derechos de emisión EUA.** El primero lo publica ICE bajo licencia y
-  el segundo EEX; ninguno tiene descarga abierta comparable.
-
-Sin previsiones publicadas, la afirmación *«la señal está en las previsiones y
-no en el historial»* **no se puede contrastar** con estos datos. Lo que sí se
-puede medir es su otra mitad: si los valores rezagados sirven o no. Para el
-spark spread, en cambio, MIBGAS y OMIE bastan — gas y electricidad españoles,
-ambos en €/MWh, con más de ocho años de solapamiento.
+  el segundo EEX; ninguno tiene descarga abierta comparable. Por eso el CO2
+  entra en el cuaderno como análisis de sensibilidad y no como serie.

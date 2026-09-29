@@ -358,19 +358,30 @@ ETF sectoriales.
 
 No son opiniones: están medidos, y los reproduce el tercer notebook.
 
-**1. En energía, la señal está en las previsiones publicadas, no en el historial
-de precios.** Las variables físicas afectan al precio de forma contemporánea, así
-que el frío de hoy no anticipa el rendimiento de mañana:
+**1. La previsión publicada explica el precio precisamente porque no lo
+predice.** Este resultado decía antes lo contrario —«la señal está en las
+previsiones publicadas»— y salía del simulador, donde era circular por
+construcción: el precio se fijaba sobre el valor realizado de la exógena y la
+previsión se fabricaba a partir de ese mismo valor futuro, de modo que el
+«+0,20» era la habilidad de previsión que estaba escrita en el fichero
+multiplicada por la correlación contemporánea.
 
-| Relación | r |
+Medido sobre el mercado español real, con la previsión de demanda que el
+operador publica antes de que cierre la subasta (1 004 días de solapamiento con
+OMIE):
+
+| Relación | Resultado |
 |---|---|
-| Cambio de temperatura de hoy vs rendimiento de hoy | +0,25 |
-| Nivel de temperatura de hoy vs rendimiento de mañana | −0,03 (p=0,23) |
-| **Cambio previsto para mañana** vs rendimiento de mañana | **+0,20** |
+| R² del precio contra la **previsión publicada** | 0,2608 |
+| R² del precio contra la **demanda realizada** | 0,2628 |
+| Lo que añade conocer la realidad | **0,20 puntos** |
+| Cambio de la previsión de **ayer** vs cambio de precio de hoy | r = +0,02 (t = 0,74) |
 
-Y usar esa previsión no es mirar al futuro: el operador del sistema la publica
-antes de que cierre el mercado diario. Es la diferencia estructural con la renta
-variable, donde no existe un boletín oficial de lo que va a pasar mañana.
+La previsión explica el precio tan bien como lo que de verdad ocurrió, y no
+predice nada del cambio futuro. Las dos cosas son la misma: **la subasta de
+OMIE para el día D se casa el día D−1 con esa previsión como entrada.** El
+simulador tenía incorporada la hipótesis contraria —un mercado que ignora la
+información pública hasta que se materializa— y nadie la había declarado.
 
 **2. El error de predicción y el dinero ordenan los modelos de forma opuesta.**
 

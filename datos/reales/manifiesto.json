@@ -177,6 +177,28 @@
    "desde": "2018-01-01",
    "hasta": "2026-09-19",
    "sha256_12": "378720e2f33f"
+  },
+  {
+   "fichero": "sistema_electrico_diario.csv",
+   "descripcion": "Demanda realizada y PREVISTA publicada por el operador, eolica y solar, medias diarias en MW",
+   "repo": "Open Power System Data",
+   "ruta_origen": "time_series/2020-10-06 (republica ENTSO-E Transparency)",
+   "columna_fecha": "fecha",
+   "filas": 2100,
+   "desde": "2015-01-01",
+   "hasta": "2020-09-30",
+   "sha256_12": "1abfaf3fe9dc"
+  },
+  {
+   "fichero": "sistema_electrico_horario.csv",
+   "descripcion": "Lo mismo con resolucion horaria, indice en Europe/Madrid",
+   "repo": "Open Power System Data",
+   "ruta_origen": "time_series/2020-10-06 (republica ENTSO-E Transparency)",
+   "columna_fecha": "local",
+   "filas": 50398,
+   "desde": "2015-01-01",
+   "hasta": "2020-09-30",
+   "sha256_12": "69fe39ed83cb"
   }
  ]
 }
