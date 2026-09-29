@@ -222,11 +222,12 @@
   {
    "fichero": "ree_servicios_ajuste.csv",
    "descripcion": "Precio de la banda de regulacion secundaria y coste total de los servicios de ajuste del sistema espaniol, 2021-2025.",
-   "origen": "Transcrito a mano del Informe del Sistema Electrico de Red Electrica; las cifras estan en el PDF del informe y no hay descarga automatica",
+   "origen": "SIN VERIFICAR CONTRA LA FUENTE. Cifras del Informe del Sistema Electrico de REE reproducidas de memoria del modelo, no descargadas: todo el dominio de REE (esios.ree.es, apidatos.ree.es, www.ree.es, sistemaelectrico-ree.es) devuelve 403 de Incapsula a este contenedor. La unica comprobacion hecha es aritmetica interna: 34,28 x 922 MW x 8.760 h = 277 M EUR, el 10,4 % de los 2.668 M EUR de servicios de ajuste de 2024. Eso fija la unidad pero NO confirma el valor. Contrastar con el informe antes de usarlo para decidir.",
    "url_origen": "https://www.sistemaelectrico-ree.es/informe-del-sistema-electrico",
    "filas": 8,
-   "sha256_12": "47e9c12f2afb"
+   "sha256_12": "47e9c12f2afb",
+   "verificado": false
   }
  ],
- "derivados": "omie_impacto_precio.csv, omie_elasticidad_oferta.csv y ree_servicios_ajuste.csv no son descargas directas: los dos primeros se calculan de las curvas agregadas de OMIE, que pesan unos 7 MB por sesion y no se versionan, y el tercero esta transcrito del informe anual de REE. Las 21 sesiones usadas estan listadas en el README de esta carpeta para que el calculo se pueda repetir."
+ "derivados": "omie_impacto_precio.csv y omie_elasticidad_oferta.csv se calculan de las curvas agregadas de OMIE, que pesan unos 7 MB por sesion y no se versionan; las 21 sesiones usadas estan listadas en el README de esta carpeta para que el calculo se pueda repetir. ree_servicios_ajuste.csv es distinto: no esta verificado contra su fuente, vease su campo 'origen'."
 }

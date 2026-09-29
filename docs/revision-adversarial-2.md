@@ -1154,7 +1154,7 @@ fingirlo habría sido peor que decirlo:
   cuando los datos dan 0,25-0,44.
 
 La suite pasa de las 944 pruebas con que empezó la revisión a **1 113**, y a
-**1 183** con el apéndice de datos que cierra este documento.
+**1 198** con los dos apéndices de datos que cierran este documento.
 
 ---
 
@@ -1176,10 +1176,13 @@ un parámetro obligatorio de rellenar a mano.
 
 ## 2. Servicios de ajuste: 34,28 €/MW y hora
 
-Transcrito del Informe del Sistema Eléctrico de REE a
-`datos/reales/ree_servicios_ajuste.csv`. ESIOS exige un token que se pide por
-correo y `apidatos.ree.es` está tras protección anti-bot, así que no hubo
-descarga automática.
+En `datos/reales/ree_servicios_ajuste.csv`, y con una salvedad que hay que
+poner por delante: **es el único fichero del proyecto no verificado contra su
+fuente**. Todo el dominio de REE —`esios.ree.es`, `apidatos.ree.es`,
+`www.ree.es`, `sistemaelectrico-ree.es`— devuelve 403 de Incapsula a este
+contenedor, comprobado host por host, así que las cifras están reproducidas de
+memoria del modelo y no descargadas. Dejarlo sin decir habría sido justo el
+tipo de cosa que esta revisión busca en el código de otros.
 
 La unidad no venía sin ambigüedad en el informe, y una unidad mal interpretada
 aquí cambia el VAN por un factor de 8 760. Se resolvió aritméticamente: con
@@ -1188,6 +1191,11 @@ una banda media asignada de 922 MW, 34,28 × 922 × 8 760 = **277 M€**, el
 banda secundaria sea una partida mediana del total, lo que confirma €/MW **y
 por hora**. Si fuera por año daría 32 000 €, el 0,001 % del total, absurdo; si
 fuera €/MWh no cuadraría con que la banda se retribuye por disponibilidad.
+
+Conviene ser preciso sobre qué prueba esa comprobación: **fija la unidad y no
+el valor**. Un 34,28 que en realidad fuera 31,50 la pasaría igual de bien. Es
+suficiente para escalar un análisis de sensibilidad y no para firmar una
+valoración.
 
 ## 3. Impacto en el precio: el hallazgo que cambia la conclusión
 
@@ -1283,3 +1291,53 @@ sigue valiendo los 72 156 € de VAN que calcula el módulo, pero no es lo que
 decide si la batería se construye. Quien quiera que este proyecto informe una
 inversión real tiene que modelar la banda, y para eso hacen falta datos de
 asignación de banda por unidad que ESIOS publica y este proyecto no tiene.
+
+---
+
+# Apéndice II: una corrección sobre el apéndice anterior
+
+Al buscar los datos de asignación de banda salió un problema en lo que yo
+mismo acababa de escribir, y es del tipo exacto que esta revisión busca en el
+código ajeno.
+
+## Lo que declaré y lo que era cierto
+
+El manifiesto decía que `ree_servicios_ajuste.csv` estaba **«transcrito a mano
+del Informe del Sistema Eléctrico de Red Eléctrica»**. Eso afirma que alguien
+leyó el documento. No ocurrió: todo el dominio de REE devuelve 403 de
+Incapsula a este contenedor, lo cual se comprobó ahora host por host y ya
+constaba como bloqueado cuando escribí esa línea. Las cifras salieron de la
+memoria del modelo que escribió el proyecto, que puede equivocarse en un
+dígito sin dar ninguna señal.
+
+El error no es haber usado esa fuente —con el dominio bloqueado era eso o
+nada, y el análisis de sensibilidad necesita un orden de magnitud— sino
+**haberla etiquetado como algo más fuerte de lo que es**, en el fichero cuyo
+propósito es justamente registrar la procedencia.
+
+## Qué prueba la comprobación aritmética, y qué no
+
+Este es el punto fino. La comprobación fue 34,28 × 922 MW × 8 760 h = 277 M€,
+el 10,4 % de los 2 668 M€ de servicios de ajuste de 2024, y se presentó como
+confirmación. **Confirma la unidad y no el valor.** Si el precio real fuera
+31,50 €/MW·h, el producto daría 254 M€, un 9,5 % del total, e igual de
+creíble. La prueba descarta €/año y €/MWh, que era su propósito original, y no
+descarta un error en la cifra.
+
+Es la misma clase de razonamiento que critiqué en el cuerpo de esta revisión:
+una comprobación que pasa se toma como validación de todo cuando solo valida
+una dimensión concreta.
+
+## Lo corregido
+
+- `manifiesto.json` marca el fichero con `"verificado": false` y explica en
+  `origen` que no está contrastado, por qué, y qué prueba exactamente la
+  comprobación aritmética.
+- El README de datos lo señala como el único fichero de la carpeta sin
+  verificar, con la advertencia de contrastarlo antes de decidir nada con él.
+- El README principal ya no presenta las cifras de banda como valoración sino
+  como análisis de sensibilidad bien escalado.
+
+Las conclusiones no cambian —la **forma** del resultado depende de la unidad,
+que sí está establecida, y no del valor exacto— pero su estatus sí: dejan de
+ser una valoración y pasan a ser lo que siempre fueron.

@@ -22,6 +22,8 @@ dependencies = [
 graficos = ["matplotlib>=3.7"]
 notebooks = ["matplotlib>=3.7", "jupyter", "ipykernel"]
 ficheros = ["openpyxl>=3.1"]
+# Solo para icm.datos.entsoe, que es la unica descarga por HTTP directa.
+entsoe = ["requests>=2.31"]
 # PyTorch ocupa varios gigas porque el paquete de PyPI arrastra las
 # bibliotecas de CUDA. Solo hace falta para icm.ml.redes; todo lo demas
 # funciona sin el. Para la version ligera de CPU:

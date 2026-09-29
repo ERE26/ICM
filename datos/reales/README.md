@@ -276,10 +276,30 @@ vender lo hunde 20,01. El activo destruye el pico del que vive.
 
 ## Servicios de ajuste
 
-`ree_servicios_ajuste.csv`, 8 filas, transcritas a mano del [Informe del
-Sistema Eléctrico](https://www.sistemaelectrico-ree.es/informe-del-sistema-electrico)
-de Red Eléctrica — no hay descarga automática porque las cifras están en el
-PDF del informe.
+`ree_servicios_ajuste.csv`, 8 filas. **Este fichero no está verificado contra
+su fuente y es el único de esta carpeta que no lo está.** Conviene decir
+exactamente qué es y qué no es.
+
+Las cifras corresponden al [Informe del Sistema
+Eléctrico](https://www.sistemaelectrico-ree.es/informe-del-sistema-electrico)
+de Red Eléctrica, pero **no se descargaron**: todo el dominio de REE
+—`esios.ree.es`, `apidatos.ree.es`, `www.ree.es`,
+`sistemaelectrico-ree.es`— devuelve 403 de Incapsula a este contenedor, lo
+que se comprobó host por host. Están reproducidas de memoria del modelo que
+escribió este proyecto, que es una fuente que puede equivocarse en un dígito
+sin avisar.
+
+La única comprobación que se les ha hecho es **aritmética interna**, y es
+importante ver qué prueba y qué no: 34,28 × 922 MW × 8 760 h = 277 M€, el
+10,4 % de los 2 668 M€ de servicios de ajuste de 2024. Eso es consistente con
+que la banda secundaria sea una partida mediana del total, lo que **fija la
+unidad** —€/MW y por hora, no por año ni por MWh— pero **no confirma el
+valor**: un 34,28 que en realidad fuera 31,50 pasaría la misma comprobación.
+
+Quien use este fichero para decidir algo tiene que contrastarlo con el
+informe. Se deja en el repositorio porque la unidad sí está establecida y el
+orden de magnitud permite hacer el análisis de sensibilidad, no porque sea un
+dato tan sólido como los demás de esta carpeta.
 
 Hacen falta porque son el ingreso que `ParametrosInversion` pide a mano y que
 el proyecto no tenía de ninguna fuente: el precio de la **banda de regulación
@@ -297,6 +317,64 @@ septiembre de 2026, dos semanas antes de esta descarga, así que no existe
 serie de precios de capacidad para España. Cualquier cifra que se pusiera ahí
 sería inventada, y por eso `ingreso_adicional_anual_por_mw` sigue valiendo
 cero por omisión.
+
+## La asignación de banda: dónde está y por qué no está aquí
+
+Es el dato que cierra la valoración del almacenamiento, porque de él depende
+si la banda cubre el 10 %, el 25 % o el 50 % de las horas, que es la
+diferencia entre 135 y 392 €/kWh de capex de equilibrio. Se buscó en serio.
+
+**ESIOS no es alcanzable desde este entorno, y no por falta de credencial.**
+Se comprobó host por host, con y sin `User-Agent` descriptivo:
+
+| Host | Respuesta |
+|---|---|
+| `api.esios.ree.es` | 403 Incapsula |
+| `www.esios.ree.es` | 403 Incapsula |
+| `apidatos.ree.es` | 403 Incapsula |
+| `www.ree.es` | 403 Incapsula |
+| `sistemaelectrico-ree.es` | 403 Incapsula |
+| `demanda.ree.es` | 403 Incapsula |
+
+No es la política de red del contenedor —el proxy no registra ningún fallo de
+relé y OMIE, ENTSO-E y el resto de orígenes responden con normalidad— sino
+protección anti-bot del origen, que rechaza a este contenedor por su IP. No se
+intentó rodearla.
+
+**ENTSO-E sí es alcanzable y publica lo mismo.** Responde con el protocolo
+correcto, no con un muro:
+
+```xml
+<Reason><code>999</code><text>Authentication failed.</text></Reason>
+```
+
+Es decir: el host contesta, entiende la consulta y solo falta el token. La
+plataforma de transparencia publica las reservas de balance contratadas bajo
+los artículos 17.1.B, C y D, y lo que en España se llama banda de regulación
+secundaria es allí **aFRR**.
+
+El token es gratuito pero va ligado a una persona, así que este proyecto no
+puede pedirlo solo:
+
+1. Cuenta en <https://transparency.entsoe.eu>.
+2. Correo a `transparency@entsoe.eu` con asunto *Restful API access* desde esa
+   dirección.
+3. El token aparece en *My Account Settings*.
+
+Con el token en la variable de entorno `ENTSOE_TOKEN`, `icm.datos.entsoe`
+funciona sin tocar nada:
+
+```python
+from icm.datos import descargar_banda_secundaria, horas_con_banda
+
+banda = descargar_banda_secundaria("2024-01-01", "2025-01-01")
+horas_con_banda(banda, potencia=100.0)   # la fracción que el VAN necesita
+```
+
+El lector está escrito y probado; lo que no está verificado son los
+parámetros de consulta, porque sin token no se ha podido ejecutar una
+descarga real ni una vez. Está explicado en la cabecera del módulo y aislado
+en `parametros_banda_secundaria` para que corregirlo sea una línea.
 
 ## Lo que no se pudo conseguir
 

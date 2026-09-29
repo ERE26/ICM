@@ -346,9 +346,13 @@ escala a la que el arbitraje solo funcione**.
 
 Y ahí es donde el dato de servicios de ajuste cierra el argumento. La banda de
 regulación secundaria se pagó a **34,28 €/MW y hora asignada** en 2024
-(`datos/reales/ree_servicios_ajuste.csv`, transcrito del informe de REE y
-comprobado aritméticamente: 34,28 × 922 MW × 8 760 h = 277 M€, el 10,4 % de los
-2 668 M€ de servicios de ajuste de ese año). Para la batería de 100 MW, con el
+(`datos/reales/ree_servicios_ajuste.csv`). Esa cifra **no está verificada
+contra su fuente** —todo el dominio de REE devuelve 403 de Incapsula a este
+entorno— y lo único que se le ha comprobado es la coherencia aritmética:
+34,28 × 922 MW × 8 760 h = 277 M€, el 10,4 % de los 2 668 M€ de servicios de
+ajuste de ese año. Eso fija la **unidad** pero no el **valor**, así que las
+cifras siguientes son un análisis de sensibilidad bien escalado, no una
+valoración auditada. Para la batería de 100 MW, con el
 impacto en el precio ya descontado:
 
 | Horas con banda asignada | Ingreso adicional | Capex de equilibrio |
@@ -359,7 +363,22 @@ impacto en el precio ya descontado:
 | 50 % | 150 146 €/MW·año | 392,5 €/kWh |
 
 **Con la banda cubriendo una hora de cada cuatro, el activo entra en el rango
-de mercado** (200-400 €/kWh) por primera vez en todo el proyecto. Es la
+de mercado** (200-400 €/kWh) por primera vez en todo el proyecto.
+
+Cuál de esas filas es la real depende de un dato que el proyecto **no tiene**:
+la asignación de banda hora a hora. ESIOS la publica y no es alcanzable desde
+este entorno —todo el dominio de REE devuelve 403 de Incapsula, comprobado
+host por host—. ENTSO-E publica lo mismo para toda Europa, sí es alcanzable y
+solo pide un token gratuito que va ligado a una persona. El lector está
+escrito y probado en `icm.datos.entsoe`, y funciona en cuanto exista
+`ENTSOE_TOKEN`:
+
+```python
+from icm.datos import descargar_banda_secundaria, horas_con_banda
+
+banda = descargar_banda_secundaria("2024-01-01", "2025-01-01")
+horas_con_banda(banda, potencia=100.0)   # la fila de la tabla que aplica
+``` Es la
 respuesta cuantificada a por qué el almacenamiento en España se financia con
 pagos por potencia disponible y no con el *spread* horario: se cobran por MW y
 no por MWh, así que **no se autodestruyen al crecer**. El arbitraje paga la
