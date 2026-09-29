@@ -917,3 +917,240 @@ el error adecuado.
 Los módulos de prueba pasan de 67 y 60 casos a 73 y 62: **5 de los nuevos
 fallan contra el código viejo** y los 2 de spreads pasan en las dos versiones a
 propósito, porque fijan lo que estaba bien.
+
+---
+
+## Estado: evaluación, cerrada. Y con esto, los 107
+
+Septiembre de 2026. `ml/evaluacion.py`. `comun.py` ya se cerró con la capa de
+datos. Este es el último de los siete bloques.
+
+### El MASE dependía de las unidades, y la causa era peor de lo que parecía
+
+Confirmado exacto. La misma serie de 1 000 rendimientos de volatilidad 1,5 %,
+el mismo modelo —uno que predice cero— y dos respuestas:
+
+| Unidades | `quantile(\|x\|, 0,99)` | Se clasificaba como | MASE |
+|---|---:|---|---:|
+| tanto por uno | 0,0347 | rendimiento | **1,0000** |
+| porcentaje | 3,4718 | precio | **0,7046** |
+
+La causa es `_es_serie_de_rendimientos`, que decidía con un umbral **absoluto**:
+rendimientos si la serie está centrada en cero y `quantile(|x|, 0,99) < 1`. En
+porcentaje el cuantil pasa de 1, la serie se clasifica como precio, la
+referencia ingenua deja de ser «cero» y pasa a ser «el último valor» —una
+referencia pésima para una serie sin memoria— y cualquier modelo la bate. La
+métrica que el docstring vende como adimensional cambiaba con las unidades.
+
+**Y hay algo que el revisor no vio: la regla fallaba en el mercado para el que
+está escrita la librería.** Los rendimientos diarios de OMIE tienen
+`quantile(|x|, 0,99) = 2,55`, porque el pool pasa de 1 a 100 EUR/MWh con
+normalidad. En tanto por uno y todo, **se clasificaban como precio**.
+
+La regla nueva no mira la escala, mira la **persistencia**: el cociente entre
+la desviación típica de la serie y la de su primera diferencia, que es
+invariante a la escala porque la multiplica por la misma constante arriba y
+abajo. Para un AR(1) de parámetro `φ` vale `1/√(2(1−φ))`.
+
+| Serie | Cociente | ρ(1) |
+|---|---:|---:|
+| Ruido blanco (teórico) | 0,707 | 0 |
+| OMIE rendimientos | 0,710 | +0,008 |
+| **OMIE rendimientos en %** | **0,710** | +0,008 |
+| Spark spread OMIE-MIBGAS | 2,140 | +0,891 |
+| OMIE precio EUR/MWh | 2,978 | +0,944 |
+| VIX nivel | 4,647 | +0,977 |
+| EUR/USD precio | 23,180 | +0,999 |
+
+Los dos grupos quedan separados y el cociente **no se mueve al cambiar de
+unidades**, que era todo el problema. Entre 1,2 y 2,0 la función **no adivina**:
+levanta `ErrorDatos` pidiendo la marca, porque ahí caen las series de verdad
+ambiguas —un rendimiento con autocorrelación de 0,8 da 1,58— y elegir mal la
+referencia cambia la conclusión entera.
+
+### Una prueba más que pasaba por el motivo equivocado
+
+`test_un_spread_centrado_en_cero_se_trata_como_nivel_y_no_como_rendimiento`
+construía un «spark spread» con **ruido blanco** de escala 8 y exigía que se
+tratase como nivel. La premisa es correcta —un spread es un nivel— pero los
+datos no la cumplían: el ruido blanco tiene cociente 0,710 y para una serie sin
+memoria la mejor predicción ingenua es la media, no el valor de ayer. La regla
+vieja acertaba por la magnitud, no por la dinámica.
+
+Un spark spread **de verdad** sí es un nivel, y lo es por persistencia: medido
+sobre OMIE contra MIBGAS, 3 153 días, cociente 2,140 y ρ(1) = +0,891. La prueba
+se reescribió con esa dinámica, y se añadió la mitad que faltaba: que el ruido
+blanco medido en euros **no** es un nivel. Van once pruebas en este proyecto
+que consagraban un fallo.
+
+### Diebold-Mariano: dos fallos que iban juntos
+
+**El divisor.** `np.mean` sobre el producto desplazado divide entre `n − k` en
+vez de entre `n`, inflando cada autocovarianza por el factor exacto `n/(n−k)`.
+El efecto típico es pequeño, pero la cola es larga y **cambia el veredicto**:
+
+| `n` | `h` | Mediana del cociente | Percentil 90 | Máximo | Veredicto al 5 % cambia en |
+|---:|---:|---:|---:|---:|---:|
+| 60 | 22 | 1,027 | 1,569 | 21,85 | **3,7 %** de los casos |
+| 120 | 22 | 1,016 | 1,246 | 19,59 | 2,7 % |
+| 250 | 22 | 1,005 | 1,063 | 2,27 | 0,9 % |
+
+(3 000 réplicas cada uno. La primera medición que hice daba «el estadístico se
+multiplica por 2,28 y el p-valor pasa de 0,0452 a 0,3722»: era **un solo
+sorteo**, y presentarlo como la magnitud típica habría sido el mismo error que
+critiqué a los subagentes. La mediana es 1,027.)
+
+**La varianza negativa.** Sumar las autocovarianzas sin ponderar no garantiza
+una varianza positiva. Con `n = 60` y horizonte 22 salía **negativa el 13,5 %
+de las veces**, y en esos casos la función devolvía estadístico 0 y p-valor 1:
+se callaba sin avisar de que se callaba. Con pesos de Bartlett (Newey-West) es
+no negativa por construcción y eso baja al **0,0 %**. `nucleo="rectangular"`
+recupera el estimador truncado del artículo de 1995, ya con el divisor bien.
+
+**El orden.** Las autocovarianzas se calculan **por posición** y nadie
+comprobaba el índice. Sobre 200 errores solapados a horizonte 10, barajar
+llevaba el estadístico de +1,5104 a +3,3244 y el p-valor de **0,1325** —no
+rechaza— a **0,0011**: una ventaja predictiva inventada por el orden de las
+filas. Es el mismo fallo que apareció en `serie_var_movil` y en Christoffersen,
+y van tres. Ahora se exige índice monótono cuando el horizonte pasa de 1; con
+horizonte 1 no hay autocovarianzas y el orden da igual.
+
+### Lo que sigue sin estar bien, y queda escrito
+
+**Con errores solapados el contraste rechaza más de lo que dice, y eso no lo
+arregla ninguno de los tres cambios.** Medido con 2 000 réplicas de dos
+predicciones de precisión idéntica:
+
+| `n` | `h` | Rectangular | Bartlett |
+|---:|---:|---:|---:|
+| 60 | 1 | 5,4 % | 5,4 % |
+| 60 | 10 | 10,4 % | 8,3 % |
+| 60 | 22 | 12,1 % | 8,2 % |
+| 120 | 22 | 10,9 % | 7,3 % |
+| 250 | 22 | 8,2 % | 8,6 % |
+| 500 | 22 | 6,7 % | 9,2 % |
+
+Con horizonte 1 el tamaño es correcto. Con horizontes largos se va al 7-12 %
+frente al 5 % nominal, en las dos variantes, y la corrección de
+Harvey-Leybourne-Newbold —que está bien transcrita, eso lo verificó el
+revisor— no llega a compensarlo. Así que un p-valor de 0,04 con horizonte 22
+**no** es un contraste al 5 %, y el docstring lo dice ahora con la tabla
+delante.
+
+### El acierto direccional descartaba fechas en silencio
+
+`_acierto_direccional` excluye las fechas en que el valor real o el previsto
+son exactamente cero. Es correcto —ahí no hay dirección que acertar— pero
+**cuántas** no se veía en ninguna parte. Sobre las diferencias del precio
+horario de OMIE son **9 169 de 102 142, el 8,98 %**: el acierto se calculaba
+sobre el 91 % de la muestra. Añadida la columna `fechas_sin_direccion` a
+`tabla_evaluacion`.
+
+### Comprobado con datos reales
+
+`tabla_evaluacion` sobre los 3 162 días de rendimientos diarios de OMIE, con un
+AR(1) ajustado en la primera mitad, una media móvil de 21 sesiones y la media
+muestral:
+
+| Modelo | MAE | MASE | Acierto dir. | Fechas sin dirección | p DM |
+|---|---:|---:|---:|---:|---:|
+| ingenua | 0,2825 | 1,0000 | NaN | **3 162** | 1,0000 |
+| ar1 | 0,2825 | 1,0001 | 0,4984 | 0 | 0,3276 |
+| media_muestral | 0,2894 | 1,0247 | 0,4820 | 0 | 0,0001 |
+| media_movil_21 | 0,3298 | 1,1675 | 0,4687 | 0 | 0,0013 |
+
+**Ninguno bate a la referencia.** El AR(1) empata porque el `φ` ajustado en la
+primera mitad es −0,0016, o sea nada; los otros dos son significativamente
+peores. Es el resultado honesto: los rendimientos diarios del pool no se
+predicen, y la tabla lo dice en lugar de fabricar un ganador. La fila de la
+ingenua muestra las 3 162 fechas sin dirección y su acierto como NaN, que es
+exactamente lo que hay que decir de quien no apuesta nunca.
+
+Y el MASE del AR(1) sale **1,000139 en tanto por uno y 1,000139 en
+porcentaje**, que era el hallazgo.
+
+### Lo que esto cambia en el cuaderno 03
+
+El fallo no era teórico: el cuaderno 03 publicaba MASE de **0,656, 0,681 y
+0,650** para sus tres configuraciones, o sea «los modelos baten a la referencia
+por un 32-35 %». Esos números salían de una referencia mal elegida, porque los
+rendimientos del pool caían del lado «precio» de aquel umbral de escala y la
+ingenua pasaba a ser «lo mismo que ayer» en vez de «cero». Batir una referencia
+mala era gratis.
+
+Con la regla corregida son **0,951, 0,986 y 0,941**: baten por un 1-6 %. Y la
+tabla de sensibilidad al factor de escala pasa de 0,673 / 0,649 / 0,810 / 3,504
+a 0,976 / 0,941 / 1,174 / 5,079. **No cambia ninguna conclusión del cuaderno
+—su tesis era justamente que ahí no hay señal cobrable— pero la refuerza**, y
+queda anotado en el propio cuaderno con el antes y el después. El cambio a
+`inverted_cdf` en el VaR histórico también se nota ahí: la fila `historico` del
+backtest pasa de 55 a 52 excepciones.
+
+---
+
+## Balance de los 107
+
+Los siete bloques están cerrados. Lo que queda escrito de todo el ejercicio:
+
+**Las fórmulas estaban bien.** Lo dijo la propia revisión al terminar y se
+confirma bloque a bloque: la log-verosimilitud de la cópula t coincide al bit
+con `scipy`, la descomposición de Euler suma exactamente la volatilidad, la
+aritmética de los spreads da error 0,000e+00 en 3 000 casos, la corrección
+2×M coincide con `statsmodels` a 3,6e−15, la corrección de
+Harvey-Leybourne-Newbold está transcrita carácter a carácter. **Lo que falla
+son los bordes, las convenciones y lo que ninguna prueba tocaba**: la primera
+observación, el orden de un diccionario, el orden de un índice, una serie
+corta, las unidades, un umbral absoluto, una cartera neta corta, un día que el
+mercado cerró a cero.
+
+**Tres fallos aparecieron tres veces cada uno**, en módulos distintos y
+escritos en momentos distintos, lo que dice que eran patrones de pensamiento y
+no despistes:
+
+1. **Cruzar dos objetos etiquetados por posición.** En las cópulas (+788 o
+   −3 654 de verosimilitud según el orden de las columnas), en
+   `volatilidad_cartera` (factor 2,85 según el orden de las claves de un
+   diccionario) y en `_preparar` con etiquetas numéricas.
+2. **Calcular algo posicional sobre un índice que nadie comprueba que esté
+   ordenado.** En `serie_var_movil` (947 de 950 ventanas con futuro dentro),
+   en Christoffersen (LR de 76,38 a 0,37) y en Diebold-Mariano (p-valor de
+   0,1325 a 0,0011).
+3. **Integrar una cola por el extremo derecho de cada tramo**, siempre corto y
+   siempre hacia el lado inseguro: en `es_garch` y en `es_cornish_fisher`.
+
+**Once pruebas consagraban un fallo**, y la lección es la del spread: una
+prueba puede tener la premisa correcta y los datos equivocados. El «spark
+spread» era ruido blanco, la referencia del bootstrap se construía con
+`mode="wrap"`, el MASE se comprobaba pasando la referencia a mano —la única
+rama donde la invarianza se cumplía sola—, el aviso de Cornish-Fisher pasaba
+con una semilla de cada dos.
+
+**Donde el revisor se equivocó**, cinco veces, y merece constar con la misma
+tinta: las correlaciones del simulador (era su prior, no un dato), el tamaño
+del efecto de Kruskal-Wallis (0,0106 y no 0,26; la causa era la
+autocorrelación), `es_historico` (no arrastraba el problema del cuantil),
+`var_incremental` (no infla el VaR al quitar un activo pequeño) y la prueba de
+Cornish-Fisher (no era una prueba floja, era el código: rechazaba el 57 % de
+las muestras normales).
+
+**Donde me equivoqué yo**, y también consta: una frontera «no monótona» que
+era ruido de coma flotante a 1,4e−16; una sospecha de mezcla de unidades en
+`ratio_sharpe` que no existía (0,6746 frente a 0,6745); un primer intento de
+reproducir la paridad de riesgo que no encontró nada porque usé matrices
+demasiado fáciles; una banda de aviso del ±25 % que dejaba escapar justo el
+caso peor; un arreglo de Kruskal-Wallis por desplazamiento circular que era
+inválido por aliasing con la agrupación; y una magnitud del 2,28× en
+Diebold-Mariano medida sobre **un solo sorteo** cuando la mediana es 1,027.
+
+**Y tres cosas que no se arreglaron**, porque no tienen arreglo barato y
+fingirlo habría sido peor que decirlo:
+
+- El p-valor de Kruskal-Wallis sobre una serie con dependencia serial. Tres
+  enfoques probados, tres modos de fallo distintos, documentados. Se añadió el
+  diagnóstico —`observaciones_efectivas`— en lugar de un arreglo falso.
+- El tamaño de Diebold-Mariano con errores solapados: 7-12 % frente al 5 %
+  nominal a horizontes largos, en las dos variantes del núcleo.
+- El agrupamiento de volatilidad del simulador, que sigue entre 0,07 y 0,13
+  cuando los datos dan 0,25-0,44.
+
+La suite pasa de las 944 pruebas con que empezó la revisión a **1 113**.

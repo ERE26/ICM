@@ -113,17 +113,47 @@ def test_una_marca_de_tipo_desconocida_se_rechaza(rendimientos_ruido):
 
 
 def test_un_spread_centrado_en_cero_se_trata_como_nivel_y_no_como_rendimiento():
-    """Un spread vale cero de media pero se mueve en euros, no en tantos por uno.
+    """Un spread vale cero de media pero es un NIVEL, y su referencia es "lo de ayer".
 
-    Es el caso limite de la regla de escala: sin el segundo criterio, la
-    referencia de un spark spread pasaria a ser "cero" en lugar de "lo mismo
-    que ayer", que es lo correcto para un nivel.
+    Esta prueba pasaba por el motivo equivocado. Usaba ruido blanco de escala 8
+    y la regla vieja lo clasificaba como nivel **por la magnitud**, no por la
+    dinamica. Pero el ruido blanco no es un nivel: su cociente
+    ``std/std(diferencia)`` es 0,710 y para una serie asi la mejor prediccion
+    ingenua es la media, no el valor de ayer.
+
+    Un spark spread de verdad si es un nivel, y lo es por persistencia: medido
+    sobre OMIE contra MIBGAS, 3 153 dias, el cociente vale **2,140** y la
+    autocorrelacion de orden 1 es **+0,891**. Asi que la serie de la prueba se
+    construye con esa dinamica en lugar de con ruido.
+    """
+    generador = np.random.default_rng(5)
+    indice = pd.bdate_range("2020-01-01", periods=400, name="fecha")
+    spread = np.zeros(400)
+    ruido = generador.normal(0.0, 8.0, 400)
+    for t in range(1, 400):
+        spread[t] = 0.9 * spread[t - 1] + ruido[t]
+    serie = pd.Series(spread, index=indice, name="spark")
+
+    cociente = float(np.std(spread) / np.std(np.diff(spread)))
+    assert cociente > 2.0, "un spread persistente tiene que dar cociente de nivel"
+    np.testing.assert_allclose(prediccion_ingenua(serie).iloc[1:], serie.iloc[:-1])
+
+
+def test_el_ruido_blanco_no_es_un_nivel_aunque_se_mida_en_euros():
+    """La otra mitad: la escala no decide, la dinamica si.
+
+    Ruido blanco de escala 8. La regla vieja lo llamaba nivel porque sus
+    valores pasan de 1; la nueva lo llama rendimiento porque no tiene memoria,
+    y para una serie sin memoria la referencia correcta es la media -- cero --
+    y no el valor de ayer, que solo arrastra el ruido de la vispera.
     """
     generador = np.random.default_rng(5)
     indice = pd.bdate_range("2020-01-01", periods=200, name="fecha")
-    spread = pd.Series(generador.normal(0.0, 8.0, 200), index=indice, name="spark")
+    blanco = pd.Series(generador.normal(0.0, 8.0, 200), index=indice)
 
-    np.testing.assert_allclose(prediccion_ingenua(spread).iloc[1:], spread.iloc[:-1])
+    prediccion = prediccion_ingenua(blanco)
+    assert prediccion.iloc[0] != prediccion.iloc[0]  # NaN de arranque
+    np.testing.assert_allclose(prediccion.iloc[1:].to_numpy(), 0.0)
 
 
 def test_la_ingenua_a_varios_dias_desplaza_el_horizonte_completo(precios):
@@ -557,6 +587,7 @@ def test_la_tabla_anade_la_ingenua_cuando_no_esta(caso_con_senal):
         "rmse",
         "mase",
         "acierto_direccional",
+        "fechas_sin_direccion",
         "ic",
         "p_valor_dm",
         "n_observaciones",
@@ -641,3 +672,221 @@ def test_una_tabla_sin_predicciones_se_rechaza(caso_con_senal):
 
     with pytest.raises(ErrorDatos, match="ninguna prediccion"):
         tabla_evaluacion(y, {})
+
+
+# --- lo que la segunda revision adversarial encontro ---------------------------
+
+
+def test_el_mase_no_depende_de_las_unidades_sin_pasar_la_referencia():
+    """La prueba que habia pasaba 'referencia' explicita, la unica rama donde la
+    invarianza se cumplia sola. Aqui se deja que la deduzca, que es como se usa.
+
+    La regla vieja era de escala -- rendimientos si quantile(|x|, 0.99) < 1 --
+    asi que los mismos rendimientos en porcentaje se clasificaban como precio,
+    la referencia ingenua pasaba de 'cero' a 'el ultimo valor' y el MASE de un
+    modelo que predice cero caia de 1,0000 a 0,7046.
+    """
+    generador = np.random.default_rng(7)
+    indice = pd.bdate_range("2020-01-01", periods=1000)
+    tanto_por_uno = pd.Series(generador.normal(0.0, 0.015, 1000), index=indice)
+    porcentaje = tanto_por_uno * 100.0
+
+    cero_uno = pd.Series(0.0, index=indice)
+    cero_pct = pd.Series(0.0, index=indice)
+    mase_uno = error_escalado_medio(tanto_por_uno, cero_uno)
+    mase_pct = error_escalado_medio(porcentaje, cero_pct)
+
+    assert mase_uno == pytest.approx(mase_pct)
+    assert mase_uno == pytest.approx(1.0, abs=0.05)
+
+    # Y un modelo que de verdad predice algo tiene el mismo MASE en las dos.
+    senal = pd.Series(tanto_por_uno.to_numpy() * 0.3, index=indice)
+    assert error_escalado_medio(tanto_por_uno, senal) == pytest.approx(
+        error_escalado_medio(porcentaje, senal * 100.0)
+    )
+
+
+def test_los_rendimientos_de_omie_no_se_confunden_con_precios():
+    """La regla de escala fallaba en el mercado para el que esta escrita la libreria.
+
+    Los rendimientos diarios del pool tienen quantile(|x|, 0.99) = 2,55, porque
+    el precio pasa de 1 a 100 EUR/MWh con normalidad. En tanto por uno y todo,
+    se clasificaban como PRECIO.
+    """
+    from icm.datos import rendimientos
+    from icm.datos.ficheros import cargar_precios_fichero
+    from icm.ml.evaluacion import _es_serie_de_rendimientos
+
+    precios = cargar_precios_fichero("datos/reales/omie_diario.csv")
+    nivel = precios.iloc[:, 0].copy()
+    nivel.attrs = {}
+    rend = rendimientos(precios, tipo="simple").iloc[:, 0].dropna()
+    rend.attrs = {}
+
+    assert float(np.quantile(np.abs(rend.to_numpy()), 0.99)) > 1.0  # la regla vieja falla aqui
+    assert _es_serie_de_rendimientos(rend) is True
+    assert _es_serie_de_rendimientos(rend * 100.0) is True  # y en porcentaje tambien
+    assert _es_serie_de_rendimientos(nivel) is False
+
+
+def test_una_serie_ambigua_no_se_adivina():
+    """Un rendimiento con autocorrelacion de 0,8 da cociente 1,58, entre los dos
+    umbrales. Elegir mal la referencia ahi cambia la conclusion entera, asi que
+    se pide la marca en lugar de adivinar."""
+    from icm.ml.evaluacion import _es_serie_de_rendimientos
+
+    generador = np.random.default_rng(3)
+    x = np.zeros(2000)
+    ruido = generador.standard_normal(2000)
+    for t in range(1, 2000):
+        x[t] = 0.8 * x[t - 1] + ruido[t]
+    ambigua = pd.Series(x, index=pd.bdate_range("2015-01-01", periods=2000))
+
+    with pytest.raises(ErrorDatos, match="No se puede deducir"):
+        _es_serie_de_rendimientos(ambigua)
+
+    # Con la marca puesta, sin problema y sin depender de la escala.
+    for tipo, esperado in (("rendimiento", True), ("precio", False)):
+        marcada = ambigua.copy()
+        marcada.attrs["tipo_serie"] = tipo
+        assert _es_serie_de_rendimientos(marcada) is esperado
+
+
+def test_diebold_mariano_divide_las_autocovarianzas_entre_n():
+    """La autocovarianza muestral se divide entre n, no entre n - k.
+
+    'np.mean' sobre el producto desplazado divide entre n - k, o sea infla cada
+    autocovarianza por el factor exacto n/(n-k). El efecto tipico es pequenio
+    -- la mediana del cociente entre los dos estadisticos es 1,027 con n = 60 y
+    horizonte 22 -- pero la cola es larga (percentil 90 en 1,57 y maximo
+    observado 21,85 sobre 3 000 replicas) y **cambia el veredicto al 5 % en el
+    3,7 % de los casos**. Con n = 250 baja al 0,9 %. Es un fallo de muestra
+    corta, justo donde se usa el contraste.
+    """
+    generador = np.random.default_rng(7)
+    n, horizonte = 60, 22
+    diferencia = generador.normal(0.01, 1.0, n)
+    centrado = diferencia - diferencia.mean()
+
+    # Lo estructural: cada autocovarianza sale inflada por n/(n-k) exacto.
+    for k in range(1, horizonte):
+        producto = centrado[k:] * centrado[:-k]
+        con_n = float(producto.sum()) / n
+        con_nk = float(producto.mean())
+        assert con_nk == pytest.approx(con_n * n / (n - k))
+        assert abs(con_nk) > abs(con_n)
+
+    # Y la funcion usa el divisor correcto: se reconstruye a mano.
+    serie_a = pd.Series(generador.standard_normal(n))
+    serie_b = pd.Series(generador.standard_normal(n))
+    obtenido = contraste_diebold_mariano(serie_a, serie_b, horizonte, nucleo="rectangular")
+
+    d = np.abs(serie_a.to_numpy()) ** 2 - np.abs(serie_b.to_numpy()) ** 2
+    c = d - d.mean()
+    varianza = float(np.mean(c**2))
+    for k in range(1, horizonte):
+        varianza += 2.0 * float((c[k:] * c[:-k]).sum()) / n
+    factor = (n + 1.0 - 2.0 * horizonte + horizonte * (horizonte - 1.0) / n) / n
+    esperado = d.mean() / np.sqrt(varianza / n) * np.sqrt(factor) if varianza > 0 else 0.0
+    assert obtenido["estadistico"] == pytest.approx(esperado)
+
+
+def test_el_divisor_equivocado_cambia_el_veredicto_a_veces():
+    """La frecuencia con la que el divisor decide el resultado, medida."""
+    from scipy import stats as _stats
+
+    def estadistico_y_p(diferencia, horizonte, divisor):
+        n = diferencia.size
+        centrado = diferencia - diferencia.mean()
+        varianza = float(np.mean(centrado**2))
+        for k in range(1, horizonte):
+            producto = centrado[k:] * centrado[:-k]
+            varianza += (
+                2.0 * float(producto.sum()) / (n if divisor == "n" else producto.size)
+            )
+        if varianza <= 0.0:
+            return 0.0, 1.0
+        factor = (n + 1.0 - 2.0 * horizonte + horizonte * (horizonte - 1.0) / n) / n
+        valor = diferencia.mean() / np.sqrt(varianza / n) * np.sqrt(factor)
+        return valor, float(2.0 * _stats.t.sf(abs(valor), df=n - 1))
+
+    generador = np.random.default_rng(11)
+    cambios = 0
+    intentos = 600
+    for _ in range(intentos):
+        diferencia = generador.normal(0.05, 1.0, 60)
+        _, p_mal = estadistico_y_p(diferencia, 22, "n-k")
+        _, p_bien = estadistico_y_p(diferencia, 22, "n")
+        cambios += (p_mal < 0.05) != (p_bien < 0.05)
+    assert cambios / intentos > 0.01, "el divisor tiene que cambiar el veredicto a veces"
+    assert cambios / intentos < 0.15
+
+
+def test_los_pesos_de_bartlett_evitan_varianzas_negativas():
+    """Sumar autocovarianzas sin ponderar no garantiza varianza positiva.
+
+    Con n = 60 y horizonte 22 salia negativa el 13,5 % de las veces, y ahi la
+    funcion devolvia estadistico 0 y p-valor 1: se callaba sin avisar de que se
+    callaba. Con los pesos de Newey-West es no negativa por construccion.
+    """
+    generador = np.random.default_rng(3)
+    n, horizonte = 60, 22
+    mudos = {"bartlett": 0, "rectangular": 0}
+    for _ in range(300):
+        a = pd.Series(generador.standard_normal(n))
+        b = pd.Series(generador.standard_normal(n))
+        for nucleo in mudos:
+            resultado = contraste_diebold_mariano(a, b, horizonte, nucleo=nucleo)
+            if resultado["estadistico"] == 0.0 and resultado["p_valor"] == 1.0:
+                mudos[nucleo] += 1
+
+    assert mudos["rectangular"] > 15  # medido ~13,5 % de 300
+    assert mudos["bartlett"] == 0
+
+
+def test_diebold_mariano_exige_orden_cronologico_con_horizonte_mayor_que_uno():
+    """Las autocovarianzas se calculan por posicion, asi que el orden ES el dato.
+
+    Medido sobre 200 errores solapados a horizonte 10, barajar el indice
+    llevaba el p-valor de 0,1325 -- no rechaza -- a 0,0011.
+    """
+    generador = np.random.default_rng(5)
+    n, horizonte = 200, 10
+    indice = pd.bdate_range("2020-01-01", periods=n)
+    suavizar = np.ones(horizonte) / horizonte
+    def solapado(escala=1.0):
+        bruto = np.convolve(generador.standard_normal(n + horizonte), suavizar, "valid")
+        return pd.Series(bruto[:n] * escala, index=indice)
+
+    a, b = solapado(), solapado(0.85)
+
+    ordenado = contraste_diebold_mariano(a, b, horizonte)
+    assert ordenado["p_valor"] > 0.05
+
+    permutacion = np.random.default_rng(1).permutation(n)
+    with pytest.raises(ErrorDatos, match="no esta ordenado"):
+        contraste_diebold_mariano(a.iloc[permutacion], b.iloc[permutacion], horizonte)
+
+    # Con horizonte 1 no hay autocovarianzas y el orden da igual.
+    contraste_diebold_mariano(a.iloc[permutacion], b.iloc[permutacion], 1)
+
+
+def test_la_tabla_publica_cuantas_fechas_descarta_el_acierto_direccional():
+    """Sobre las diferencias del precio horario de OMIE, el 8,98 % de las fechas
+    son exactamente cero y no hay direccion que acertar. Antes no se veia."""
+    indice = pd.bdate_range("2020-01-01", periods=300)
+    generador = np.random.default_rng(11)
+    valores = generador.normal(0.0, 1.0, 300)
+    valores[::5] = 0.0  # un 20 % de ceros exactos, como el pool
+    y = pd.Series(valores, index=indice)
+    y.attrs["tipo_serie"] = "rendimiento"
+    modelo = pd.Series(generador.normal(0.0, 1.0, 300), index=indice)
+
+    tabla = tabla_evaluacion(y, {"modelo": modelo})
+    assert "fechas_sin_direccion" in tabla.columns
+    assert tabla.loc["modelo", "fechas_sin_direccion"] >= 55  # ~20 % de 299
+    # La ingenua sobre rendimientos predice cero siempre: las descarta todas.
+    assert tabla.loc[NOMBRE_INGENUA, "fechas_sin_direccion"] == tabla.loc[
+        NOMBRE_INGENUA, "n_observaciones"
+    ]
+    assert np.isnan(tabla.loc[NOMBRE_INGENUA, "acierto_direccional"])
