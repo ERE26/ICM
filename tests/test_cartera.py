@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -25,6 +27,7 @@ from icm.cartera import (
     paridad_riesgo,
     ratio_informacion,
     ratio_sharpe,
+    rentabilidad_cartera,
     ratio_sortino,
     rentabilidad_acumulada,
     rentabilidad_anualizada,
@@ -334,3 +337,211 @@ def test_la_frontera_falla_limpiamente_si_no_hay_solucion():
     cov = pd.DataFrame([[1e-8]], index=["X"], columns=["X"])
     with pytest.raises((ErrorOptimizacion, ErrorDatos)):
         minima_varianza_con_objetivo(pd.Series({"X": 0.05}), cov, 0.50)
+
+
+# --- lo que la segunda revision adversarial encontro ---------------------------
+
+
+def _matriz_correlada(vols, rho, nombres):
+    """Covarianzas con correlacion uniforme y volatilidades dadas."""
+    n = len(vols)
+    correlacion = np.full((n, n), rho)
+    np.fill_diagonal(correlacion, 1.0)
+    diagonal = np.diag(np.asarray(vols, dtype=float))
+    return pd.DataFrame(diagonal @ correlacion @ diagonal, index=nombres, columns=nombres)
+
+
+def test_la_volatilidad_de_la_cartera_no_depende_del_orden_de_los_pesos():
+    # 'normalizar_pesos(pesos)' sin etiquetas devolvia el vector en el orden
+    # del diccionario y se multiplicaba por una matriz que estaba en el orden
+    # de SUS columnas. Factor 2,85 decidido por el orden de las claves.
+    cov = pd.DataFrame([[0.04, 0.0], [0.0, 0.36]], index=["A", "B"], columns=["A", "B"])
+    mu = pd.Series({"A": 0.05, "B": 0.15})
+    esperada_vol = float(np.sqrt(0.9**2 * 0.04 + 0.1**2 * 0.36))
+
+    for pesos in ({"A": 0.9, "B": 0.1}, {"B": 0.1, "A": 0.9}):
+        assert volatilidad_cartera(pesos, cov) == pytest.approx(esperada_vol)
+        assert rentabilidad_cartera(pesos, mu) == pytest.approx(0.9 * 0.05 + 0.1 * 0.15)
+
+    # Y una Series con el indice al reves tampoco cambia el resultado.
+    invertida = pd.Series({"B": 0.1, "A": 0.9})
+    assert volatilidad_cartera(invertida, cov) == pytest.approx(esperada_vol)
+    # Coincide con lo que ya hacia bien 'contribuciones_riesgo'.
+    suma = contribuciones_riesgo(invertida, cov)["contribucion_absoluta"].sum()
+    assert suma == pytest.approx(esperada_vol)
+
+
+def test_un_vector_de_pesos_de_longitud_equivocada_da_error():
+    cov = pd.DataFrame([[0.04, 0.0], [0.0, 0.36]], index=["A", "B"], columns=["A", "B"])
+    with pytest.raises(ErrorDatos, match="pesos para"):
+        volatilidad_cartera(np.array([0.5, 0.3, 0.2]), cov)
+
+
+@pytest.mark.parametrize("n", [3, 5, 10])
+@pytest.mark.parametrize("rho", [0.0, 0.5, 0.9])
+def test_la_paridad_de_riesgo_iguala_las_contribuciones_de_verdad(n, rho):
+    # El objetivo anterior -- suma de cuadrados de las diferencias entre
+    # contribuciones relativas -- no es convexo, y SLSQP se quedaba en caras
+    # del simplex con activos expulsados a peso cero devolviendo success=True.
+    # Medido sobre 20 matrices de 10 activos sin correlacion y volatilidades
+    # entre el 0,3 % y el 50 %: 6 de 20 con activos a peso cero y hasta 0,25
+    # de dispersion entre contribuciones que deberian ser identicas.
+    nombres = [f"a{i}" for i in range(n)]
+    # Varias semillas por caso: con una sola, la mayoria de las matrices son
+    # faciles y el fallo -- que aparecia en 6 de 20 con 10 activos -- se
+    # escapaba. Las volatilidades van del 0,3 % al 50 %, que es el rango en el
+    # que el objetivo no convexo se quedaba en caras del simplex.
+    for semilla in range(1000, 1012):
+        generador = np.random.default_rng(semilla + n)
+        vols = 10.0 ** generador.uniform(-2.5, -0.3, n)
+        cov = _matriz_correlada(vols, rho, nombres)
+
+        pesos = paridad_riesgo(cov)
+        assert (pesos > 0).all(), f"activo expulsado a peso cero (semilla {semilla})"
+        assert pesos.sum() == pytest.approx(1.0)
+
+        relativa = contribuciones_riesgo(pesos, cov)["contribucion_relativa"]
+        assert relativa.max() - relativa.min() < 1e-3, f"semilla {semilla}"
+        np.testing.assert_allclose(relativa.to_numpy(), 1.0 / n, atol=1e-3)
+
+
+def test_la_paridad_de_riesgo_respeta_un_presupuesto_desigual():
+    nombres = ["bonos", "bolsa", "materias"]
+    cov = _matriz_correlada([0.05, 0.18, 0.30], 0.3, nombres)
+    presupuesto = {"bonos": 0.5, "bolsa": 0.3, "materias": 0.2}
+
+    pesos = paridad_riesgo(cov, presupuesto)
+    relativa = contribuciones_riesgo(pesos, cov)["contribucion_relativa"]
+    for activo, cuota in presupuesto.items():
+        assert relativa[activo] == pytest.approx(cuota, abs=1e-3)
+    # El de menos riesgo pesa mas, que es la razon de ser de la paridad.
+    assert pesos["bonos"] > pesos["bolsa"] > pesos["materias"]
+
+
+def test_un_suelo_negativo_sin_cortos_es_contradictorio():
+    # Devolvia [(-0.5, 1.0), ...]: una cartera con cortos pedida sin cortos.
+    with pytest.raises(ErrorDatos, match="incompatibles"):
+        Restricciones(permitir_cortos=False, peso_minimo=-0.5).limites(3)
+
+
+def test_con_cortos_el_tope_deja_hacer_un_130_30():
+    # Con permitir_cortos=True el tope se quedaba en 1,0, asi que un 130/30
+    # era infactible sin que nada lo dijera.
+    # Con dos activos el tope es 1 - (2-1)*(-1) = 2,0; con tres, 3,0.
+    assert Restricciones(permitir_cortos=True).limites(2) == [(-1.0, 2.0)] * 2
+    assert Restricciones(permitir_cortos=True).limites(3) == [(-1.0, 3.0)] * 3
+    assert all(
+        inf <= -1.0 and sup >= 1.3
+        for inf, sup in Restricciones(permitir_cortos=True).limites(2)
+    )
+    # Long-only sigue acotado en [0, 1].
+    assert Restricciones().limites(4) == [(0.0, 1.0)] * 4
+
+
+def test_la_frontera_avisa_de_los_puntos_que_descarta():
+    nombres = list("abcdefgh")
+    mu = pd.Series(dict(zip(nombres, [0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15, 0.30])))
+    vols = 10.0 ** np.random.default_rng(5).uniform(-2, -0.4, 8)
+    cov = _matriz_correlada(vols, 0.85, nombres)
+
+    with pytest.warns(UserWarning, match="no se han podido resolver"):
+        frontera = frontera_eficiente(
+            mu, cov, 40, Restricciones(peso_minimo=0.05, peso_maximo=0.25), incluir_pesos=False
+        )
+    assert frontera.attrs["puntos_descartados"] == 40 - len(frontera)
+    assert frontera.attrs["puntos_descartados"] > 0
+
+
+def test_la_frontera_marca_los_puntos_dominados():
+    # Con cortos permitidos sobre activos muy correlados, SLSQP se queda en
+    # minimos locales y la frontera traia puntos con MENOS rentabilidad a MAS
+    # volatilidad, presentados como eficientes. Medido, hasta 4,5 puntos
+    # porcentuales de rentabilidad perdidos.
+    generador = np.random.default_rng(0)
+    encontrada = None
+    for _ in range(40):
+        n = int(generador.integers(4, 12))
+        vols = 10.0 ** generador.uniform(-2.2, -0.3, n)
+        nombres = [f"a{i}" for i in range(n)]
+        cov = _matriz_correlada(vols, float(generador.uniform(0.9, 0.999)), nombres)
+        mu = pd.Series(generador.uniform(-0.05, 0.30, n), index=nombres)
+        try:
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                frontera = frontera_eficiente(
+                    mu, cov, 30, Restricciones(permitir_cortos=True), incluir_pesos=False
+                )
+        except (ErrorOptimizacion, ErrorDatos):
+            continue
+        if frontera.attrs["puntos_dominados"]:
+            encontrada = frontera
+            break
+
+    assert encontrada is not None, "no se ha encontrado ninguna frontera con puntos dominados"
+    dominados = ~encontrada["eficiente"]
+    assert dominados.any()
+    # Un punto dominado tiene mas volatilidad y menos rentabilidad que otro.
+    for posicion in encontrada.index[dominados]:
+        mejores = encontrada.loc[: posicion - 1]
+        assert (mejores["rentabilidad"] > encontrada.loc[posicion, "rentabilidad"]).any()
+
+
+def test_la_frontera_limpia_no_avisa_ni_trae_puntos_dominados():
+    nombres = list("abcd")
+    mu = pd.Series(dict(zip(nombres, [0.04, 0.06, 0.08, 0.20])))
+    cov = pd.DataFrame(np.diag([0.01, 0.02, 0.04, 0.50]), index=nombres, columns=nombres)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        frontera = frontera_eficiente(mu, cov, 40, incluir_pesos=False)
+    assert frontera.attrs["puntos_descartados"] == 0
+    assert frontera.attrs["puntos_dominados"] == 0
+    assert frontera["eficiente"].all()
+
+
+def test_la_recta_del_mercado_no_se_dibuja_con_pendiente_negativa():
+    # Si ninguna cartera bate al activo sin riesgo, la recta baja: mas riesgo,
+    # menos rentabilidad. Antes se devolvia esa recta descendente sin decir
+    # nada, con su 'peso_en_tangente' y todo.
+    cov = pd.DataFrame([[0.04, 0.0], [0.0, 0.36]], index=["A", "B"], columns=["A", "B"])
+    mu = pd.Series({"A": -0.05, "B": -0.02})
+    with pytest.raises(ErrorOptimizacion, match="pendiente negativa"):
+        linea_mercado_capitales(mu, cov, tasa_libre_riesgo=0.03)
+
+
+def test_las_etiquetas_numericas_no_se_confunden_con_datos_ausentes():
+    # 'activos' hacia str() de las columnas y luego 'mu.reindex(["0","1"])'
+    # daba todo NaN: el error que salia mandaba a buscar un hueco en los datos
+    # cuando lo que no encajaba era el tipo de la etiqueta.
+    cov = pd.DataFrame([[0.04, 0.0], [0.0, 0.36]], index=[0, 1], columns=[0, 1])
+    pesos = maximo_sharpe(pd.Series({0: 0.05, 1: 0.15}), cov)
+    assert pesos.sum() == pytest.approx(1.0)
+    assert (pesos >= 0).all()
+
+    with pytest.raises(ErrorDatos, match="no coinciden"):
+        maximo_sharpe(pd.Series({"X": 0.05, "Y": 0.15}), cov)
+
+
+def test_el_sharpe_geometrico_y_el_aritmetico_son_distintos_y_se_puede_elegir():
+    # El paquete usa las dos definiciones: esta funcion la geometrica, y
+    # 'ml.estrategia' la aritmetica para comparar estrategias. Comparar un
+    # numero de un modulo con uno del otro no es una comparacion valida.
+    from icm.ml.estrategia import _sharpe_aritmetico
+
+    serie = pd.Series(np.random.default_rng(3).normal(0.0005, 0.02, 2000))
+    geometrico = ratio_sharpe(serie, 0.0, 252)
+    aritmetico = ratio_sharpe(serie, 0.0, 252, media="aritmetica")
+
+    # Lo que de verdad importa: la rama aritmetica reconcilia los dos modulos.
+    assert aritmetico == pytest.approx(_sharpe_aritmetico(serie, 252))
+    assert geometrico < aritmetico
+
+    # Y el hueco es exactamente la diferencia entre las dos medias anuales,
+    # no un artefacto: el numerador geometrico es la tasa compuesta.
+    volatilidad = volatilidad_anualizada(serie, 252)
+    hueco_numerador = (aritmetico - geometrico) * volatilidad
+    esperado = float(serie.mean()) * 252 - rentabilidad_anualizada(serie, 252)
+    assert hueco_numerador == pytest.approx(esperado)
+    assert hueco_numerador > 0.0
+
+    with pytest.raises(ErrorDatos, match="Media"):
+        ratio_sharpe(serie, 0.0, 252, media="mediana")

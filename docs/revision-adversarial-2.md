@@ -618,3 +618,156 @@ Tres cosas que se leen bien ahí, y ninguna se podía leer antes:
   disparatados, y eso no es un fallo: son rendimientos logarítmicos y la regla
   de la raíz del tiempo a un año no vale, como dice el docstring. La
   diferencia entre ambos es exactamente la deriva.
+
+---
+
+## Estado: carteras, cerradas
+
+Septiembre de 2026. `cartera/optimizacion.py`, `frontera.py` y `metricas.py`.
+Cada cifra reproducida con un script; el módulo de pruebas pasa de 41 a 61
+casos y **12 de los nuevos fallan contra el código viejo**.
+
+### El orden de las claves de un diccionario decidía el resultado
+
+Confirmado exacto. `volatilidad_cartera` y `rentabilidad_cartera` llamaban a
+`normalizar_pesos(pesos)` **sin etiquetas**, así que el vector salía en el
+orden en que viniera el diccionario, y luego se multiplicaba por una matriz
+que estaba en el orden de *sus* columnas. Con dos activos de volatilidad 20 %
+y 60 %:
+
+| Pesos escritos así | Volatilidad | Rentabilidad |
+|---|---:|---:|
+| `{A: 0.9, B: 0.1}` | 0,1897 | 0,0600 |
+| `{B: 0.1, A: 0.9}` | **0,5404** | **0,1400** |
+| correcto | 0,1897 | 0,0600 |
+
+Factor 2,85, exactamente lo que medía el revisor. Y lo más revelador:
+`contribuciones_riesgo`, en el mismo fichero y doce líneas más abajo, **sí
+alineaba** —pasaba `marco_cov.columns` a `normalizar_pesos`—, así que la
+volatilidad total que sale de sumar las contribuciones y la que devolvía
+`volatilidad_cartera` podían diferir por un factor de tres sin que nada
+chirriara. Ahora las tres pasan por un único `_pesos_alineados`, que además
+rechaza un vector de longitud equivocada en lugar de propagar el error.
+
+### Paridad de riesgo: el objetivo no era convexo
+
+El revisor tenía razón, y mi primer intento de reproducirlo **no encontró
+nada**: con covarianzas de datos normales aleatorios, bien condicionadas,
+salían 0 fallos de 10. El fallo aparece donde la paridad de riesgo es difícil
+de verdad, con volatilidades muy dispares:
+
+| Activos | ρ | Fallos / 20 | Peor dispersión | Activos a peso cero |
+|---:|---:|---:|---:|---:|
+| 3 | 0,00 | 1 | 0,500 | 1 |
+| 10 | 0,00 | **6** | 0,250 | **9** |
+| 10 | 0,50-0,97 | 0 | 0 | 0 |
+
+(Volatilidades sorteadas entre el 0,3 % y el 50 %.) El objetivo era la suma de
+cuadrados de las diferencias entre contribuciones relativas, que **no es
+convexo**: SLSQP se quedaba en caras del símplex con activos expulsados a peso
+cero y devolvía `success=True`, y lo que uno miraría para validarlo —que las
+contribuciones de los supervivientes salgan iguales— también cuadraba.
+
+Sustituido por la formulación logarítmica estándar (Maillard et al. 2010;
+Spinu 2013):
+
+```
+minimizar  f(y) = ½ y'Σy − Σᵢ bᵢ log(yᵢ)     con y > 0
+```
+
+que es **estrictamente convexa** en el ortante positivo, tiene mínimo único y
+cuyo punto crítico cumple `yᵢ(Σy)ᵢ = bᵢ` exactamente —la condición de paridad—,
+con los pesos saliendo de reescalar `y`. Se resuelve con el gradiente
+analítico `Σy − b/y`. Dos detalles que costaron una iteración: hay que
+normalizar la matriz a diagonal media 1, porque si no los dos términos del
+objetivo viven a cuatro órdenes de magnitud de distancia y la búsqueda lineal
+aborta; y el indicador de `scipy` **no es el criterio**, porque con este
+objetivo dice `ABNORMAL` cuando ya está en el óptimo. Quien juzga es
+`_verificar_paridad`, que comprueba la condición de primer orden sobre el
+resultado y levanta `ErrorOptimizacion` con los números si no se cumple. Esa
+comprobación es la que faltaba: `success=True` no dice nada sobre si el óptimo
+encontrado reparte el riesgo.
+
+Resultado sobre las mismas 320 matrices: **0 fallos, ningún activo expulsado,
+peor dispersión 3,1e−04** frente a 0,25.
+
+### Restricciones que se contradecían en silencio
+
+- `Restricciones(permitir_cortos=False, peso_minimo=-0.5)` devolvía
+  `[(-0.5, 1.0), ...]`: una cartera con posiciones cortas pedida
+  explícitamente **sin** cortos. Ahora es un error.
+- Con `permitir_cortos=True` el tope quedaba en 1,0, así que un **130/30 —la
+  razón de ser de permitir cortos— era infactible** sin que nada lo dijera. El
+  tope pasa a ser el máximo que de verdad puede alcanzar un peso dado el suelo
+  de los demás, `1 − (n−1)·inferior`.
+
+### La frontera y la recta
+
+- **`frontera_eficiente` descartaba puntos en silencio.** Con suelo del 5 % y
+  techo del 25 % sobre ocho activos muy correlados salían **30 de los 40**
+  puntos pedidos y nada lo decía: una frontera recortada y una completa se
+  veían igual. Ahora avisa y el número queda en
+  `attrs["puntos_descartados"]`.
+- **Y presentaba como eficientes puntos dominados.** Con cortos permitidos
+  sobre activos muy correlados, SLSQP se queda en mínimos locales: en 10 de
+  unas 120 fronteras aparecían puntos con *menos* rentabilidad a *más*
+  volatilidad, hasta **4,5 puntos porcentuales** perdidos. Ahora se marcan en
+  la columna `eficiente` y se avisa.
+- **`linea_mercado_capitales` dibujaba rectas con pendiente negativa.** Si
+  ninguna cartera bate al activo sin riesgo, la recta baja —más riesgo, menos
+  rentabilidad— y el objeto devolvía esa recta con su `peso_en_tangente` y
+  todo. Con `mu = {A: −5 %, B: −2 %}` y tasa libre del 3 %, pendiente
+  −0,0833. Ahora es un error que dice que lo óptimo con esas estimaciones es
+  no invertir.
+
+### Dos Sharpes distintos en el mismo paquete
+
+`cartera.ratio_sharpe` usaba la tasa **geométrica** en el numerador y
+`ml.estrategia` la **aritmética**, sin que nada lo dijera, así que comparar un
+número de un módulo con uno del otro no era una comparación válida. La
+diferencia es estructural: el numerador geométrico es el aritmético menos
+`σ²/2`, que con volatilidad del 2 % diaria vale **5,04 puntos porcentuales**
+sobre los 12,6 de la media aritmética. Medido con 200 000 observaciones,
++0,2488 frente a +0,3985 (−37,6 %, contra el −40,0 % que predice la fórmula).
+
+`ratio_sharpe` acepta ahora `media="aritmetica"`, que reproduce exactamente
+`ml.estrategia._sharpe_aritmetico`, y el docstring dice cuál usa cada módulo y
+por qué. El valor por omisión no se ha tocado: cambiarlo movería todas las
+cifras ya publicadas.
+
+En muestras cortas hay que mirar la diferencia absoluta y no el porcentaje:
+sobre ocho semillas de 2 000 observaciones el «hueco» relativo va del −87 % al
++317 %, porque es un cociente de dos números pequeños, mientras que la resta
+en el numerador sigue siendo esos 5,04 puntos.
+
+### Etiquetas numéricas
+
+`_preparar` hacía `str()` de las columnas de la covarianza y luego
+`mu.reindex(["0", "1"])`, que con índices numéricos daba todo NaN. El error
+que salía —«hay rentabilidades esperadas ausentes»— mandaba a buscar un hueco
+en los datos que no existía: lo que no encajaba era el tipo de la etiqueta.
+Ahora se reindexa por las etiquetas originales y el mensaje distingue los dos
+casos, además de nombrar qué activos faltan.
+
+### Donde me equivoqué yo
+
+Marqué como hallazgo que `frontera_eficiente` devolvía fronteras no monótonas
+con techo del 20 %. Al medir la violación resultó ser de **1,4e−16**: ruido de
+coma flotante, no un punto dominado. El detector se ha quedado —con tolerancia
+de 1e−12, que absorbe el ruido— porque los puntos dominados de verdad existen,
+pero aparecen con cortos permitidos, no con techo.
+
+También sospeché que `ratio_sharpe` mezclaba unidades al dividir una tasa
+compuesta de rendimientos simples por una volatilidad de logarítmicos. No: la
+misma serie marcada como `log` y convertida a `simple` da 0,6746 y 0,6745. No
+era un hallazgo.
+
+### Comprobado con datos reales
+
+Paridad de riesgo sobre seis series (OMIE, MIBGAS, Brent, Henry Hub, VIX y
+EUR/USD, 2 122 sesiones comunes). Las contribuciones relativas salen
+`0,166667 · 0,166659 · 0,166664 · 0,166667 · 0,166663 · 0,166680`, todas a
+menos de 2e−05 de 1/6. Y los pesos son los que tienen que ser: OMIE, con una
+volatilidad anualizada 176 veces mayor que la del EUR/USD, se lleva el **0,43 %**
+de la cartera y el EUR/USD el **76,88 %**. Con las claves del diccionario en
+orden inverso, la volatilidad de esa cartera sale 0,143735 en los dos casos.

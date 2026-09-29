@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -25,9 +27,25 @@ def frontera_eficiente(
     """Recorre la frontera entre la cartera de minima varianza y la de mayor rentabilidad.
 
     Devuelve un marco con la rentabilidad, la volatilidad y, si se pide, los
-    pesos de cada cartera eficiente. Los puntos que el optimizador no logra
-    resolver se descartan en silencio: con restricciones exigentes es normal
-    que algunos objetivos de rentabilidad sean inalcanzables.
+    pesos de cada cartera eficiente.
+
+    Sobre los puntos que faltan y los que sobran
+    --------------------------------------------
+    Con restricciones exigentes es normal que algunos objetivos de
+    rentabilidad sean inalcanzables, y esos puntos se descartan. Antes se
+    descartaban **en silencio**: con suelo del 5 % y techo del 25 % sobre ocho
+    activos muy correlados salian 30 de los 40 puntos pedidos y nada lo decia,
+    asi que una frontera recortada y una frontera completa se veian igual.
+    Ahora se avisa con un ``UserWarning`` y el numero queda en
+    ``frontera.attrs["puntos_descartados"]``.
+
+    Ademas se comprueba que la frontera sea **monotona**: ordenada por
+    volatilidad, la rentabilidad tiene que crecer, porque si a mas riesgo
+    corresponde menos rentabilidad ese punto esta dominado y no es eficiente.
+    Con techo del 20 % sobre esos mismos ocho activos aparecian puntos
+    dominados -- el optimizador se queda en un minimo local -- y la frontera
+    los presentaba como eficientes. Ahora se marcan en la columna
+    ``eficiente`` y se avisa.
     """
     restricciones = restricciones or Restricciones()
     vector, _, activos = _preparar(mu, cov)
@@ -48,10 +66,12 @@ def frontera_eficiente(
 
     objetivos = np.linspace(rentabilidad_minima, rentabilidad_maxima, int(n_puntos))
     filas = []
+    descartados = 0
     for objetivo in objetivos:
         try:
             pesos = minima_varianza_con_objetivo(mu, cov, float(objetivo), restricciones)
         except ErrorOptimizacion:
+            descartados += 1
             continue
         w = pesos.to_numpy(float)
         matriz = cov.to_numpy(float) if isinstance(cov, pd.DataFrame) else np.asarray(cov, float)
@@ -68,7 +88,35 @@ def frontera_eficiente(
             "No se ha podido calcular ningun punto de la frontera con esas restricciones."
         )
     frontera = pd.DataFrame(filas).sort_values("volatilidad").reset_index(drop=True)
+
+    if descartados:
+        warnings.warn(
+            f"{descartados} de los {int(n_puntos)} puntos pedidos de la frontera no se "
+            f"han podido resolver con estas restricciones y se han descartado; quedan "
+            f"{len(frontera)}. La frontera que se devuelve no cubre todo el rango de "
+            f"rentabilidades solicitado.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Un punto esta dominado si otro de menos volatilidad da mas rentabilidad.
+    maximo_previo = frontera["rentabilidad"].cummax()
+    frontera["eficiente"] = frontera["rentabilidad"] >= maximo_previo - 1e-12
+    dominados = int((~frontera["eficiente"]).sum())
+    if dominados:
+        warnings.warn(
+            f"{dominados} de los {len(frontera)} puntos de la frontera estan dominados: "
+            f"hay otra cartera con menos volatilidad y mas rentabilidad, asi que el "
+            f"optimizador se ha quedado en un minimo local y esos puntos no son "
+            f"eficientes. Estan marcados con 'eficiente' a False; filtrelos antes de "
+            f"dibujar o de leer la frontera.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     frontera.attrs["activos"] = activos
+    frontera.attrs["puntos_descartados"] = descartados
+    frontera.attrs["puntos_dominados"] = dominados
     return frontera
 
 
@@ -96,6 +144,15 @@ def linea_mercado_capitales(
     if volatilidad_tangente == 0:
         raise ErrorOptimizacion("La cartera tangente no tiene riesgo: la recta no esta definida.")
 
+    if rentabilidad_tangente <= tasa_libre_riesgo:
+        raise ErrorOptimizacion(
+            f"Ninguna cartera bate al activo sin riesgo: la tangente rinde "
+            f"{rentabilidad_tangente:.4%} frente a una tasa libre de riesgo de "
+            f"{tasa_libre_riesgo:.4%}. La recta del mercado de capitales tendria "
+            f"pendiente negativa -- mas riesgo, menos rentabilidad -- y no significa "
+            f"nada: lo optimo con estas estimaciones es no invertir. Antes se "
+            f"devolvia esa recta descendente sin decir nada."
+        )
     pendiente = (rentabilidad_tangente - tasa_libre_riesgo) / volatilidad_tangente
     tope = volatilidad_maxima if volatilidad_maxima is not None else volatilidad_tangente * 1.5
     volatilidades = np.linspace(0.0, tope, int(n_puntos))
