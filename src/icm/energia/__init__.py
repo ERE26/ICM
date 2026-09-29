@@ -25,9 +25,13 @@ from icm.energia.almacenamiento import (
     ALMACENAMIENTOS,
     Despacho,
     ParametrosAlmacenamiento,
+    ParametrosInversion,
+    curva_margen_por_capacidad,
     despacho_optimo,
     liquidar_plan,
     valor_de_la_prevision,
+    valor_van_de_la_prevision,
+    van_almacenamiento,
 )
 from icm.energia.curvas import (
     descomponer_rendimiento,
@@ -80,6 +84,10 @@ from icm.energia.spreads import (
 )
 
 __all__ = [
+    "van_almacenamiento",
+    "valor_van_de_la_prevision",
+    "curva_margen_por_capacidad",
+    "ParametrosInversion",
     "valor_de_la_prevision",
     "liquidar_plan",
     "despacho_optimo",

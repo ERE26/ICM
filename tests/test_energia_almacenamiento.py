@@ -260,3 +260,195 @@ def test_el_resumen_cuenta_bien_los_ciclos():
     assert resumen["ciclos_equivalentes"] == pytest.approx(1.0)
     assert resumen["energia_movida"] == pytest.approx(4.0)  # 2 cargados + 2 descargados
     assert resumen["margen_por_ciclo"] == pytest.approx(180.0)
+
+
+# --- valoracion: VAN, capex y degradacion ----------------------------------------
+
+
+def _perfil_diario(dias=120, amplitud=40.0, nivel=70.0):
+    """Precios con un ciclo diario limpio: el VAN sale determinista.
+
+    120 dias y no mas: el despacho resuelve un programa lineal por dia y la
+    curva de capacidad lo repite por cada factor, asi que alargar la muestra
+    multiplica el coste sin cambiar ninguna de las propiedades que se
+    comprueban. Con 400 dias este modulo doblaba el tiempo de toda la suite.
+    """
+    indice = pd.date_range("2020-01-01", periods=24 * dias, freq="h")
+    forma = amplitud * np.sin(2.0 * np.pi * (indice.hour.to_numpy() - 4) / 24.0)
+    return pd.Series(nivel + forma, index=indice)
+
+
+SIN_DEGRADAR = ParametrosAlmacenamiento(
+    nombre="prueba 1 MW / 4 h", capacidad=4.0, potencia=1.0,
+    rendimiento_ciclo=1.0, coste_degradacion=0.0,
+)
+
+
+def test_el_van_coincide_con_el_flujo_descontado_a_mano():
+    from icm.energia.almacenamiento import ParametrosInversion, van_almacenamiento
+
+    precios = _perfil_diario()
+    inversion = ParametrosInversion(
+        capex_por_kwh=100.0, coste_fijo_anual_por_kw=0.0, vida_anios=3,
+        tasa_descuento=0.10, retencion_anual=1.0,
+    )
+    resultado = van_almacenamiento(precios, SIN_DEGRADAR, inversion)
+
+    capex = 4.0 * 1000.0 * 100.0
+    margen = resultado["margen_bruto_anual"]
+    esperado = -capex + sum(margen / 1.10**k for k in (1, 2, 3))
+    assert resultado["van"] == pytest.approx(esperado)
+    assert resultado["capex"] == pytest.approx(capex)
+
+
+def test_la_tir_anula_el_van():
+    from icm.energia.almacenamiento import _tir
+
+    flujos = np.array([-1000.0, 400.0, 400.0, 400.0])
+    tir = _tir(flujos)
+    van_a_la_tir = float(np.sum(flujos / (1.0 + tir) ** np.arange(len(flujos))))
+    assert van_a_la_tir == pytest.approx(0.0, abs=1e-9)
+    # Un activo que no recupera el capex no tiene TIR, y se dice con NaN.
+    assert np.isnan(_tir(np.array([-1000.0, 100.0, 100.0])))
+    assert np.isnan(_tir(np.array([1000.0, 100.0])))  # sin inversion inicial
+
+
+def test_el_periodo_de_retorno_interpola_dentro_del_anio():
+    from icm.energia.almacenamiento import _periodo_de_retorno
+
+    assert _periodo_de_retorno(np.array([-1000.0, 400.0, 400.0, 400.0])) == pytest.approx(2.5)
+    assert _periodo_de_retorno(np.array([-1000.0, 1000.0])) == pytest.approx(1.0)
+    # Si no se recupera, NaN y no la vida entera.
+    assert np.isnan(_periodo_de_retorno(np.array([-1000.0, 100.0, 100.0])))
+
+
+def test_el_margen_no_es_proporcional_a_la_capacidad():
+    """Por eso la degradacion no se puede aplicar como un factor sobre el margen.
+
+    Las horas que se aniaden al ampliar la capacidad son cada vez menos
+    extremas, asi que perder el 20 % de capacidad cuesta MENOS del 20 % del
+    ingreso. Un VAN que lo trate como proporcional castiga de mas.
+    """
+    from icm.energia.almacenamiento import curva_margen_por_capacidad
+
+    curva = curva_margen_por_capacidad(_perfil_diario(), SIN_DEGRADAR, factores=(0.5, 0.75))
+
+    assert curva.is_monotonic_increasing  # mas capacidad, mas margen
+    relativo = curva / curva.loc[1.0]
+    assert relativo.loc[0.5] > 0.5, "al 50 % de capacidad se gana MAS del 50 %"
+    assert relativo.loc[0.75] > 0.75
+
+
+def test_la_degradacion_no_se_cuenta_dos_veces():
+    """El punto delicado de toda la valoracion.
+
+    El coste por MWh cumple dos papeles: senial de despacho y amortizacion de
+    la vida util. En un VAN que ya descuenta el capex, restarlo tambien seria
+    pagar la bateria dos veces. El flujo usa el margen BRUTO y la degradacion
+    entra como perdida de capacidad.
+    """
+    from icm.energia.almacenamiento import ParametrosInversion, van_almacenamiento
+
+    precios = _perfil_diario()
+    con_coste = ParametrosAlmacenamiento("con coste", 4.0, 1.0, 1.0, coste_degradacion=5.0)
+    inversion = ParametrosInversion(capex_por_kwh=100.0, vida_anios=5, retencion_anual=1.0)
+    resultado = van_almacenamiento(precios, con_coste, inversion)
+
+    # El bruto es mayor que el neto: el coste existe y se informa.
+    assert resultado["margen_bruto_anual"] > resultado["margen_neto_anual"]
+    # Y el flujo del primer anio se construye con el BRUTO, no con el neto.
+    esperado = (
+        resultado["margen_bruto_anual"]
+        + resultado["ingreso_adicional_anual"]
+        - resultado["coste_fijo_anual"]
+    )
+    assert resultado["flujo_anio_1"] == pytest.approx(esperado)
+
+
+def test_la_retencion_hace_decrecer_los_flujos():
+    from icm.energia.almacenamiento import ParametrosInversion, van_almacenamiento
+
+    precios = _perfil_diario()
+    sin_fade = ParametrosInversion(capex_por_kwh=100.0, vida_anios=10, retencion_anual=1.0,
+                                   coste_fijo_anual_por_kw=0.0)
+    con_fade = ParametrosInversion(capex_por_kwh=100.0, vida_anios=10, retencion_anual=0.95,
+                                   coste_fijo_anual_por_kw=0.0)
+
+    a = van_almacenamiento(precios, SIN_DEGRADAR, sin_fade)
+    b = van_almacenamiento(precios, SIN_DEGRADAR, con_fade)
+
+    assert b["van"] < a["van"]
+    assert b["flujo_ultimo_anio"] < b["flujo_anio_1"]
+    assert a["flujo_ultimo_anio"] == pytest.approx(a["flujo_anio_1"])
+
+
+def test_el_capex_de_equilibrio_deja_el_van_en_cero():
+    from icm.energia.almacenamiento import ParametrosInversion, van_almacenamiento
+
+    precios = _perfil_diario()
+    inversion = ParametrosInversion(capex_por_kwh=300.0, vida_anios=10)
+    resultado = van_almacenamiento(precios, SIN_DEGRADAR, inversion)
+
+    equilibrio = resultado["capex_equilibrio_por_kwh"]
+    comprobacion = van_almacenamiento(
+        precios,
+        SIN_DEGRADAR,
+        ParametrosInversion(
+            capex_por_kwh=equilibrio,
+            vida_anios=inversion.vida_anios,
+            tasa_descuento=inversion.tasa_descuento,
+            retencion_anual=inversion.retencion_anual,
+            coste_fijo_anual_por_kw=inversion.coste_fijo_anual_por_kw,
+        ),
+    )
+    assert comprobacion["van"] == pytest.approx(0.0, abs=1.0)
+
+
+def test_los_ingresos_adicionales_entran_por_potencia_no_por_capacidad():
+    """Capacidad y servicios de ajuste se remuneran por MW, no por MWh."""
+    from icm.energia.almacenamiento import ParametrosInversion, van_almacenamiento
+
+    precios = _perfil_diario()
+    inversion = ParametrosInversion(capex_por_kwh=100.0, ingreso_adicional_anual_por_mw=30_000.0,
+                                    vida_anios=5, retencion_anual=1.0)
+    resultado = van_almacenamiento(precios, SIN_DEGRADAR, inversion)
+    assert resultado["ingreso_adicional_anual"] == pytest.approx(30_000.0)  # 1 MW
+
+
+@pytest.mark.parametrize(
+    "campo, valor",
+    [("capex_por_kwh", -1.0), ("vida_anios", 0), ("tasa_descuento", 8.0),
+     ("retencion_anual", 1.5), ("retencion_anual", 0.0)],
+)
+def test_una_ficha_de_inversion_imposible_se_rechaza(campo, valor):
+    from icm.energia.almacenamiento import ParametrosInversion
+
+    with pytest.raises(ErrorDatos):
+        ParametrosInversion(**{campo: valor})
+
+
+def test_anualizar_con_menos_de_un_mes_da_error():
+    from icm.energia.almacenamiento import ParametrosInversion, van_almacenamiento
+
+    corta = _perfil_diario(dias=10)
+    with pytest.raises(ErrorDatos, match="dias"):
+        van_almacenamiento(corta, SIN_DEGRADAR, ParametrosInversion())
+
+
+def test_el_valor_van_de_la_prevision_ordena_oraculo_ingenua():
+    """La tabla final: cuanto vale la prevision en euros de VAN."""
+    from icm.energia.almacenamiento import ParametrosInversion, valor_van_de_la_prevision
+
+    generador = np.random.default_rng(5)
+    precios = _perfil_diario(dias=120)
+    precios = precios + generador.normal(0.0, 10.0, len(precios))
+
+    tabla = valor_van_de_la_prevision(
+        precios, {}, SIN_DEGRADAR,
+        ParametrosInversion(capex_por_kwh=120.0, vida_anios=10),
+    )
+    assert tabla.loc["oraculo", "pct_oraculo"] == pytest.approx(100.0)
+    assert tabla.loc["ingenua", "pct_oraculo"] < 100.0
+    assert tabla.loc["ingenua", "van"] < tabla.loc["oraculo", "van"]
+    # La diferencia de VAN es el valor maximo que puede tener un modelo.
+    assert tabla.loc["oraculo", "van"] - tabla.loc["ingenua", "van"] > 0.0

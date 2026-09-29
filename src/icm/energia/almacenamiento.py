@@ -56,6 +56,7 @@ arbitraje destruye valor aunque el margen de energia salga positivo.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -181,11 +182,25 @@ class Despacho:
     descarga: pd.Series
     estado_carga: pd.Series
     margen: pd.Series
+    margen_bruto: pd.Series
     parametros: ParametrosAlmacenamiento
 
     @property
     def margen_total(self) -> float:
         return float(self.margen.sum())
+
+    @property
+    def margen_bruto_total(self) -> float:
+        """Margen de energia **sin** descontar la degradacion.
+
+        Hace falta separarlo porque el coste de degradacion cumple dos
+        papeles distintos y confundirlos es contar la misma cosa dos veces:
+        como **senial de despacho** evita ciclar por diferencias
+        irrelevantes, y como **coste** es amortizacion de la vida util, o sea
+        del propio capex. En un VAN que ya lleva el capex dentro hay que usar
+        el bruto; vease :func:`van_almacenamiento`.
+        """
+        return float(self.margen_bruto.sum())
 
     @property
     def energia_movida(self) -> float:
@@ -206,6 +221,7 @@ class Despacho:
         return pd.Series(
             {
                 "margen_total": self.margen_total,
+                "margen_bruto_total": self.margen_bruto_total,
                 "periodos": float(len(self.margen)),
                 "energia_movida": self.energia_movida,
                 "ciclos_equivalentes": self.ciclos_equivalentes,
@@ -378,17 +394,16 @@ def _construir_despacho(
     rendimiento = parametros.rendimiento_medio
     neto = carga * rendimiento - descarga / rendimiento
     estado = carga_inicial + np.cumsum(neto)
-    margen = (
-        descarga * precios.to_numpy(float)
-        - carga * precios.to_numpy(float)
-        - (carga + descarga) * float(parametros.coste_degradacion)
-    )
+    valores = precios.to_numpy(float)
+    bruto = descarga * valores - carga * valores
+    margen = bruto - (carga + descarga) * float(parametros.coste_degradacion)
     indice = precios.index
     return Despacho(
         carga=pd.Series(carga, index=indice, name="carga"),
         descarga=pd.Series(descarga, index=indice, name="descarga"),
         estado_carga=pd.Series(estado, index=indice, name="estado_carga"),
         margen=pd.Series(margen, index=indice, name="margen"),
+        margen_bruto=pd.Series(bruto, index=indice, name="margen_bruto"),
         parametros=parametros,
     )
 
@@ -536,3 +551,344 @@ def _resolver_parametros(
             "O pase una ParametrosAlmacenamiento propia."
         )
     return ALMACENAMIENTOS[clave]
+
+
+# --- valoracion del activo -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParametrosInversion:
+    """Lo que hace falta para pasar de un margen anual a un VAN.
+
+    Atributos
+    ---------
+    capex_por_kwh:
+        Coste de instalacion en EUR por kWh de capacidad. Para bateria de
+        litio a escala de red, el rango que se publica en 2024-2025 va de 200
+        a 400 EUR/kWh todo incluido (celdas, inversor, obra civil, conexion).
+        Un bombeo nuevo no se cotiza asi, y la cifra correcta ahi es el coste
+        del proyecto completo.
+    coste_fijo_anual_por_kw:
+        Operacion y mantenimiento fijos en EUR por kW de potencia y anio:
+        seguros, vigilancia, terrenos, sistema de control. Del orden de 5-12
+        EUR/kW.
+    vida_anios:
+        Horizonte de la valoracion. La garantia tipica de una bateria de red
+        son 10-15 anios o un numero de ciclos, el que se cumpla antes.
+    tasa_descuento:
+        Coste medio ponderado del capital, en tanto por uno.
+    retencion_anual:
+        Fraccion de la capacidad que queda al final de cada anio. 0,975 deja
+        el 68,5 % a los quince anios, que es el orden de magnitud de una
+        garantia de 70-80 % al final del periodo.
+    ingreso_adicional_anual_por_mw:
+        Ingresos que **no** son arbitraje: mercado de capacidad, servicios de
+        ajuste, restricciones tecnicas. Es un parametro y no un valor por
+        omision a proposito: en Espania son una parte grande del ingreso real
+        de una bateria y **no estan en los datos de este proyecto**, asi que
+        quien valore tiene que ponerlo a mano y hacerse responsable.
+    valor_residual:
+        Valor de desmantelamiento o de segunda vida al terminar, en EUR. Se
+        descuenta al ultimo anio.
+    """
+
+    capex_por_kwh: float = 300.0
+    coste_fijo_anual_por_kw: float = 8.0
+    vida_anios: int = 15
+    tasa_descuento: float = 0.08
+    retencion_anual: float = 0.975
+    ingreso_adicional_anual_por_mw: float = 0.0
+    valor_residual: float = 0.0
+
+    def __post_init__(self) -> None:
+        for campo in ("capex_por_kwh", "coste_fijo_anual_por_kw", "ingreso_adicional_anual_por_mw"):
+            if float(getattr(self, campo)) < 0.0:
+                raise ErrorDatos(f"'{campo}' no puede ser negativo.")
+        if int(self.vida_anios) < 1:
+            raise ErrorDatos("La vida del activo tiene que ser de al menos un anio.")
+        if not -1.0 < float(self.tasa_descuento) < 1.0:
+            raise ErrorDatos(
+                f"'tasa_descuento' se expresa en tanto por uno y vale "
+                f"{self.tasa_descuento}. Un 8 % es 0.08, no 8."
+            )
+        if not 0.0 < float(self.retencion_anual) <= 1.0:
+            raise ErrorDatos(
+                f"'retencion_anual' es la fraccion de capacidad que queda cada anio y "
+                f"tiene que estar en (0, 1]; vale {self.retencion_anual}."
+            )
+
+
+def curva_margen_por_capacidad(
+    precios,
+    parametros: ParametrosAlmacenamiento | str = "bateria_4h",
+    factores: Sequence[float] = (0.4, 0.55, 0.7, 0.85, 1.0),
+    por_dia: bool = True,
+) -> pd.Series:
+    """Margen bruto anual segun la capacidad que le quede al activo.
+
+    Hace falta porque **el margen no es proporcional a la capacidad**. Medido
+    sobre OMIE con potencia de 1 MW: 26 350 EUR/anio con 2 horas, 42 088 con
+    4 y 48 535 con 6. Duplicar la capacidad no duplica el ingreso, porque las
+    horas que se aniaden son cada vez menos extremas -- el pool no tiene mas
+    de unas seis horas de recorrido diario que explotar.
+
+    Por eso la degradacion no se puede aplicar como un factor sobre el margen:
+    perder el 20 % de capacidad no cuesta el 20 % del ingreso, cuesta menos.
+    Esta curva se resuelve una vez y :func:`van_almacenamiento` interpola en
+    ella anio a anio.
+
+    Devuelve una Series indexada por el factor de capacidad, con el margen
+    bruto **anualizado** en EUR.
+    """
+    ficha = _resolver_parametros(parametros)
+    serie = como_serie(precios, "precios")
+    valores = sorted({float(f) for f in factores} | {1.0})
+    if valores[0] <= 0.0:
+        raise ErrorDatos("Los factores de capacidad tienen que ser positivos.")
+    if valores[-1] > 1.0:
+        raise ErrorDatos("Los factores de capacidad no pueden pasar de 1: el activo no crece.")
+
+    anios = _anios_de_la_muestra(serie)
+    margenes = {}
+    for factor in valores:
+        reducida = ParametrosAlmacenamiento(
+            nombre=f"{ficha.nombre} al {100 * factor:.0f} %",
+            capacidad=float(ficha.capacidad) * factor,
+            potencia=float(ficha.potencia),
+            rendimiento_ciclo=float(ficha.rendimiento_ciclo),
+            coste_degradacion=float(ficha.coste_degradacion),
+            horas_por_periodo=float(ficha.horas_por_periodo),
+        )
+        plan = despacho_optimo(serie, reducida, por_dia)
+        margenes[factor] = plan.margen_bruto_total / anios
+
+    curva = pd.Series(margenes, name="margen_bruto_anual")
+    curva.index.name = "factor_capacidad"
+    return curva
+
+
+def _anios_de_la_muestra(precios: pd.Series) -> float:
+    """Anios que cubre la muestra, para anualizar el margen."""
+    if not isinstance(precios.index, pd.DatetimeIndex):
+        raise ErrorDatos(
+            "Para anualizar el margen hacen falta fechas: el indice de los precios "
+            "tiene que ser un DatetimeIndex."
+        )
+    dias = (precios.index[-1] - precios.index[0]).total_seconds() / 86400.0
+    if dias < 30.0:
+        raise ErrorDatos(
+            f"La muestra cubre {dias:.0f} dias. Anualizar un margen a partir de menos "
+            "de un mes da una cifra que no significa nada; use al menos un anio."
+        )
+    return dias / 365.25
+
+
+def van_almacenamiento(
+    precios,
+    parametros: ParametrosAlmacenamiento | str = "bateria_4h",
+    inversion: ParametrosInversion | None = None,
+    por_dia: bool = True,
+    curva: pd.Series | None = None,
+) -> pd.Series:
+    """VAN del activo: capex, degradacion, O&M y el margen que de verdad captura.
+
+    Sobre la degradacion contada dos veces
+    --------------------------------------
+    Este es el punto delicado de toda la valoracion y conviene decirlo antes
+    de dar un numero. El coste de degradacion de
+    :class:`ParametrosAlmacenamiento` cumple **dos papeles**:
+
+    1. Como **senial de despacho** decide cuando no merece la pena ciclar.
+       Ahi es imprescindible: sin el, el optimizador arbitra por 0,10 EUR/MWh.
+    2. Como **coste en euros** es amortizacion de la vida util, es decir del
+       propio capex.
+
+    En un VAN que ya descuenta el capex, restar tambien el coste por MWh es
+    **pagar la bateria dos veces**. Asi que aqui el flujo de caja usa el
+    margen **bruto** --el coste por MWh se queda solo como senial de
+    despacho-- y la degradacion se expresa donde corresponde: como perdida de
+    capacidad via ``retencion_anual``, que reduce el margen de los anios
+    siguientes.
+
+    Cuanto vale esa diferencia no es teorico, sale en la propia tabla:
+    ``margen_bruto_anual`` frente a ``margen_neto_anual``.
+
+    Devuelve
+    --------
+    Una Series con el capex, los flujos, el VAN, la TIR, el periodo de retorno
+    y el capex de equilibrio.
+    """
+    ficha = _resolver_parametros(parametros)
+    datos = inversion or ParametrosInversion()
+    serie = como_serie(precios, "precios")
+
+    if curva is None:
+        curva = curva_margen_por_capacidad(serie, ficha, por_dia=por_dia)
+    factores = np.asarray(curva.index, dtype=float)
+    valores_curva = curva.to_numpy(dtype=float)
+
+    capex = float(ficha.capacidad) * 1000.0 * float(datos.capex_por_kwh)
+    fijo = float(ficha.potencia) * 1000.0 * float(datos.coste_fijo_anual_por_kw)
+    adicional = float(ficha.potencia) * float(datos.ingreso_adicional_anual_por_mw)
+
+    flujos = [-capex]
+    retencion = 1.0
+    for anio in range(1, int(datos.vida_anios) + 1):
+        # La capacidad media del anio: se degrada a lo largo de el.
+        media = retencion * (1.0 + float(datos.retencion_anual)) / 2.0
+        arbitraje = float(np.interp(media, factores, valores_curva))
+        flujo = arbitraje + adicional - fijo
+        if anio == int(datos.vida_anios):
+            flujo += float(datos.valor_residual)
+        flujos.append(flujo)
+        retencion *= float(datos.retencion_anual)
+
+    flujos = np.asarray(flujos, dtype=float)
+    van = float(np.sum(flujos / (1.0 + float(datos.tasa_descuento)) ** np.arange(len(flujos))))
+
+    plan_nominal = despacho_optimo(serie, ficha, por_dia)
+    anios_muestra = _anios_de_la_muestra(serie)
+
+    return pd.Series(
+        {
+            "capex": capex,
+            "margen_bruto_anual": plan_nominal.margen_bruto_total / anios_muestra,
+            "margen_neto_anual": plan_nominal.margen_total / anios_muestra,
+            "coste_fijo_anual": fijo,
+            "ingreso_adicional_anual": adicional,
+            "flujo_anio_1": float(flujos[1]),
+            "flujo_ultimo_anio": float(flujos[-1]),
+            "van": van,
+            "tir": _tir(flujos),
+            "retorno_anios": _periodo_de_retorno(flujos),
+            "capex_equilibrio_por_kwh": _capex_de_equilibrio(flujos, capex, ficha, datos),
+        },
+        name=ficha.nombre,
+    )
+
+
+def _tir(flujos: np.ndarray) -> float:
+    """Tasa interna de retorno por biseccion.
+
+    Se resuelve por biseccion y no con las raices del polinomio porque con
+    flujos de signo unico tras la inversion la TIR es unica y la biseccion no
+    puede devolver una raiz compleja ni negativa espuria. Si el activo nunca
+    recupera el capex, la TIR no existe y se devuelve ``NaN`` en lugar de un
+    numero inventado.
+    """
+    if flujos[0] >= 0.0 or np.sum(flujos[1:]) <= 0.0:
+        return float("nan")
+
+    def van_a(tasa: float) -> float:
+        return float(np.sum(flujos / (1.0 + tasa) ** np.arange(len(flujos))))
+
+    if van_a(0.0) <= 0.0:
+        return float("nan")  # ni sin descontar se recupera la inversion
+    bajo, alto = 0.0, 1.0
+    while van_a(alto) > 0.0 and alto < 10.0:
+        alto *= 2.0
+    if van_a(alto) > 0.0:  # pragma: no cover - TIR absurdamente alta
+        return float("nan")
+    for _ in range(200):
+        medio = 0.5 * (bajo + alto)
+        if van_a(medio) > 0.0:
+            bajo = medio
+        else:
+            alto = medio
+    return 0.5 * (bajo + alto)
+
+
+def _periodo_de_retorno(flujos: np.ndarray) -> float:
+    """Anios hasta que el flujo acumulado **sin descontar** cruza cero.
+
+    Sin descontar a proposito: es la cifra que se usa para comparar de un
+    vistazo, y mezclarla con el descuento la haria incomparable con la que
+    publica cualquier otro. Si no se recupera dentro de la vida del activo se
+    devuelve ``NaN``, no la vida entera.
+    """
+    acumulado = np.cumsum(flujos)
+    cruces = np.flatnonzero(acumulado >= 0.0)
+    if cruces.size == 0:
+        return float("nan")
+    primero = int(cruces[0])
+    if primero == 0:  # pragma: no cover - capex nulo
+        return 0.0
+    # Interpolacion lineal dentro del anio en que cruza.
+    previo = acumulado[primero - 1]
+    return float(primero - 1 + (-previo) / (acumulado[primero] - previo))
+
+
+def _capex_de_equilibrio(
+    flujos: np.ndarray,
+    capex: float,
+    ficha: ParametrosAlmacenamiento,
+    datos: ParametrosInversion,
+) -> float:
+    """Capex por kWh que deja el VAN en cero: la cifra que decide la inversion.
+
+    Es mas util que el VAN en si, porque el VAN depende de un capex que se ha
+    supuesto y este responde a la pregunta que de verdad se hace quien
+    invierte: **cuanto puedo llegar a pagar por esto**.
+    """
+    descuentos = (1.0 + float(datos.tasa_descuento)) ** np.arange(1, len(flujos))
+    valor_operacion = float(np.sum(flujos[1:] / descuentos))
+    if valor_operacion <= 0.0:
+        return 0.0
+    return valor_operacion / (float(ficha.capacidad) * 1000.0)
+
+
+def valor_van_de_la_prevision(
+    precios_reales,
+    previsiones: dict[str, object],
+    parametros: ParametrosAlmacenamiento | str = "bateria_4h",
+    inversion: ParametrosInversion | None = None,
+    por_dia: bool = True,
+) -> pd.DataFrame:
+    """Cuanto vale la prevision **en euros de VAN**, que es la pregunta final.
+
+    :func:`valor_de_la_prevision` dice que fraccion del techo captura cada
+    prevision. Esta la traduce a lo unico que decide una inversion: el VAN del
+    activo si se opera con ella. La diferencia entre la fila del oraculo y la
+    de la ingenua es el valor maximo que puede tener un modelo de prevision
+    para este activo, y la de cualquier fila intermedia es lo que vale ese
+    modelo concreto.
+
+    El despacho se decide con la prevision y se **liquida a los precios
+    realizados**, igual que en :func:`valor_de_la_prevision`.
+    """
+    ficha = _resolver_parametros(parametros)
+    datos = inversion or ParametrosInversion()
+    reales = como_serie(precios_reales, "precios_reales")
+    anios = _anios_de_la_muestra(reales)
+
+    candidatas: dict[str, object] = {"oraculo": reales, "ingenua": _prevision_ingenua(reales)}
+    candidatas.update(previsiones)
+
+    # La curva de margen frente a capacidad se resuelve UNA vez: su forma no
+    # depende de la prevision, solo su altura.
+    curva = curva_margen_por_capacidad(reales, ficha, por_dia=por_dia)
+    techo = float(curva.loc[1.0])
+    filas = {}
+    for nombre, prevision in candidatas.items():
+        serie = como_serie(prevision, str(nombre)).reindex(reales.index)
+        if serie.isna().any():
+            serie = serie.fillna(float(reales.mean()))
+        plan = despacho_optimo(serie, ficha, por_dia)
+        liquidado = liquidar_plan(plan, reales)
+        bruto_anual = liquidado.margen_bruto_total / anios
+        # Se reescala la curva por la fraccion capturada.
+        fraccion = bruto_anual / techo if techo else 0.0
+        resumen = van_almacenamiento(reales, ficha, datos, por_dia, curva * fraccion)
+        filas[str(nombre)] = {
+            "margen_bruto_anual": bruto_anual,
+            "pct_oraculo": 100.0 * fraccion,
+            "van": resumen["van"],
+            "tir": resumen["tir"],
+            "capex_equilibrio_por_kwh": resumen["capex_equilibrio_por_kwh"],
+        }
+
+    tabla = pd.DataFrame(filas).T
+    tabla.index.name = "prevision"
+    tabla.attrs["activo"] = ficha.nombre
+    tabla.attrs["capex_supuesto_por_kwh"] = float(datos.capex_por_kwh)
+    return tabla

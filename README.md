@@ -223,7 +223,9 @@ eligiendo mal la referencia, como pasó en este mismo proyecto; un 78 % del
 oráculo no se puede inflar por encima de 100.
 
 Medido sobre los 67 512 períodos horarios reales de OMIE (2018-2025), batería de
-1 MW / 4 h con rendimiento 0,85 y 3 €/MWh de degradación:
+1 MW / 4 h con rendimiento 0,85 y 3 €/MWh de degradación (margen **neto** de ese
+coste; el bruto de la tabla siguiente son 50 168 y la diferencia, 8 094 €, es
+justo la degradación):
 
 | | €/año por MW | % del oráculo |
 |---|---:|---:|
@@ -235,6 +237,47 @@ Un perfil móvil trivial ya bate a la referencia en un 10 %, y quedan **9 200
 €/MW·año** entre eso y el techo. Ese hueco es lo que se disputa un modelo — y es
 la diferencia con predecir rendimientos diarios, donde el MASE se quedaba en
 0,94-0,99 y el IC salía negativo.
+
+`van_almacenamiento` cierra la valoración: capex, O&M fijo, degradación y
+descuento. El resultado sobre OMIE es contundente y conviene no maquillarlo:
+
+| | |
+|---|---:|
+| Margen bruto anual (oráculo, 4 MWh) | 50 168 €/MW |
+| Capex de equilibrio, **solo arbitraje** | **80,8 €/kWh** |
+| Capex de mercado de una batería de red | 200-400 €/kWh |
+
+**Una batería no se financia con el arbitraje de OMIE: se queda a un factor 3-5
+de ser viable.** Con 60 000 €/MW·año de mercado de capacidad y servicios de
+ajuste el equilibrio sube a 209 €/kWh y la TIR a 2,52 %, todavía por debajo de
+un WACC del 8 %. Es exactamente por eso que el almacenamiento en España depende
+de las subastas de capacidad y no del *spread* horario.
+
+Y `valor_van_de_la_prevision` traduce la previsión a lo único que decide una
+inversión. Al capex de equilibrio del oráculo (80,8 €/kWh):
+
+| | Captura | VAN |
+|---|---:|---:|
+| Oráculo | 100,0 % | +20 € |
+| Repetir ayer | 75,8 % | −94 915 € |
+| Perfil por tipo de día | 81,6 % | −72 137 € |
+
+**Una previsión perfecta valdría 94 934 € de VAN** sobre este activo. El perfil
+trivial captura 22 778 € de esos —el 24 %— y quedan **72 156 € sin capturar**.
+Ese es el presupuesto máximo defendible para un modelo de previsión aplicado a
+esta batería, y es una cifra que se puede llevar a un comité.
+
+Dos cuidados que el módulo toma y que un Excel no suele tomar:
+
+- **El margen no es proporcional a la capacidad.** Al 40 % de capacidad se gana
+  el 51 % del ingreso, no el 40 %: las horas que se añaden al ampliar son cada
+  vez menos extremas. `curva_margen_por_capacidad` resuelve esa curva y el VAN
+  interpola en ella año a año, así que la degradación se aplica donde toca.
+- **La degradación no se cuenta dos veces.** El coste por MWh del despacho es
+  amortización de la vida útil, es decir del propio capex; restarlo además del
+  capex sería pagar la batería dos veces. El flujo usa el margen **bruto** y la
+  degradación entra como pérdida de capacidad. La diferencia son 8 094 €/año, y
+  la tabla informa las dos cifras.
 
 **`simulacion`** y **`estacionalidad`** — Escenarios sintéticos con señal
 predecible real, para trabajar sin acceso a los mercados, y descomposición
